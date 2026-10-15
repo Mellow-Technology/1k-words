@@ -1,0 +1,62 @@
+[package]
+name = "thousand_words"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "1k-words"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+blake3 = "1"
+# Where settings, catalogs and the default library go on each platform.
+dirs = "6"
+# GPUI plus the GPUI Kit component library (re-exports GPUI as `gpui_kit::*`).
+gpui-kit = "0.7.3"
+image = { version = "0.25.6", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "tiff", "rayon"] }
+imagesize = "0.14"
+kamadak-exif = "0.6"
+futures = "0.3"
+# HEIC/HEIF decoding (iPhone photos); links the system libheif.
+libheif-rs = "3"
+# Video decoding for Live Photos; links the system FFmpeg libraries.
+ffmpeg-next = "9"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Camera raw decoding. Note: rawler is LGPL-2.1.
+rawler = "0.8"
+# Each library's catalog. Embedded and synchronous, so no async runtime.
+turso = { version = "0.8.3", default-features = false }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+# Headless UI tests: simulated key presses and clicks in a real window.
+gpui-kit = { version = "0.7.3", features = ["test-support"] }
+
+# Image decoding is painfully slow without optimizations. Generic decoding
+# code is compiled into this crate, so it needs some optimization too, not
+# just the dependencies (opt-level 0 makes loading a photo ~5x slower).
+[profile.dev]
+opt-level = 1
+
+# Image decoding is painfully slow without optimizations, so optimize
+# dependencies even in debug builds.
+[profile.dev.package."*"]
+opt-level = 3
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Removable storage in the sidebar: listing volumes, mount notifications and
+# ejecting (`src/devices/macos.rs`).
+block2 = "0.6"
+objc2 = "0.6"
+# Telling disk images apart from real devices.
+objc2-disk-arbitration = { version = "0.3.2", default-features = false, features = ["std", "DADisk", "DASession"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSWorkspace"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSArray", "NSDictionary", "NSError", "NSFileManager", "NSNotification", "NSObject", "NSOperation", "NSString", "NSURL", "NSValue"] }
+# Hardware-decoded video frames stay on the GPU: VideoToolbox converts and
+# rotates them, and GPUI draws them with its `surface` element.
+objc2-core-foundation = "0.3.2"
+objc2-core-video = { version = "0.3.2", features = ["CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn"] }
+objc2-video-toolbox = { version = "0.3.2", features = ["VTSession", "VTPixelRotationSession", "VTPixelRotationProperties", "VTPixelTransferSession", "VTPixelTransferProperties"] }

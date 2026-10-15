@@ -1,0 +1,751 @@
+//! The photo viewer: a zoomable view of one photo, a sidebar with its
+//! details, and, for brackets and bursts, a filmstrip of every frame.
+
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::Arc;
+
+use gpui_kit::{
+    AnyElement, App, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding,
+    MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, RenderImage, ScrollDelta,
+    ScrollWheelEvent, SharedString, Subscription, Task, Window, div, img, prelude::*, px, rgba,
+    size, svg, transparent_black,
+};
+
+use gpui_kit::component::button::Button;
+use gpui_kit::component::status_bar::StatusBar;
+use gpui_kit::component::{ActiveTheme, IconName, Sizable};
+
+use crate::assets::{BRACKET_ICON, BURST_ICON, LIVE_ICON};
+use crate::decode;
+use crate::details::{DetailSection, format_ev_value, photo_details};
+use crate::navigation;
+use crate::photos::{Stack, StackKind, StartFrame};
+use crate::video::{PlaybackState, VideoPlayer};
+use crate::zoom::{ZoomState, zoomed_image};
+
+gpui_kit::actions!(
+    viewer,
+    [
+        CloseViewer,
+        ZoomIn,
+        ZoomOut,
+        ZoomToFit,
+        ActualSize,
+        PreviousFrame,
+        NextFrame
+    ]
+);
+
+const KEY_CONTEXT: &str = "PhotoViewer";
+const SIDEBAR_WIDTH: f32 = 280.;
+/// Height of the thumbnails in the floating filmstrip.
+const FILMSTRIP_THUMBNAIL_HEIGHT: f32 = 56.;
+const ZOOM_STEP: f32 = 1.25;
+
+pub fn bind_keys(cx: &mut App) {
+    let context = Some(KEY_CONTEXT);
+    cx.bind_keys([
+        KeyBinding::new("escape", CloseViewer, context),
+        KeyBinding::new("cmd-=", ZoomIn, context),
+        KeyBinding::new("cmd-+", ZoomIn, context),
+        KeyBinding::new("cmd--", ZoomOut, context),
+        KeyBinding::new("cmd-0", ZoomToFit, context),
+        KeyBinding::new("cmd-1", ActualSize, context),
+        KeyBinding::new("left", PreviousFrame, context),
+        KeyBinding::new("right", NextFrame, context),
+    ]);
+}
+
+pub enum ViewerEvent {
+    Close,
+    /// Stepped back past the first frame: show the previous photo.
+    Previous,
+    /// Stepped on past the last frame: show the next photo.
+    Next,
+}
+
+struct LoadedImage {
+    image: Arc<RenderImage>,
+}
+
+enum LoadState {
+    Loading,
+    Done,
+    Failed(SharedString),
+}
+
+pub struct PhotoViewer {
+    focus_handle: FocusHandle,
+    stack: Stack,
+    selected: usize,
+    /// The gallery thumbnail of the stack's cover, shown while the cover's
+    /// full image loads.
+    cover_thumbnail: Option<Arc<RenderImage>>,
+    image: Option<LoadedImage>,
+    load_state: LoadState,
+    filmstrip: Vec<Option<Arc<RenderImage>>>,
+    details: Vec<DetailSection>,
+    zoom: Rc<RefCell<ZoomState>>,
+    /// The Live Photo video, while it plays over the photo.
+    live: Option<(Entity<VideoPlayer>, Subscription)>,
+    /// Whether the image pane has received a mouse down. Double-clicking a
+    /// gallery tile opens the viewer on the first click, and the second
+    /// shouldn't count as a double-click on the image.
+    pane_clicked: bool,
+    _load_image: Task<()>,
+    _load_details: Task<()>,
+    _load_filmstrip: Vec<Task<()>>,
+}
+
+impl EventEmitter<ViewerEvent> for PhotoViewer {}
+
+impl PhotoViewer {
+    pub fn new(
+        stack: Stack,
+        cover_thumbnail: Option<Arc<RenderImage>>,
+        start: StartFrame,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let first = stack.start_frame(start);
+        let mut this = Self {
+            focus_handle: cx.focus_handle(),
+            zoom: Rc::new(RefCell::new(ZoomState::new(image_size(&stack, first)))),
+            filmstrip: vec![None; stack.photos.len()],
+            stack,
+            selected: first,
+            cover_thumbnail,
+            image: None,
+            load_state: LoadState::Loading,
+            details: Vec::new(),
+            pane_clicked: false,
+            live: None,
+            _load_image: Task::ready(()),
+            _load_details: Task::ready(()),
+            _load_filmstrip: Vec::new(),
+        };
+        this.load_filmstrip(cx);
+        this.select(first, window, cx);
+        this
+    }
+
+    fn select(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.stop_live(cx);
+        let Some(photo) = self.stack.photos.get(ix) else {
+            return;
+        };
+        if let Some(loaded) = self.image.take() {
+            cx.drop_image(loaded.image, Some(window));
+        }
+        self.load_state = LoadState::Loading;
+        self.selected = ix;
+        self.zoom
+            .borrow_mut()
+            .set_image_size(image_size(&self.stack, ix));
+
+        let photo = photo.clone();
+        self._load_image = cx.spawn({
+            let photo = photo.clone();
+            async move |this, cx| {
+                // The embedded preview of a raw file takes milliseconds.
+                let preview = cx.background_spawn({
+                    let photo = photo.clone();
+                    async move { decode::viewer_embedded_preview(&photo) }
+                });
+                if let Some(preview) = preview.await {
+                    this.update(cx, |this, cx| this.show(preview, cx)).ok();
+                }
+
+                let decoded = cx.background_spawn(async move { decode::decode_full(&photo) });
+                let decoded = match decoded.await {
+                    Ok(decoded) => decoded,
+                    Err(error) => {
+                        this.update(cx, |this, cx| {
+                            this.load_state = LoadState::Failed(error.to_string().into());
+                            cx.notify();
+                        })
+                        .ok();
+                        return;
+                    }
+                };
+
+                // Without an embedded preview, show a scaled down copy first;
+                // it's much quicker to convert and upload to the GPU.
+                let needs_preview = this.read_with(cx, |this, _| this.image.is_none());
+                let decoded = if needs_preview.unwrap_or(false) {
+                    let (preview, decoded) = cx
+                        .background_spawn(
+                            async move { (decode::viewer_preview(&decoded), decoded) },
+                        )
+                        .await;
+                    this.update(cx, |this, cx| this.show(preview, cx)).ok();
+                    decoded
+                } else {
+                    decoded
+                };
+
+                let full = cx
+                    .background_spawn(async move { decode::viewer_full(decoded) })
+                    .await;
+                this.update(cx, |this, cx| {
+                    this.show(full, cx);
+                    this.load_state = LoadState::Done;
+                })
+                .ok();
+            }
+        });
+
+        self._load_details = cx.spawn(async move |this, cx| {
+            let details = cx
+                .background_spawn(async move { photo_details(&photo) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.details = details;
+                cx.notify();
+            })
+            .ok();
+        });
+        cx.notify();
+    }
+
+    /// Plays the selected photo's Live Photo video over it, once.
+    fn play_live(&mut self, cx: &mut Context<Self>) {
+        let Some(video) = self.stack.photos[self.selected].live_video.clone() else {
+            return;
+        };
+        if self.live.is_some() {
+            return;
+        }
+        let player = cx.new(|cx| VideoPlayer::new(video, cx));
+        let observe = cx.observe(&player, |this, player, cx| {
+            if *player.read(cx).state() != PlaybackState::Playing {
+                this.stop_live(cx);
+            }
+            cx.notify();
+        });
+        self.live = Some((player, observe));
+        cx.notify();
+    }
+
+    fn stop_live(&mut self, cx: &mut App) {
+        if let Some((player, _)) = self.live.take() {
+            player.update(cx, |player, cx| player.stop(cx));
+        }
+    }
+
+    fn show(&mut self, image: Arc<RenderImage>, cx: &mut Context<Self>) {
+        if let Some(old) = self.image.replace(LoadedImage { image }) {
+            cx.drop_image(old.image, None);
+        }
+        cx.notify();
+    }
+
+    fn load_filmstrip(&mut self, cx: &mut Context<Self>) {
+        if self.stack.photos.len() < 2 {
+            return;
+        }
+        self._load_filmstrip = self
+            .stack
+            .photos
+            .iter()
+            .enumerate()
+            .map(|(ix, photo)| {
+                let photo = photo.clone();
+                cx.spawn(async move |this, cx| {
+                    let result = cx
+                        .background_spawn(async move { decode::filmstrip_thumbnail(&photo) })
+                        .await;
+                    this.update(cx, |this, cx| {
+                        this.filmstrip[ix] = result.ok();
+                        cx.notify();
+                    })
+                    .ok();
+                })
+            })
+            .collect();
+    }
+
+    /// Removes this viewer's images from the GPU atlas. `window` must be
+    /// given when called during an update of that window.
+    pub fn release_images(&mut self, mut window: Option<&mut Window>, cx: &mut App) {
+        self.stop_live(cx);
+        for image in self
+            .image
+            .take()
+            .map(|loaded| loaded.image)
+            .into_iter()
+            .chain(self.filmstrip.iter_mut().filter_map(Option::take))
+        {
+            cx.drop_image(image, window.as_deref_mut());
+        }
+    }
+
+    fn close(&mut self, _: &CloseViewer, window: &mut Window, cx: &mut Context<Self>) {
+        self.release_images(Some(window), cx);
+        cx.emit(ViewerEvent::Close);
+    }
+
+    /// Steps through a bracket's or burst's frames, then on to the
+    /// neighboring photos.
+    fn step_frame(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let ix = self.selected as isize + delta;
+        if ix < 0 {
+            cx.emit(ViewerEvent::Previous);
+        } else if ix as usize >= self.stack.photos.len() {
+            cx.emit(ViewerEvent::Next);
+        } else {
+            self.select(ix as usize, window, cx);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn shown(&self) -> (std::path::PathBuf, usize) {
+        (self.stack.cover().path.clone(), self.selected)
+    }
+
+    fn update_zoom(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut ZoomState)) {
+        f(&mut self.zoom.borrow_mut());
+        cx.notify();
+    }
+
+    fn on_scroll(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let anchor = Some(event.position);
+        match event.delta {
+            // Mouse wheels zoom.
+            ScrollDelta::Lines(delta) => self.update_zoom(cx, |zoom| {
+                zoom.zoom_by(ZOOM_STEP.powf(delta.y), anchor);
+            }),
+            // Trackpads pan, or zoom while ⌘ or ctrl is held.
+            ScrollDelta::Pixels(delta) => {
+                if event.modifiers.platform || event.modifiers.control {
+                    let factor = 2f32.powf(f32::from(delta.y) / 200.);
+                    self.update_zoom(cx, |zoom| zoom.zoom_by(factor, anchor));
+                } else {
+                    self.update_zoom(cx, |zoom| zoom.pan_by(delta));
+                }
+            }
+        }
+    }
+
+    fn on_mouse_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let is_double_click = event.click_count == 2 && self.pane_clicked;
+        self.pane_clicked = true;
+        if is_double_click {
+            self.update_zoom(cx, |zoom| zoom.toggle_actual_size(Some(event.position)));
+        } else {
+            self.update_zoom(cx, |zoom| zoom.start_drag(event.position));
+        }
+    }
+
+    fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let mut zoom = self.zoom.borrow_mut();
+        if event.pressed_button != Some(MouseButton::Left) {
+            zoom.end_drag();
+        } else if zoom.drag_to(event.position) {
+            cx.notify();
+        }
+    }
+
+    fn render_top_bar(&self, cx: &mut Context<Self>) -> Div {
+        let top_bar = div().flex().flex_none().items_center().gap_3().h(px(44.));
+        navigation::title_bar_start(top_bar, cx)
+            .pr_3()
+            .border_b_1()
+            .border_color(cx.theme().title_bar_border)
+            .bg(cx.theme().title_bar)
+            .child(
+                Button::new("back")
+                    .icon(IconName::ChevronLeft)
+                    .label("Gallery")
+                    .small()
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.close(&CloseViewer, window, cx)),
+                    ),
+            )
+    }
+
+    /// The file name and position in the stack on the left; loading state
+    /// and zoom on the right.
+    fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let photo = &self.stack.photos[self.selected];
+        let name: SharedString = photo
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+            .into();
+        let position = match self.stack.kind {
+            StackKind::Single => None,
+            StackKind::Bracket => Some("Bracket"),
+            StackKind::Burst => Some("Burst"),
+        }
+        .map(|kind| {
+            format!(
+                "{kind} · {} of {}",
+                self.selected + 1,
+                self.stack.photos.len()
+            )
+        });
+        let status = match (&self.load_state, &self.image) {
+            (LoadState::Failed(_), Some(_)) => Some("Preview only"),
+            (LoadState::Loading, _) => Some("Loading full resolution…"),
+            _ => None,
+        };
+        let zoom = self.zoom.borrow();
+        let zoom_label: SharedString = if zoom.is_fit() {
+            "Fit".into()
+        } else {
+            format!("{:.0}%", zoom.actual_percent()).into()
+        };
+
+        StatusBar::new()
+            .flex_none()
+            .px_3()
+            .left(div().text_color(cx.theme().foreground).child(name))
+            .when_some(position, |bar, position| bar.left(position))
+            .when_some(status, |bar, status| bar.right(status))
+            .right(zoom_label)
+    }
+
+    fn render_sidebar(&self, cx: &App) -> impl IntoElement {
+        let muted_foreground = cx.theme().muted_foreground;
+        div()
+            .id("details")
+            .flex_none()
+            .w(px(SIDEBAR_WIDTH))
+            .h_full()
+            .overflow_y_scroll()
+            .border_l_1()
+            .border_color(cx.theme().sidebar_border)
+            .bg(cx.theme().sidebar)
+            .p_4()
+            .flex()
+            .flex_col()
+            .gap_5()
+            .children(self.details.iter().map(|section| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1p5()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted_foreground)
+                            .child(section.title.to_uppercase()),
+                    )
+                    .children(section.rows.iter().map(|(label, value)| {
+                        div()
+                            .flex()
+                            .gap_2()
+                            .text_xs()
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .w(px(96.))
+                                    .text_color(muted_foreground)
+                                    .child(label.clone()),
+                            )
+                            .child(div().flex_1().min_w_0().child(value.clone()))
+                    }))
+            }))
+    }
+
+    fn render_image_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // Until the preview loads, stretch a thumbnail we already have.
+        let image = self
+            .image
+            .as_ref()
+            .map(|loaded| loaded.image.clone())
+            .or_else(|| self.filmstrip[self.selected].clone())
+            .or_else(|| {
+                (self.selected == self.stack.cover)
+                    .then(|| self.cover_thumbnail.clone())
+                    .flatten()
+            });
+        let error: Option<SharedString> = match (&self.load_state, &self.image) {
+            (LoadState::Failed(error), None) => {
+                Some(format!("Can't display image: {error}").into())
+            }
+            _ => None,
+        };
+        let zoom = self.zoom.borrow();
+
+        div()
+            .id("image-pane")
+            .relative()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .overflow_hidden()
+            .bg(cx.theme().background)
+            .when(!zoom.is_fit(), |pane| pane.cursor_grab())
+            .when(zoom.is_dragging(), |pane| pane.cursor_grabbing())
+            .on_scroll_wheel(cx.listener(Self::on_scroll))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.update_zoom(cx, ZoomState::end_drag)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.update_zoom(cx, ZoomState::end_drag)),
+            )
+            .children(image.map(|image| zoomed_image(image, self.zoom.clone())))
+            .children(error.map(|error| {
+                div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(error)
+            }))
+            .children(self.render_live(cx))
+            .when(self.stack.photos.len() > 1, |pane| {
+                pane.child(self.render_filmstrip(cx))
+            })
+    }
+
+    /// For Live Photos: the video while it plays, and the LIVE button that
+    /// plays it (on hover, like Photos, or on click).
+    fn render_live(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        if self.stack.photos[self.selected].live_video.is_none() {
+            return Vec::new();
+        }
+        let video = self
+            .live
+            .as_ref()
+            .and_then(|(player, _)| player.read(cx).render_frame(ObjectFit::Contain))
+            .map(|video| {
+                div()
+                    .absolute()
+                    .inset_0()
+                    .bg(cx.theme().background)
+                    .child(video)
+                    .into_any_element()
+            });
+        let button = div()
+            .id("live")
+            .absolute()
+            .top_3()
+            .left_3()
+            .occlude()
+            .cursor_pointer()
+            .child(
+                pill()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        svg()
+                            .path(LIVE_ICON)
+                            .size_3p5()
+                            .text_color(rgba(0xffffffff)),
+                    )
+                    .child("LIVE"),
+            )
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if *hovered {
+                    this.play_live(cx);
+                }
+            }))
+            .on_click(cx.listener(|this, _, _, cx| this.play_live(cx)))
+            .into_any_element();
+        video.into_iter().chain([button]).collect()
+    }
+
+    /// Every frame of a bracket or burst, floating over the bottom of the
+    /// image pane.
+    fn render_filmstrip(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let icon = match self.stack.kind {
+            StackKind::Burst => BURST_ICON,
+            _ => BRACKET_ICON,
+        };
+        let theme = cx.theme();
+        let (primary, muted, popover, popover_foreground, border) = (
+            theme.primary,
+            theme.muted,
+            theme.popover,
+            theme.popover_foreground,
+            theme.border,
+        );
+
+        // The full-width row only centers the strip; without a hitbox of its
+        // own, it doesn't block panning the image on either side.
+        div()
+            .absolute()
+            .bottom_4()
+            .left_0()
+            .right_0()
+            .px_4()
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .id("filmstrip")
+                    // Keep clicks and scrolling from reaching the image pane.
+                    .occlude()
+                    .max_w_full()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .p_2()
+                    .rounded_lg()
+                    .bg(popover.opacity(0.72))
+                    .border_1()
+                    .border_color(border.opacity(0.6))
+                    .shadow_lg()
+                    .overflow_x_scroll()
+                    // The key: the stack's icon above the unit of the labels
+                    // under each frame ("EV" for brackets).
+                    .child(
+                        filmstrip_column()
+                            .px_1()
+                            .child(
+                                div()
+                                    .h(px(FILMSTRIP_THUMBNAIL_HEIGHT))
+                                    .flex()
+                                    .items_center()
+                                    .child(
+                                        svg()
+                                            .path(icon)
+                                            .size_4()
+                                            .text_color(popover_foreground.opacity(0.7)),
+                                    ),
+                            )
+                            .child(
+                                filmstrip_label()
+                                    .text_color(popover_foreground.opacity(0.6))
+                                    .child(match self.stack.kind {
+                                        StackKind::Bracket => "EV",
+                                        _ => "",
+                                    }),
+                            ),
+                    )
+                    .children(self.stack.photos.iter().enumerate().map(|(ix, photo)| {
+                        let selected = ix == self.selected;
+                        let label = match self.stack.kind {
+                            StackKind::Bracket => {
+                                format_ev_value(photo.meta.exposure_bias.unwrap_or(0.0))
+                            }
+                            _ => format!("{}", ix + 1),
+                        };
+                        filmstrip_column()
+                            .id(("frame", ix))
+                            .cursor_pointer()
+                            .when(!selected, |frame| {
+                                frame.opacity(0.75).hover(|s| s.opacity(1.))
+                            })
+                            .child(
+                                div()
+                                    .h(px(FILMSTRIP_THUMBNAIL_HEIGHT))
+                                    .w(px(FILMSTRIP_THUMBNAIL_HEIGHT * photo.aspect_ratio()))
+                                    .rounded_md()
+                                    .border_2()
+                                    .border_color(if selected {
+                                        primary
+                                    } else {
+                                        transparent_black()
+                                    })
+                                    .bg(muted)
+                                    .overflow_hidden()
+                                    .children(self.filmstrip[ix].clone().map(|image| {
+                                        img(image)
+                                            .size_full()
+                                            .rounded_sm()
+                                            .object_fit(ObjectFit::Cover)
+                                    })),
+                            )
+                            .child(
+                                filmstrip_label()
+                                    .text_color(if selected {
+                                        popover_foreground
+                                    } else {
+                                        popover_foreground.opacity(0.6)
+                                    })
+                                    .child(label),
+                            )
+                            .on_click(
+                                cx.listener(move |this, _, window, cx| this.select(ix, window, cx)),
+                            )
+                    })),
+            )
+    }
+}
+
+fn filmstrip_column() -> Div {
+    div().flex_none().flex().flex_col().items_center().gap_1()
+}
+
+fn filmstrip_label() -> Div {
+    div().h(px(14.)).text_xs().line_height(px(14.))
+}
+
+// Pills and labels sit on top of photos, so they use fixed colors that read
+// on any image rather than theme colors.
+fn pill() -> Div {
+    div()
+        .px_2()
+        .py_0p5()
+        .rounded_md()
+        .bg(rgba(0x000000a6))
+        .text_color(rgba(0xffffffff))
+        .text_xs()
+}
+
+/// Size in image pixels of a stack's frame, with EXIF orientation applied.
+fn image_size(stack: &Stack, ix: usize) -> gpui_kit::Size<f32> {
+    let photo = &stack.photos[ix];
+    size(photo.width as f32, photo.height as f32)
+}
+
+impl Focusable for PhotoViewer {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for PhotoViewer {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .track_focus(&self.focus_handle)
+            .key_context(KEY_CONTEXT)
+            .on_action(cx.listener(Self::close))
+            .on_action(cx.listener(|this, _: &ZoomIn, _, cx| {
+                this.update_zoom(cx, |zoom| zoom.zoom_by(ZOOM_STEP, None))
+            }))
+            .on_action(cx.listener(|this, _: &ZoomOut, _, cx| {
+                this.update_zoom(cx, |zoom| zoom.zoom_by(1. / ZOOM_STEP, None))
+            }))
+            .on_action(cx.listener(|this, _: &ZoomToFit, _, cx| {
+                this.update_zoom(cx, ZoomState::zoom_to_fit)
+            }))
+            .on_action(cx.listener(|this, _: &ActualSize, _, cx| {
+                this.update_zoom(cx, ZoomState::zoom_to_actual_size)
+            }))
+            .on_action(
+                cx.listener(|this, _: &PreviousFrame, window, cx| this.step_frame(-1, window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &NextFrame, window, cx| this.step_frame(1, window, cx)),
+            )
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
+            .child(self.render_top_bar(cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .child(self.render_image_pane(cx))
+                    .child(self.render_sidebar(cx)),
+            )
+            .child(self.render_status_bar(cx))
+    }
+}
