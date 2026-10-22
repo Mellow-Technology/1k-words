@@ -43,6 +43,9 @@ pub struct Photo {
     pub raw_pair: Option<PathBuf>,
     /// The video of a Live Photo.
     pub live_video: Option<PathBuf>,
+    /// Where its library keeps its thumbnail, for photos in a library. It
+    /// may not have been made yet.
+    pub thumbnail: Option<PathBuf>,
     /// Display width and height, with EXIF orientation applied.
     pub width: u32,
     pub height: u32,
@@ -368,6 +371,7 @@ fn read_photo(files: ShotFiles) -> Result<Photo> {
         path,
         raw_pair,
         live_video,
+        thumbnail: None,
         width,
         height,
         meta,
@@ -651,6 +655,7 @@ mod tests {
             path: PathBuf::from(name),
             raw_pair: None,
             live_video: None,
+            thumbnail: None,
             width: 6000,
             height: 4000,
             meta: CaptureMeta {

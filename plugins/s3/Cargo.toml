@@ -1,0 +1,22 @@
+[package]
+name = "s3-sync"
+version = "0.1.0"
+edition = "2024"
+description = "1k Words sync plugin for S3-compatible object storage"
+publish = false
+
+# Built to a WebAssembly component by the app's build script, with
+# `--target wasm32-wasip2`.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+hmac = "0.12"
+sha2 = "0.10"
+wit-bindgen = "0.57"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1

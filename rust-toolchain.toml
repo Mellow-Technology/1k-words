@@ -1,2 +1,4 @@
 [toolchain]
 channel = "1.99.0"
+# Sync plugins (`plugins/*`) are built to WebAssembly components.
+targets = ["wasm32-wasip2"]

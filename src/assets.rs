@@ -45,7 +45,18 @@ pub fn load_fonts(cx: &App) {
 // Lucide icons beyond GPUI Kit's default set.
 gpui_kit::assets::icon_assets!(
     LucideIcons,
-    [Eject, Grid2x2, HardDrive, Images, Import, LayoutDashboard]
+    [
+        Album,
+        CloudUpload,
+        Eject,
+        FolderPlus,
+        Grid2x2,
+        HardDrive,
+        Images,
+        Import,
+        LayoutDashboard,
+        ScanEye
+    ]
 );
 
 /// The app's own assets, falling back to GPUI Kit's (e.g. component icons).

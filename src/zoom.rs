@@ -12,7 +12,7 @@ use std::sync::Arc;
 use gpui_kit::{
     AnyElement, App, AvailableSpace, Bounds, Element, ElementId, GlobalElementId,
     InspectorElementId, IntoElement, LayoutId, ObjectFit, Pixels, Point, RenderImage, Size, Style,
-    Window, img, point, prelude::*, px, relative, size,
+    Window, div, img, point, prelude::*, px, relative, size,
 };
 
 /// The furthest the viewer zooms in, in device pixels per image pixel.
@@ -185,12 +185,26 @@ impl ZoomState {
 /// Draws `image` filling its parent according to the shared zoom state.
 /// The parent should clip its overflow.
 pub fn zoomed_image(image: Arc<RenderImage>, state: Rc<RefCell<ZoomState>>) -> ZoomedImage {
-    ZoomedImage { image, state }
+    ZoomedImage {
+        image,
+        state,
+        overlay: None,
+    }
 }
 
 pub struct ZoomedImage {
     image: Arc<RenderImage>,
     state: Rc<RefCell<ZoomState>>,
+    overlay: Option<AnyElement>,
+}
+
+impl ZoomedImage {
+    /// Draws `overlay` over the image, zoomed and panned with it: it's laid
+    /// out at the image's displayed size.
+    pub fn overlay(mut self, overlay: impl IntoElement) -> Self {
+        self.overlay = Some(overlay.into_any_element());
+        self
+    }
 }
 
 impl IntoElement for ZoomedImage {
@@ -203,7 +217,7 @@ impl IntoElement for ZoomedImage {
 
 impl Element for ZoomedImage {
     type RequestLayoutState = ();
-    type PrepaintState = AnyElement;
+    type PrepaintState = (AnyElement, Option<AnyElement>);
 
     fn id(&self) -> Option<ElementId> {
         None
@@ -257,7 +271,25 @@ impl Element for ZoomedImage {
             cx,
         );
         image.prepaint_at(image_bounds.origin, window, cx);
-        image
+
+        let overlay = self.overlay.take().map(|overlay| {
+            let mut overlay = div()
+                .w(image_bounds.size.width)
+                .h(image_bounds.size.height)
+                .child(overlay)
+                .into_any_element();
+            overlay.layout_as_root(
+                size(
+                    AvailableSpace::Definite(image_bounds.size.width),
+                    AvailableSpace::Definite(image_bounds.size.height),
+                ),
+                window,
+                cx,
+            );
+            overlay.prepaint_at(image_bounds.origin, window, cx);
+            overlay
+        });
+        (image, overlay)
     }
 
     fn paint(
@@ -266,11 +298,14 @@ impl Element for ZoomedImage {
         _inspector_id: Option<&InspectorElementId>,
         _bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
-        image: &mut Self::PrepaintState,
+        (image, overlay): &mut Self::PrepaintState,
         window: &mut Window,
         cx: &mut App,
     ) {
         image.paint(window, cx);
+        if let Some(overlay) = overlay {
+            overlay.paint(window, cx);
+        }
     }
 }
 

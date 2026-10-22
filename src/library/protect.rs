@@ -32,6 +32,21 @@ pub fn set_writable(path: &Path, writable: bool) -> io::Result<()> {
     std::fs::set_permissions(path, permissions)
 }
 
+/// Makes `path` and everything in it read-only, or writable again.
+pub fn set_tree_writable(path: &Path, writable: bool) -> io::Result<()> {
+    // A folder must be readable to list it, which read-only doesn't change.
+    if path.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            set_tree_writable(&entry?.path(), writable)?;
+        }
+    }
+    // Symbolic links' permissions are their targets'; leave them be.
+    if !std::fs::symlink_metadata(path)?.is_symlink() {
+        set_writable(path, writable)?;
+    }
+    Ok(())
+}
+
 fn is_writable(path: &Path) -> io::Result<bool> {
     Ok(!std::fs::metadata(path)?.permissions().readonly())
 }
@@ -120,14 +135,7 @@ pub(super) mod tests {
 
     /// Makes everything under `dir` writable, so tests can clean up.
     pub(crate) fn unlock_all(dir: &Path) {
-        set_writable(dir, true).ok();
-        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-            let path = entry.path();
-            set_writable(&path, true).ok();
-            if path.is_dir() {
-                unlock_all(&path);
-            }
-        }
+        set_tree_writable(dir, true).ok();
     }
 
     #[test]

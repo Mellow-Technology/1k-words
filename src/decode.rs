@@ -91,6 +91,23 @@ pub fn full_thumbnail(photo: &Photo) -> Result<Arc<RenderImage>> {
     )))
 }
 
+/// The thumbnail a library keeps for a photo (see `library::derivatives`):
+/// the embedded preview when it's at least as wide as a thumbnail, as a raw
+/// file's is, otherwise made from the full image.
+pub fn thumbnail_image(photo: &Photo) -> Result<DynamicImage> {
+    let image = match embedded_preview(photo) {
+        Some(preview) if preview.width() >= THUMBNAIL_WIDTH => preview,
+        _ => decode_full(photo)?,
+    };
+    Ok(fit(image, THUMBNAIL_WIDTH, u32::MAX))
+}
+
+/// A thumbnail the library made earlier, if it's there.
+pub fn kept_thumbnail(path: &Path) -> Option<Arc<RenderImage>> {
+    let image = ImageReader::open(path).ok()?.decode().ok()?;
+    Some(to_render_image(image))
+}
+
 /// A filmstrip thumbnail, from the embedded preview when it's large enough.
 pub fn filmstrip_thumbnail(photo: &Photo) -> Result<Arc<RenderImage>> {
     let image = match embedded_preview(photo) {
@@ -157,7 +174,7 @@ fn fit(image: DynamicImage, max_width: u32, max_height: u32) -> DynamicImage {
 }
 
 /// Converts to the BGRA layout GPUI expects.
-fn to_render_image(image: DynamicImage) -> Arc<RenderImage> {
+pub fn to_render_image(image: DynamicImage) -> Arc<RenderImage> {
     let mut buffer = image.into_rgba8();
     for pixel in buffer.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);

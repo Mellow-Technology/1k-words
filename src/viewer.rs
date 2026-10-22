@@ -8,19 +8,27 @@ use std::sync::Arc;
 use gpui_kit::{
     AnyElement, App, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding,
     MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, RenderImage, ScrollDelta,
-    ScrollWheelEvent, SharedString, Subscription, Task, Window, div, img, prelude::*, px, rgba,
-    size, svg, transparent_black,
+    ScrollWheelEvent, SharedString, Subscription, Task, TestSupportExt as _, Window, div, img,
+    prelude::*, px, rgba, size, svg, transparent_black,
 };
 
-use gpui_kit::component::button::Button;
+use gpui_kit::assets::IconName as LucideIcon;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::status_bar::StatusBar;
-use gpui_kit::component::{ActiveTheme, IconName, Sizable};
+use gpui_kit::component::{ActiveTheme, Icon, IconName, Selectable as _, Sizable};
 
+use crate::album_dialogs::{NameCallback, album_title, prompt_for_album_name};
 use crate::assets::{BRACKET_ICON, BURST_ICON, LIVE_ICON};
 use crate::decode;
-use crate::details::{DetailSection, format_ev_value, photo_details};
+use crate::details::{DetailSection, format_ev_value, objects_section, photo_details};
+use crate::detect::DetectedObject;
+use crate::gallery::show_error;
+use crate::library::{self, Album, AlbumId, Library, tree_order};
 use crate::navigation;
+use crate::object_boxes::ObjectBoxes;
 use crate::photos::{Stack, StackKind, StartFrame};
+use crate::settings;
 use crate::video::{PlaybackState, VideoPlayer};
 use crate::zoom::{ZoomState, zoomed_image};
 
@@ -63,6 +71,8 @@ pub enum ViewerEvent {
     Previous,
     /// Stepped on past the last frame: show the next photo.
     Next,
+    /// A photo was added to or taken out of an album, or an album was made.
+    AlbumsChanged,
 }
 
 struct LoadedImage {
@@ -86,16 +96,26 @@ pub struct PhotoViewer {
     load_state: LoadState,
     filmstrip: Vec<Option<Arc<RenderImage>>>,
     details: Vec<DetailSection>,
+    /// The objects found in the selected photo, if any, and their section
+    /// of the sidebar.
+    objects: Option<(Arc<[DetectedObject]>, DetailSection)>,
     zoom: Rc<RefCell<ZoomState>>,
     /// The Live Photo video, while it plays over the photo.
     live: Option<(Entity<VideoPlayer>, Subscription)>,
-    /// Whether the image pane has received a mouse down. Double-clicking a
-    /// gallery tile opens the viewer on the first click, and the second
-    /// shouldn't count as a double-click on the image.
+    /// Whether the image pane has received a mouse down, so that only two
+    /// clicks on the image count as a double-click on it: not, say, a third
+    /// quick click after double-clicking a gallery tile to open it.
     pane_clicked: bool,
     _load_image: Task<()>,
     _load_details: Task<()>,
     _load_filmstrip: Vec<Task<()>>,
+    /// The library the photos are in, if they're a library's, for albums.
+    library: Option<Arc<Library>>,
+    /// The library's albums, for the albums menu.
+    albums: Arc<Vec<Album>>,
+    /// The albums the selected photo is in, once they're known.
+    photo_albums: Option<Vec<AlbumId>>,
+    _load_albums: Task<()>,
 }
 
 impl EventEmitter<ViewerEvent> for PhotoViewer {}
@@ -105,6 +125,7 @@ impl PhotoViewer {
         stack: Stack,
         cover_thumbnail: Option<Arc<RenderImage>>,
         start: StartFrame,
+        library: Option<Arc<Library>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -119,11 +140,16 @@ impl PhotoViewer {
             image: None,
             load_state: LoadState::Loading,
             details: Vec::new(),
+            objects: None,
             pane_clicked: false,
             live: None,
             _load_image: Task::ready(()),
             _load_details: Task::ready(()),
             _load_filmstrip: Vec::new(),
+            library,
+            albums: Arc::default(),
+            photo_albums: None,
+            _load_albums: Task::ready(()),
         };
         this.load_filmstrip(cx);
         this.select(first, window, cx);
@@ -139,6 +165,8 @@ impl PhotoViewer {
             cx.drop_image(loaded.image, Some(window));
         }
         self.load_state = LoadState::Loading;
+        self.photo_albums = None;
+        self.objects = None;
         self.selected = ix;
         self.zoom
             .borrow_mut()
@@ -196,17 +224,209 @@ impl PhotoViewer {
             }
         });
 
+        let library = library::current(cx);
         self._load_details = cx.spawn(async move |this, cx| {
             let details = cx
-                .background_spawn(async move { photo_details(&photo) })
+                .background_spawn({
+                    let photo = photo.clone();
+                    async move { photo_details(&photo) }
+                })
                 .await;
             this.update(cx, |this, cx| {
                 this.details = details;
                 cx.notify();
             })
             .ok();
+
+            // Looking for them may take a moment, so they're added after.
+            let Some(library) = library else {
+                return;
+            };
+            let objects = cx
+                .background_spawn(async move {
+                    let objects = library.objects(&photo).unwrap_or_else(|error| {
+                        eprintln!(
+                            "couldn't find objects in {}: {error:#}",
+                            photo.path.display()
+                        );
+                        None
+                    })?;
+                    let section = objects_section(&objects)?;
+                    Some((Arc::from(objects), section))
+                })
+                .await;
+            if objects.is_some() {
+                this.update(cx, |this, cx| {
+                    this.objects = objects;
+                    cx.notify();
+                })
+                .ok();
+            }
         });
+        self.load_albums(cx);
         cx.notify();
+    }
+
+    /// The albums the photo shown is in, once they're known; never for
+    /// photos that aren't a library's.
+    #[cfg(test)]
+    pub fn photo_albums(&self) -> Option<&[AlbumId]> {
+        self.photo_albums.as_deref()
+    }
+
+    /// Reads the library's albums, and which the selected photo is in.
+    fn load_albums(&mut self, cx: &mut Context<Self>) {
+        let Some(library) = self.library.clone() else {
+            return;
+        };
+        let photo = self.stack.photos[self.selected].clone();
+        self._load_albums = cx.spawn(async move |this, cx| {
+            let loaded = cx
+                .background_spawn(async move {
+                    anyhow::Ok((library.albums()?, library.albums_with(&photo)?))
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                match loaded {
+                    Ok((albums, photo_albums)) => {
+                        this.albums = Arc::new(albums);
+                        this.photo_albums = Some(photo_albums);
+                    }
+                    Err(error) => eprintln!("couldn't read the photo's albums: {error:#}"),
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+    }
+
+    /// Adds the photo shown to an album, or takes it out if it's in it.
+    fn toggle_album(&mut self, album: AlbumId, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(library), Some(photo_albums)) = (self.library.clone(), &self.photo_albums) else {
+            return;
+        };
+        let inside = photo_albums.contains(&album);
+        let photo = self.stack.photos[self.selected].clone();
+        let change = cx.background_spawn(async move {
+            let photos = [photo];
+            match inside {
+                true => library.remove_from_album(album, &photos),
+                false => library.add_to_album(album, &photos),
+            }
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let changed = change.await;
+            this.update_in(cx, |this, window, cx| match changed {
+                Ok(_) => this.albums_changed(cx),
+                Err(error) => show_error("The album couldn't be changed.", &error, window, cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Asks for a name for a new album, makes it, and adds the photo shown.
+    fn add_to_new_album(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(library) = self.library.clone() else {
+            return;
+        };
+        let photo = self.stack.photos[self.selected].clone();
+        let viewer = cx.weak_entity();
+        let create: NameCallback = Rc::new(move |name, window, cx| {
+            let (library, photo, viewer) = (library.clone(), photo.clone(), viewer.clone());
+            let create = cx.background_spawn(async move {
+                let album = library.create_album(&name, None)?;
+                library.add_to_album(album, &[photo])
+            });
+            window.spawn(cx, async move |cx| {
+                create.await?;
+                viewer.update(cx, |viewer, cx| viewer.albums_changed(cx))?;
+                Ok(())
+            })
+        });
+        prompt_for_album_name("New Album", "Create", "", create, window, cx);
+    }
+
+    fn albums_changed(&mut self, cx: &mut Context<Self>) {
+        self.load_albums(cx);
+        cx.emit(ViewerEvent::AlbumsChanged);
+    }
+
+    /// Every album, checked if the photo shown is in it: choosing one adds
+    /// the photo to it or takes it out. Then a new album, for the photo.
+    fn albums_menu(&self, cx: &Context<Self>) -> impl Fn(PopupMenu) -> PopupMenu + 'static {
+        let viewer = cx.weak_entity();
+        let albums = self.albums.clone();
+        let photo_albums = self.photo_albums.clone().unwrap_or_default();
+        move |mut menu| {
+            for (_, album) in tree_order(&albums) {
+                let album = album.id;
+                let viewer = viewer.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(album_title(&albums, album))
+                        .checked(photo_albums.contains(&album))
+                        .on_click(move |_, window, cx| {
+                            viewer
+                                .update(cx, |viewer, cx| viewer.toggle_album(album, window, cx))
+                                .ok();
+                        }),
+                );
+            }
+            if !albums.is_empty() {
+                menu = menu.separator();
+            }
+            let viewer = viewer.clone();
+            menu.item(
+                PopupMenuItem::new("New Album…").on_click(move |_, window, cx| {
+                    viewer
+                        .update(cx, |viewer, cx| viewer.add_to_new_album(window, cx))
+                        .ok();
+                }),
+            )
+        }
+    }
+
+    /// The albums the photo shown is in, with a menu to change them.
+    fn render_albums(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let photo_albums = self.photo_albums.as_ref()?;
+        let menu = Rc::new(self.albums_menu(cx));
+        let button = Button::new("photo-albums")
+            .icon(Icon::new(LucideIcon::Album))
+            .label("Albums")
+            .xsmall()
+            .ghost()
+            .dropdown_menu(move |popup, _, _| menu(popup));
+        let muted_foreground = cx.theme().muted_foreground;
+        let mut titles: Vec<String> = photo_albums
+            .iter()
+            .map(|&album| album_title(&self.albums, album))
+            .filter(|title| !title.is_empty())
+            .collect();
+        titles.sort();
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1p5()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(div().text_xs().text_color(muted_foreground).child("ALBUMS"))
+                        .child(button),
+                )
+                .when(titles.is_empty(), |section| {
+                    section.child(
+                        div()
+                            .text_xs()
+                            .text_color(muted_foreground)
+                            .child("Not in any album."),
+                    )
+                })
+                .children(titles.into_iter().map(|title| div().text_xs().child(title))),
+        )
     }
 
     /// Plays the selected photo's Live Photo video over it, once.
@@ -408,8 +628,22 @@ impl PhotoViewer {
             .right(zoom_label)
     }
 
-    fn render_sidebar(&self, cx: &App) -> impl IntoElement {
-        let muted_foreground = cx.theme().muted_foreground;
+    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let objects = self.objects.as_ref().map(|(_, section)| {
+            let show = settings::get(cx).show_object_boxes;
+            let toggle = Button::new("object-boxes")
+                .icon(Icon::new(LucideIcon::ScanEye))
+                .label(if show { "Hide Boxes" } else { "Show Boxes" })
+                .xsmall()
+                .ghost()
+                .selected(show)
+                .tooltip("Draw boxes around the objects in the photo")
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    settings::set_show_object_boxes(!show, cx);
+                    cx.notify();
+                }));
+            render_section(section, Some(toggle.into_any_element()), cx)
+        });
         div()
             .id("details")
             .flex_none()
@@ -423,35 +657,24 @@ impl PhotoViewer {
             .flex()
             .flex_col()
             .gap_5()
-            .children(self.details.iter().map(|section| {
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1p5()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted_foreground)
-                            .child(section.title.to_uppercase()),
-                    )
-                    .children(section.rows.iter().map(|(label, value)| {
-                        div()
-                            .flex()
-                            .gap_2()
-                            .text_xs()
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .w(px(96.))
-                                    .text_color(muted_foreground)
-                                    .child(label.clone()),
-                            )
-                            .child(div().flex_1().min_w_0().child(value.clone()))
-                    }))
-            }))
+            .children(
+                self.details
+                    .iter()
+                    .map(|section| render_section(section, None, cx)),
+            )
+            .children(objects)
+            .children(self.render_albums(cx))
     }
 
-    fn render_image_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The objects to draw boxes around, if they're shown.
+    pub fn object_boxes(&self, cx: &App) -> Option<Arc<[DetectedObject]>> {
+        self.objects
+            .as_ref()
+            .filter(|_| settings::get(cx).show_object_boxes)
+            .map(|(objects, _)| objects.clone())
+    }
+
+    fn render_image_pane(&self, cx: &mut Context<Self>) -> AnyElement {
         // Until the preview loads, stretch a thumbnail we already have.
         let image = self
             .image
@@ -470,8 +693,9 @@ impl PhotoViewer {
             _ => None,
         };
         let zoom = self.zoom.borrow();
+        let boxes = self.object_boxes(cx);
 
-        div()
+        let pane = div()
             .id("image-pane")
             .relative()
             .flex_1()
@@ -492,7 +716,13 @@ impl PhotoViewer {
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| this.update_zoom(cx, ZoomState::end_drag)),
             )
-            .children(image.map(|image| zoomed_image(image, self.zoom.clone())))
+            .children(image.map(|image| {
+                let image = zoomed_image(image, self.zoom.clone());
+                match boxes {
+                    Some(objects) => image.overlay(ObjectBoxes::new(objects)),
+                    None => image,
+                }
+            }))
             .children(error.map(|error| {
                 div()
                     .size_full()
@@ -506,7 +736,16 @@ impl PhotoViewer {
             .children(self.render_live(cx))
             .when(self.stack.photos.len() > 1, |pane| {
                 pane.child(self.render_filmstrip(cx))
-            })
+            });
+        // Found by UI tests.
+        let pane = pane.test_support();
+        // Right-click for the albums menu, for a library's photos.
+        if self.photo_albums.is_none() {
+            return pane.into_any_element();
+        }
+        let menu = Rc::new(self.albums_menu(cx));
+        pane.context_menu(move |popup, _, _| menu(popup.label("Albums")))
+            .into_any_element()
     }
 
     /// For Live Photos: the video while it plays, and the LIVE button that
@@ -748,4 +987,42 @@ impl Render for PhotoViewer {
             )
             .child(self.render_status_bar(cx))
     }
+}
+
+/// A section of the sidebar: its title, with `action` beside it if given,
+/// over its rows of labels and values.
+fn render_section(section: &DetailSection, action: Option<AnyElement>, cx: &App) -> Div {
+    let muted_foreground = cx.theme().muted_foreground;
+    div()
+        .flex()
+        .flex_col()
+        .gap_1p5()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted_foreground)
+                        .child(section.title.to_uppercase()),
+                )
+                .children(action),
+        )
+        .children(section.rows.iter().map(|(label, value)| {
+            div()
+                .flex()
+                .gap_2()
+                .text_xs()
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(96.))
+                        .text_color(muted_foreground)
+                        .child(label.clone()),
+                )
+                .child(div().flex_1().min_w_0().child(value.clone()))
+        }))
 }

@@ -6,21 +6,23 @@
 
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui_kit::assets::IconName as LucideIcon;
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::menu::PopupMenuItem;
 use gpui_kit::component::sidebar::{
     Sidebar, SidebarCollapsible, SidebarGroup, SidebarItem, SidebarMenu, SidebarMenuItem,
     SidebarToggleButton,
 };
-use gpui_kit::component::{Icon, IconName, Sizable};
+use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable};
 use gpui_kit::{
-    App, Div, Global, IntoElement, KeyBinding, ParentElement, RenderOnce, Styled, ViewElement,
-    Window, div, px,
+    App, Context, Div, Global, InteractiveElement as _, IntoElement, KeyBinding, ParentElement,
+    Render, RenderOnce, Styled, TestSupportExt as _, ViewElement, Window, div, px,
 };
 
 use crate::devices::{self, Device};
-use crate::library;
+use crate::library::{self, Album, AlbumId, child_albums};
 
 gpui_kit::actions!(navigation, [ToggleSidebar, OpenSettings]);
 
@@ -76,11 +78,15 @@ pub fn title_bar_start(title_bar: Div, cx: &App) -> Div {
 
 pub type LibraryCallback = Rc<dyn Fn(&str, &mut Window, &mut App)>;
 pub type DeviceCallback = Rc<dyn Fn(&Device, &mut Window, &mut App)>;
+pub type AlbumCallback = Rc<dyn Fn(AlbumId, &mut Window, &mut App)>;
+/// Makes an album, in the one given if any.
+pub type NewAlbumCallback = Rc<dyn Fn(Option<AlbumId>, &mut Window, &mut App)>;
 
 /// What the sidebar shows about the app's current state.
 pub struct NavigationContext {
     pub page: Page,
-    /// Whether the open library is shown (rather than a device).
+    /// Whether the whole of the open library is shown (rather than an
+    /// album or a device).
     pub showing_library: bool,
     /// Shows the library with this id, opening it if it isn't open.
     pub show_library: LibraryCallback,
@@ -89,6 +95,45 @@ pub struct NavigationContext {
     /// Opens a device's photos, or shows them if it's already open.
     pub show_device: DeviceCallback,
     pub eject_device: DeviceCallback,
+    /// The open library's albums.
+    pub albums: Arc<Vec<Album>>,
+    /// The album shown, if any.
+    pub open_album: Option<AlbumId>,
+    pub show_album: AlbumCallback,
+    pub new_album: NewAlbumCallback,
+    pub rename_album: AlbumCallback,
+    pub delete_album: AlbumCallback,
+    /// Adds the photos being dragged (see `DraggedPhotos`) to an album.
+    pub drop_on_album: AlbumCallback,
+}
+
+/// The gallery's selected photos, being dragged onto an album.
+#[derive(Clone)]
+pub struct DraggedPhotos {
+    /// How many there are, for the badge under the pointer.
+    pub count: usize,
+}
+
+impl Render for DraggedPhotos {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let label = match self.count {
+            1 => "1 photo".to_owned(),
+            count => format!("{count} photos"),
+        };
+        div()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .shadow_md()
+            .text_sm()
+            .bg(cx.theme().primary)
+            .text_color(cx.theme().primary_foreground)
+            .child(Icon::new(LucideIcon::Images).small())
+            .child(label)
+    }
 }
 
 pub fn navigation_sidebar(context: NavigationContext, cx: &App) -> impl IntoElement {
@@ -122,6 +167,7 @@ pub fn navigation_sidebar(context: NavigationContext, cx: &App) -> impl IntoElem
                 .child(toggle_button(false)),
         )
         .child(SidebarGroup::new("Libraries").child(SidebarMenu::new().children(items)))
+        .children(albums_group(&context, cx))
         .children(devices)
         .footer(MenuElement(
             SidebarMenu::new().child(
@@ -131,6 +177,94 @@ pub fn navigation_sidebar(context: NavigationContext, cx: &App) -> impl IntoElem
                     .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenSettings), cx)),
             ),
         ))
+}
+
+/// The open library's albums, nested as they are, and a button to make
+/// one.
+fn albums_group(context: &NavigationContext, cx: &App) -> Option<SidebarGroup<SidebarMenu>> {
+    library::current(cx)?;
+    // The albums the open one is in start out open, to show it.
+    let open_path: Vec<AlbumId> = context
+        .open_album
+        .map(|id| {
+            library::album_path(&context.albums, id)
+                .iter()
+                .map(|album| album.id)
+                .collect()
+        })
+        .unwrap_or_default();
+    let albums =
+        child_albums(&context.albums, None).map(|album| album_item(context, album, &open_path));
+    let new_album = context.new_album.clone();
+    let add = SidebarMenuItem::new("New Album…")
+        .icon(Icon::new(LucideIcon::FolderPlus))
+        .on_click(move |_, window, cx| new_album(None, window, cx));
+    Some(SidebarGroup::new("Albums").child(SidebarMenu::new().children(albums.chain([add]))))
+}
+
+/// An album, with the albums in it beneath, and a menu to make an album in
+/// it, rename it, or delete it.
+fn album_item(
+    context: &NavigationContext,
+    album: &Album,
+    open_path: &[AlbumId],
+) -> SidebarMenuItem {
+    let children: Vec<SidebarMenuItem> = child_albums(&context.albums, Some(album.id))
+        .map(|child| album_item(context, child, open_path))
+        .collect();
+    let id = album.id;
+    let active = context.page == Page::Library && context.open_album == Some(id);
+    let contains_open = open_path.contains(&id) && context.open_album != Some(id);
+    let show_album = context.show_album.clone();
+    let new_album = context.new_album.clone();
+    let rename_album = context.rename_album.clone();
+    let delete_album = context.delete_album.clone();
+    let drop_on_album = context.drop_on_album.clone();
+    SidebarMenuItem::new(album.name.clone())
+        .icon(Icon::new(LucideIcon::Album))
+        .active(active)
+        .default_open(contains_open)
+        .on_click(move |_, window, cx| show_album(id, window, cx))
+        // Photos are dropped on the row. Its suffix is the only place for
+        // that, so it's stretched over the row's label, without taking its
+        // clicks.
+        .suffix(move |_, cx| {
+            let drop_on_album = drop_on_album.clone();
+            let highlight = cx.theme().primary;
+            div()
+                .id(("album-drop", id as u64))
+                .absolute()
+                .inset_0()
+                .rounded_sm()
+                .drag_over::<DraggedPhotos>(move |style, _, _, _| {
+                    style
+                        .bg(highlight.opacity(0.2))
+                        .border_1()
+                        .border_color(highlight)
+                })
+                .on_drop(move |_: &DraggedPhotos, window, cx| drop_on_album(id, window, cx))
+                // Found by UI tests.
+                .test_support()
+        })
+        .children(children)
+        .context_menu(move |menu, _, _| {
+            let new_album = new_album.clone();
+            let rename_album = rename_album.clone();
+            let delete_album = delete_album.clone();
+            menu.item(
+                PopupMenuItem::new("New Album Inside…")
+                    .on_click(move |_, window, cx| new_album(Some(id), window, cx)),
+            )
+            .item(
+                PopupMenuItem::new("Rename…")
+                    .on_click(move |_, window, cx| rename_album(id, window, cx)),
+            )
+            .separator()
+            .item(
+                PopupMenuItem::new("Delete Album…")
+                    .on_click(move |_, window, cx| delete_album(id, window, cx)),
+            )
+        })
 }
 
 /// The removable devices, if any are mounted, each with an eject button.

@@ -2,27 +2,42 @@
 //! with a catalog of the photos in it.
 //!
 //! A library's folder holds a marker, a README and the originals, filed by
-//! the day they were taken:
+//! the day they were taken, and derivatives made from them, such as
+//! thumbnails, laid out the same way (see `derivatives`):
 //!
 //! ```text
 //! 1K Words/
 //!   .1k-words-library
 //!   README.txt
 //!   Originals/2026/10/15/IMG_0001.JPG
+//!   Thumbnails/2026/10/15/IMG_0001.JPG.jpg
 //! ```
 //!
 //! The originals are read-only by default (see `protect`). Each library's
 //! catalog lives in the app's config directory, as `libraries/<id>.db`, and
 //! `libraries.json` there lists the libraries.
 
+mod albums;
 mod catalog;
+mod derivatives;
 mod import;
+mod manage;
+mod objects;
 mod protect;
+mod sync;
 
+pub use albums::{Album, AlbumId, album_path, child_albums, tree_order};
 pub use import::{ImportSession, ImportSummary, Imported, PreparedImport, prepare, source_drive};
+pub use manage::{LibraryHandle, LibraryStats, MoveProgress};
+pub use objects::{ObjectKind, suggestions};
+#[cfg(test)]
+pub(crate) use sync::test_support as sync_test_support;
+pub use sync::{LibraryTarget, SyncStatus, TargetSettings, UploadProgress, UploadSummary};
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -45,6 +60,9 @@ them. Please add and remove photos with the app rather than here: files
 changed, moved or deleted here won't be reflected in the app.
 
 The photos are read-only so they aren't changed by accident.
+
+Thumbnails holds smaller copies of the photos, which the app makes from
+the originals as it needs them.
 ";
 
 /// A library as listed in `libraries.json`.
@@ -74,6 +92,44 @@ pub struct Library {
     /// Held while changing the originals, so imports running at the same
     /// time take turns (see `ImportSession`).
     placing: Mutex<()>,
+    derivatives: Activity,
+    detecting: Activity,
+}
+
+/// Work done in the background, such as making derivatives (see
+/// `Library::make_missing_thumbnails`) or finding objects (see
+/// `Library::detect_missing_objects`).
+#[derive(Default)]
+struct Activity {
+    running: AtomicBool,
+    /// Set to have it look for missing ones again.
+    wanted: AtomicBool,
+}
+
+impl Activity {
+    /// Runs passes of `pass` until it's no longer wanted, returning what
+    /// they did between them. If it's already running, it's asked to run
+    /// another pass when done instead, so photos imported meanwhile aren't
+    /// missed, and this returns at once.
+    fn run(&self, mut pass: impl FnMut() -> Result<usize>) -> Result<usize> {
+        self.wanted.store(true, Ordering::SeqCst);
+        let mut done = 0;
+        while !self.running.swap(true, Ordering::SeqCst) {
+            let result = (|| -> Result<()> {
+                while self.wanted.swap(false, Ordering::SeqCst) {
+                    done += pass()?;
+                }
+                Ok(())
+            })();
+            self.running.store(false, Ordering::SeqCst);
+            result?;
+            // Asked again just as this finished.
+            if !self.wanted.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+        Ok(done)
+    }
 }
 
 impl Library {
@@ -102,6 +158,8 @@ impl Library {
             info,
             catalog,
             placing: Mutex::new(()),
+            derivatives: Activity::default(),
+            detecting: Activity::default(),
         })
     }
 
@@ -111,11 +169,15 @@ impl Library {
 
     /// The library's photos, oldest first.
     pub fn photos(&self) -> Result<Vec<Photo>> {
-        let records = self.catalog.photos()?;
+        Ok(self.photos_from(self.catalog.photos()?))
+    }
+
+    fn photos_from(&self, records: Vec<catalog::PhotoRecord>) -> Vec<Photo> {
         let file = |relative: &str| self.info.path.join(relative);
-        Ok(records
+        records
             .into_iter()
             .map(|record| Photo {
+                thumbnail: self.thumbnail_file(&record.path),
                 path: file(&record.path),
                 raw_pair: record.raw_path.as_deref().map(file),
                 live_video: record.live_video_path.as_deref().map(file),
@@ -123,7 +185,7 @@ impl Library {
                 height: record.height,
                 meta: record.meta,
             })
-            .collect())
+            .collect()
     }
 
     /// Copies the photos among `paths` (files or folders, read recursively)
@@ -131,7 +193,17 @@ impl Library {
     /// instead (see `ImportSession`).
     #[cfg(test)]
     pub fn import(self: &Arc<Self>, paths: &[PathBuf]) -> Result<ImportSummary> {
-        import::import_all(self, crate::photos::images_in(paths))
+        import::import_all(self, crate::photos::images_in(paths), None)
+    }
+
+    /// `import`, adding the photos to `album`.
+    #[cfg(test)]
+    pub fn import_to_album(
+        self: &Arc<Self>,
+        paths: &[PathBuf],
+        album: AlbumId,
+    ) -> Result<ImportSummary> {
+        import::import_all(self, crate::photos::images_in(paths), Some(album))
     }
 }
 
@@ -169,6 +241,9 @@ pub struct Libraries {
     config_dir: PathBuf,
     registry: Registry,
     current: Option<Arc<Library>>,
+    /// Every library that's open, whether it's the current one or being
+    /// synced, say; so each catalog is only opened once.
+    loaded: HashMap<String, Weak<Library>>,
     /// Why no library could be opened, if none is.
     error: Option<SharedString>,
 }
@@ -189,6 +264,19 @@ impl Libraries {
 
     /// Opens the library with `id`, making it the current one.
     fn open(&mut self, id: &str) -> Result<()> {
+        let library = self.load(id, true)?;
+        self.current = Some(library);
+        self.registry.current = Some(id.to_owned());
+        self.error = None;
+        self.save()
+    }
+
+    /// The library with `id`, opening it if it isn't open. Unless `create`
+    /// is set, its folder must be there already.
+    fn load(&mut self, id: &str, create: bool) -> Result<Arc<Library>> {
+        if let Some(library) = self.loaded.get(id).and_then(Weak::upgrade) {
+            return Ok(library);
+        }
         let info = self
             .registry
             .libraries
@@ -196,14 +284,17 @@ impl Libraries {
             .find(|info| info.id == id)
             .cloned()
             .ok_or_else(|| anyhow!("no library with id {id}"))?;
-        if marker_id(&info.path).is_some_and(|marker| marker != info.id) {
-            bail!("{} belongs to a different library", info.path.display());
+        match marker_id(&info.path) {
+            Some(marker) if marker != info.id => {
+                bail!("{} belongs to a different library", info.path.display())
+            }
+            None if !create => bail!("{} isn't there", info.path.display()),
+            _ => {}
         }
-        let library = Library::create_or_open(info, &self.config_dir)?;
-        self.current = Some(Arc::new(library));
-        self.registry.current = Some(id.to_owned());
-        self.error = None;
-        self.save()
+        let library = Arc::new(Library::create_or_open(info, &self.config_dir)?);
+        self.loaded.retain(|_, library| library.strong_count() > 0);
+        self.loaded.insert(id.to_owned(), Arc::downgrade(&library));
+        Ok(library)
     }
 
     /// Adds the library at `path` (creating it, or adopting an existing
@@ -232,6 +323,48 @@ impl Libraries {
         });
         self.open(&id)
     }
+
+    /// Removes a library from the list (once it's been deleted). If it was
+    /// open, opens the first that's left, if any.
+    fn forget(&mut self, id: &str) -> Result<()> {
+        self.registry.libraries.retain(|info| info.id != id);
+        self.loaded.remove(id);
+        if self.registry.current.as_deref() == Some(id) {
+            self.current = None;
+            self.registry.current = None;
+            if let Some(info) = self.registry.libraries.first() {
+                let next = info.id.clone();
+                if let Err(error) = self.open(&next) {
+                    self.error = Some(format!("Couldn't open the library: {error:#}").into());
+                }
+            } else {
+                self.error = Some("There's no library. Make one with File > New Library.".into());
+            }
+        }
+        self.save()
+    }
+
+    /// Records that a library's folder moved to `path` (taking its name
+    /// from the new folder's), reopening it if it's open.
+    fn relocate(&mut self, id: &str, path: PathBuf) -> Result<()> {
+        let info = self
+            .registry
+            .libraries
+            .iter_mut()
+            .find(|info| info.id == id)
+            .ok_or_else(|| anyhow!("no library with id {id}"))?;
+        if let Some(name) = path.file_name() {
+            info.name = name.to_string_lossy().into_owned();
+        }
+        info.path = path;
+        self.loaded.remove(id);
+        if self.current.as_ref().is_some_and(|l| l.info.id == id) {
+            self.current = None;
+            self.open(id)
+        } else {
+            self.save()
+        }
+    }
 }
 
 /// Opens the last library, creating the default one (in the Pictures
@@ -245,6 +378,7 @@ pub fn init(cx: &mut App) {
             config_dir: PathBuf::new(),
             registry: Registry::default(),
             current: None,
+            loaded: HashMap::new(),
             error: Some("Couldn't find the home folder.".into()),
         }),
     }
@@ -259,6 +393,7 @@ pub fn init_at(config_dir: PathBuf, default_dir: PathBuf, cx: &mut App) {
             .unwrap_or_default(),
         config_dir,
         current: None,
+        loaded: HashMap::new(),
         error: None,
     };
     let result = match libraries.registry.current.clone() {
@@ -306,6 +441,38 @@ pub fn open(id: &str, cx: &mut App) -> Result<()> {
 /// opens it.
 pub fn add(path: PathBuf, cx: &mut App) -> Result<()> {
     cx.global_mut::<Libraries>().add(path)
+}
+
+/// A library to work on in the background: to size, move or delete it.
+pub fn handle(id: &str, cx: &App) -> Option<LibraryHandle> {
+    let libraries = cx.try_global::<Libraries>()?;
+    let info = libraries
+        .registry
+        .libraries
+        .iter()
+        .find(|info| info.id == id)?
+        .clone();
+    Some(LibraryHandle {
+        catalog_path: catalog_path(&libraries.config_dir, id),
+        open: libraries.loaded.get(id).and_then(Weak::upgrade),
+        info,
+    })
+}
+
+/// The library with `id`, opening it (without making it current) if it
+/// isn't open. Its folder must be there.
+pub fn get(id: &str, cx: &mut App) -> Result<Arc<Library>> {
+    cx.global_mut::<Libraries>().load(id, false)
+}
+
+/// Forgets a library that's been deleted (see `LibraryHandle::delete`).
+pub fn forget(id: &str, cx: &mut App) -> Result<()> {
+    cx.global_mut::<Libraries>().forget(id)
+}
+
+/// Records that a library has moved (see `LibraryHandle::move_to`).
+pub fn relocate(id: &str, path: PathBuf, cx: &mut App) -> Result<()> {
+    cx.global_mut::<Libraries>().relocate(id, path)
 }
 
 /// Where the New Library dialog starts: the folder the default library

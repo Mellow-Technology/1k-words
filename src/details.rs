@@ -5,6 +5,7 @@ use std::path::Path;
 use exif::{Exif, Tag, Value};
 use gpui_kit::SharedString;
 
+use crate::detect::DetectedObject;
 use crate::location::Location;
 use crate::photos::{Photo, ascii_field, read_exif};
 
@@ -98,6 +99,47 @@ pub fn photo_details(photo: &Photo) -> Vec<DetailSection> {
 
     sections.retain(|section| !section.rows.is_empty());
     sections
+}
+
+/// The objects found in a photo, one row for each kind, the most common
+/// first, e.g. `Person` · `3 (best 91%)`. None if nothing was found.
+pub fn objects_section(objects: &[DetectedObject]) -> Option<DetailSection> {
+    // Grouped by label, keeping the order they were found in (most certain
+    // first) among kinds that are equally common.
+    let mut kinds: Vec<(&str, usize, f32)> = Vec::new();
+    for object in objects {
+        match kinds.iter_mut().find(|(label, ..)| *label == object.label) {
+            Some((_, count, best)) => {
+                *count += 1;
+                *best = best.max(object.confidence);
+            }
+            None => kinds.push((&object.label, 1, object.confidence)),
+        }
+    }
+    kinds.sort_by(|a, b| b.1.cmp(&a.1));
+    let rows: Vec<_> = kinds
+        .into_iter()
+        .map(|(label, count, best)| {
+            let percent = (best * 100.).round();
+            let value = match count {
+                1 => format!("{percent}%"),
+                _ => format!("{count} (best {percent}%)"),
+            };
+            (capitalize(label).into(), value.into())
+        })
+        .collect();
+    (!rows.is_empty()).then(|| DetailSection {
+        title: "Objects".into(),
+        rows,
+    })
+}
+
+pub fn capitalize(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
 
 /// The main facts about a photo, for the quick preview.
@@ -293,6 +335,37 @@ mod tests {
         assert_eq!(format_metres(146.094, ""), "146 m");
         assert_eq!(format_metres(-12.4, ""), "−12 m");
         assert_eq!(format_metres(17.78, "±"), "±18 m");
+    }
+
+    #[test]
+    fn groups_objects() {
+        let object = |label: &str, confidence| DetectedObject {
+            label: label.into(),
+            confidence,
+            bounds: [0., 0., 1., 1.],
+        };
+        assert!(objects_section(&[]).is_none());
+        let section = objects_section(&[
+            object("dog", 0.95),
+            object("person", 0.91),
+            object("baseball bat", 0.5),
+            object("person", 0.66),
+            object("person", 0.7),
+        ])
+        .unwrap();
+        let rows: Vec<_> = section
+            .rows
+            .iter()
+            .map(|(label, value)| (label.as_ref(), value.as_ref()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("Person", "3 (best 91%)"),
+                ("Dog", "95%"),
+                ("Baseball bat", "50%"),
+            ]
+        );
     }
 
     #[test]

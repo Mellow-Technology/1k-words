@@ -1,0 +1,196 @@
+/// Sync plugins: WebAssembly components that copy a library's files to and
+/// from an external service (S3, Dropbox, a NAS, ...).
+///
+/// A plugin only talks to its service. The app decides what to sync and keeps
+/// the canonical record of what's where in the library's catalog, so a plugin
+/// keeps no state between calls: each call gets the target's configuration.
+///
+/// Plugins run sandboxed. They can't touch the file system or the network
+/// directly: they read and write files through handles the app gives them, and
+/// make HTTP requests through the app, only to hosts named in their
+/// configuration (or in `plugin-info.hosts`).
+package onekwords:sync@0.1.0;
+
+interface log {
+    enum level {
+        debug,
+        info,
+        warn,
+        error,
+    }
+
+    /// Writes to the app's log.
+    write: func(level: level, message: string);
+}
+
+interface files {
+    /// A file in the library, opened for a plugin to read.
+    resource source {
+        /// The file's size in bytes.
+        size: func() -> u64;
+        /// Reads up to `len` bytes at `offset`, which is fewer only at the
+        /// end of the file. The app may cap `len`; read in a loop.
+        read: func(offset: u64, len: u32) -> result<list<u8>, string>;
+    }
+
+    /// Where a download goes. The app keeps the file only if the download
+    /// succeeds.
+    resource sink {
+        write: func(bytes: list<u8>) -> result<_, string>;
+    }
+}
+
+interface http {
+    use files.{source, sink};
+
+    type headers = list<tuple<string, string>>;
+
+    record request {
+        method: string,
+        url: string,
+        headers: headers,
+    }
+
+    record response {
+        status: u16,
+        headers: headers,
+        body: list<u8>,
+    }
+
+    /// Network failures, timeouts, and requests the app refused (such as to a
+    /// host the plugin may not use).
+    type error = string;
+
+    /// Sends a request with `body`, which may be empty.
+    send: func(request: request, body: list<u8>) -> result<response, error>;
+
+    /// Sends a request with a file as its body, streamed by the app. The app
+    /// sets `content-length`.
+    send-file: func(request: request, body: borrow<source>) -> result<response, error>;
+
+    /// Sends a request and, if the response is successful (2xx), streams its
+    /// body into `into`, returning the response with an empty body.
+    /// Otherwise the body is returned as with `send`.
+    receive-file: func(request: request, into: borrow<sink>) -> result<response, error>;
+}
+
+interface plugin {
+    use files.{source, sink};
+
+    flags capabilities {
+        upload,
+        download,
+        /// Listing what's on the service. Optional: the app tracks what it
+        /// has synced, so it doesn't rely on this.
+        %list,
+        delete,
+    }
+
+    enum field-kind {
+        text,
+        /// Stored like text, but hidden as it's typed.
+        secret,
+        /// The app also allows requests to this URL's host and subdomains.
+        url,
+        /// "true" or "false".
+        %flag,
+    }
+
+    /// A setting the user fills in when adding a target, e.g. a bucket name.
+    record config-field {
+        key: string,
+        label: string,
+        kind: field-kind,
+        required: bool,
+        default: option<string>,
+        help: option<string>,
+    }
+
+    record plugin-info {
+        /// Stable and unique, e.g. "s3". Targets refer to their plugin by it.
+        id: string,
+        name: string,
+        version: string,
+        capabilities: capabilities,
+        config: list<config-field>,
+        /// Hosts the plugin may always reach (and their subdomains), e.g. a
+        /// service's fixed API host. URL fields' hosts are added to these.
+        hosts: list<string>,
+    }
+
+    /// A target's settings, by `config-field.key`.
+    type config = list<tuple<string, string>>;
+
+    variant sync-error {
+        /// The settings are wrong (bad credentials, no such bucket...).
+        /// Syncing to the target stops until they're changed.
+        config(string),
+        /// Worth trying again later: network trouble, throttling, server
+        /// errors.
+        transient(string),
+        /// The service won't take this item as it is (too big, bad name...).
+        /// It isn't retried automatically.
+        rejected(string),
+        /// The plugin doesn't support this.
+        unsupported,
+    }
+
+    /// A file in the library to upload.
+    record local-item {
+        /// Its path in the target, with `/` separators: the library's folder
+        /// there, then its path in the library, such as
+        /// `1K Words-3f2a9c1e/Originals/2026/10/15/IMG_0001.JPG`. Libraries
+        /// can share a target, and each has its own folder, so this is unique
+        /// within the target and makes a good remote name.
+        path: string,
+        size: u64,
+        media-type: string,
+        /// Seconds since the Unix epoch.
+        modified-at: f64,
+        /// For a file the app made from a photo's originals, what kind it
+        /// is, such as "thumbnail" (under `Thumbnails/` in the library);
+        /// none for an original. A service that makes its own previews can
+        /// reject derivatives.
+        derivative: option<string>,
+    }
+
+    /// An item on the service.
+    record remote-item {
+        /// How the service identifies it (an object key, a file id...).
+        key: string,
+        /// Its path in the target, if the service has paths: the
+        /// `local-item.path` it was uploaded from, for items the app uploaded.
+        path: option<string>,
+        /// A version or ETag, if the service has them.
+        version: option<string>,
+        size: option<u64>,
+    }
+
+    record listing {
+        items: list<remote-item>,
+        /// Pass to `list` for the next page; none at the end.
+        cursor: option<string>,
+    }
+
+    info: func() -> plugin-info;
+
+    /// Checks settings before a target is saved, e.g. that the credentials
+    /// work and the bucket exists.
+    validate: func(config: config) -> result<_, sync-error>;
+
+    upload: func(config: config, item: local-item, data: borrow<source>) -> result<remote-item, sync-error>;
+
+    download: func(config: config, item: remote-item, into: borrow<sink>) -> result<_, sync-error>;
+
+    %list: func(config: config, cursor: option<string>) -> result<listing, sync-error>;
+
+    delete: func(config: config, item: remote-item) -> result<_, sync-error>;
+}
+
+world sync-plugin {
+    import log;
+    import files;
+    import http;
+
+    export plugin;
+}

@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 
+use super::albums::AlbumId;
 use super::catalog::PhotoRecord;
 use super::protect::{self, Unlocked};
 use super::{Library, ORIGINALS_DIR, now};
@@ -78,7 +79,11 @@ impl ImportSummary {
 
 /// Imports `images` start to finish.
 #[cfg(test)]
-pub(super) fn import_all(library: &Arc<Library>, images: Vec<PathBuf>) -> Result<ImportSummary> {
+pub(super) fn import_all(
+    library: &Arc<Library>,
+    images: Vec<PathBuf>,
+    album: Option<AlbumId>,
+) -> Result<ImportSummary> {
     let prepared = prepare(images);
     let mut summary = ImportSummary {
         failed: prepared.failed,
@@ -89,7 +94,7 @@ pub(super) fn import_all(library: &Arc<Library>, images: Vec<PathBuf>) -> Result
     }
     let mut session = ImportSession::new(library.clone())?;
     for shot in &prepared.shots {
-        summary.record(&shot.path, session.import(shot));
+        summary.record(&shot.path, session.import(shot, album));
     }
     if let Err(error) = session.finish() {
         summary
@@ -145,8 +150,22 @@ impl ImportSession {
         })
     }
 
-    pub fn import(&mut self, shot: &Photo) -> Result<Imported> {
+    /// Copies a shot into the library, and adds it to `album` if given,
+    /// even if the library already had it.
+    pub fn import(&mut self, shot: &Photo, album: Option<AlbumId>) -> Result<Imported> {
         let display = self.stage(&shot.path)?;
+        let (hash, size) = (display.hash.clone(), display.size);
+        let result = self.import_staged(shot, display);
+        if let (Ok(_), Some(album)) = (&result, album) {
+            self.library
+                .catalog
+                .add_to_album(album, &hash, size)
+                .context("adding it to the album")?;
+        }
+        result
+    }
+
+    fn import_staged(&mut self, shot: &Photo, display: Staged) -> Result<Imported> {
         // Skip copying the rest of a shot that's already in the library. This
         // is checked again when placing it, in case another session adds it
         // meanwhile.
@@ -413,7 +432,7 @@ fn unique_stem(dir: &Path, stem: &str, extensions: &[String]) -> String {
 }
 
 /// `path` relative to `root`, with `/` separators on every platform.
-fn relative_path(root: &Path, path: &Path) -> Result<String> {
+pub(super) fn relative_path(root: &Path, path: &Path) -> Result<String> {
     let relative = path
         .strip_prefix(root)
         .with_context(|| format!("{} isn't in the library", path.display()))?;
@@ -548,7 +567,7 @@ mod tests {
                         barrier.wait();
                         let mut summary = ImportSummary::default();
                         for shot in &prepared.shots {
-                            summary.record(&shot.path, session.import(shot));
+                            summary.record(&shot.path, session.import(shot, None));
                         }
                         session.finish().unwrap();
                         summary

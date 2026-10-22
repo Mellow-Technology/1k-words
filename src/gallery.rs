@@ -1,36 +1,50 @@
 //! The main gallery view: a toolbar and a virtualized masonry grid of
 //! thumbnails for the currently open folder.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_kit::{
-    App, Context, Div, Entity, FocusHandle, Focusable, KeyBinding, MouseButton, ObjectFit,
-    PathPromptOptions, PromptLevel, RenderImage, ScrollHandle, SharedString, Stateful,
-    Subscription, Task, Window, div, img, point, prelude::*, px, rgb, rgba, svg,
+    AnyElement, App, ClickEvent, Context, Div, Entity, FocusHandle, Focusable, KeyBinding,
+    MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, PathPromptOptions, PromptLevel,
+    RenderImage, ScrollHandle, SharedString, Stateful, Subscription, Task, TestSupportExt as _,
+    Window, deferred, div, img, point, prelude::*, px, rgb, rgba, svg,
 };
 
 use gpui_kit::assets::IconName as LucideIcon;
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::button::{Button, ButtonGroup};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::{Disableable as _, Icon, IconName, Selectable as _, Sizable};
 
+use crate::album_dialogs::{
+    ImportAlbum, NameCallback, album_title, prompt_for_album_name, prompt_for_import_album,
+};
 use crate::aspect_fit::aspect_fit;
 use crate::assets::{BRACKET_ICON, BURST_ICON, LIVE_ICON};
 use crate::decode;
 use crate::devices::{self, Device};
-use crate::library::{self, ImportSession, ImportSummary, Imported, Library, PreparedImport};
+use crate::library::{
+    self, Album, AlbumId, ImportSession, ImportSummary, Imported, Library, ObjectKind,
+    PreparedImport, album_path, tree_order,
+};
+use crate::library_settings::{self, LibraryActions};
 use crate::masonry::{Direction, MasonryOptions, MasonryState, masonry};
-use crate::navigation::{self, NavigationContext, OpenSettings, Page, navigation_sidebar};
+use crate::navigation::{
+    self, DraggedPhotos, NavigationContext, OpenSettings, Page, navigation_sidebar,
+};
 use crate::photos::{self, Photo, Stack, StackKind, StartFrame};
 use crate::quick_preview::QuickPreview;
 use crate::settings::{self, GridLayout};
+use crate::sync_settings;
 use crate::video::{PlaybackState, VideoPlayer};
 use crate::viewer::{PhotoViewer, ViewerEvent};
 
@@ -43,13 +57,30 @@ gpui_kit::actions!(
         SelectRight,
         SelectUp,
         SelectDown,
+        ExtendLeft,
+        ExtendRight,
+        ExtendUp,
+        ExtendDown,
+        SelectAll,
         OpenSelected,
         ToggleQuickPreview,
-        Dismiss
+        Dismiss,
+        NewAlbum,
+        RemoveFromAlbum,
+        NextSuggestion,
+        PreviousSuggestion,
+        AcceptSuggestion,
+        DismissSuggestions
     ]
 );
 
 const KEY_CONTEXT: &str = "Gallery";
+const SEARCH_WIDTH: f32 = 280.;
+/// The key context of the search field, for its suggestions' keys.
+const SEARCH_KEY_CONTEXT: &str = "ObjectSearch";
+const MAX_SUGGESTIONS: usize = 8;
+/// How long typing pauses before the library's searched.
+const SEARCH_DELAY: Duration = Duration::from_millis(150);
 /// The corner radius of gallery tiles.
 const TILE_RADIUS: f32 = 6.;
 /// The width of the ring covering a playing video's corners; matches
@@ -77,24 +108,44 @@ const GRID_PADDING: f32 = 8.;
 const SCROLL_MARGIN: f32 = 16.;
 
 pub fn bind_keys(cx: &mut App) {
-    let context = Some(KEY_CONTEXT);
+    // Not while typing in the search field, where space types a space.
+    let context = Some("Gallery && !Input");
     cx.bind_keys([
         KeyBinding::new("left", SelectLeft, context),
         KeyBinding::new("right", SelectRight, context),
         KeyBinding::new("up", SelectUp, context),
         KeyBinding::new("down", SelectDown, context),
+        KeyBinding::new("shift-left", ExtendLeft, context),
+        KeyBinding::new("shift-right", ExtendRight, context),
+        KeyBinding::new("shift-up", ExtendUp, context),
+        KeyBinding::new("shift-down", ExtendDown, context),
+        KeyBinding::new("cmd-a", SelectAll, context),
+        KeyBinding::new("cmd-backspace", RemoveFromAlbum, context),
         KeyBinding::new("enter", OpenSelected, context),
         KeyBinding::new("space", ToggleQuickPreview, context),
         KeyBinding::new("escape", Dismiss, context),
     ]);
+    // In the search field, ahead of its own bindings for these keys (they
+    // pass them on when there are no suggestions).
+    let search = Some("ObjectSearch > Input");
+    cx.bind_keys([
+        KeyBinding::new("down", NextSuggestion, search),
+        KeyBinding::new("up", PreviousSuggestion, search),
+        KeyBinding::new("enter", AcceptSuggestion, search),
+        KeyBinding::new("escape", DismissSuggestions, search),
+    ]);
 }
 
-/// Thumbnails beyond this count are evicted (least recently shown first) to
-/// bound memory and GPU atlas usage in large folders.
-const MAX_CACHED_THUMBNAILS: usize = 400;
+/// Thumbnails beyond this many bytes of pixels are evicted, least recently
+/// shown first, to bound memory and GPU atlas usage in large folders. Each
+/// is kept in memory and in the atlas, so they take twice this. It's a few
+/// screens of tiles; those on screen are never evicted.
+const THUMBNAIL_BUDGET: usize = 150 << 20;
 
 /// Thumbnails load in two steps: a quick one from the photo's embedded
-/// preview, then one generated from the full image.
+/// preview, then one generated from the full image. A library keeps the
+/// thumbnails it's made (see `library::derivatives`), so they're shown in
+/// one step once they're there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Step {
     Preview,
@@ -136,6 +187,8 @@ struct LivePreview {
 enum Source {
     /// The open library.
     Library,
+    /// An album in the open library.
+    Album(AlbumId),
     /// A device's photos, before they're imported.
     Device(Device),
 }
@@ -145,6 +198,22 @@ enum Status {
     Loaded,
     Error(SharedString),
 }
+
+/// A box dragged out over the grid to select the tiles it touches.
+struct Marquee {
+    /// Where it started and where it's dragged to, in the grid's layout
+    /// (as `MasonryLayout::rect`), so it stays put as the grid scrolls.
+    start: gpui_kit::Point<f32>,
+    end: gpui_kit::Point<f32>,
+    /// What stays selected as well: what was, if it started with ⌘ or
+    /// Shift.
+    base: BTreeSet<usize>,
+    /// Whether it's moved far enough to be a box rather than a click.
+    dragging: bool,
+}
+
+/// How far the mouse moves, pressed, before it's dragging out a box.
+const MARQUEE_THRESHOLD: f32 = 4.;
 
 /// What to import.
 enum ImportJob {
@@ -194,7 +263,8 @@ type LaneKey = (String, u64);
 struct ImportLane {
     key: LaneKey,
     library: Arc<Library>,
-    pending: VecDeque<Photo>,
+    /// Each with the album it's to be added to, if any.
+    pending: VecDeque<(Photo, Option<AlbumId>)>,
     worker: Option<Task<()>>,
 }
 
@@ -205,7 +275,30 @@ pub struct Gallery {
     scroll_handle: ScrollHandle,
     source: Source,
     status: Status,
+    /// The open library's albums, for the sidebar.
+    albums: Arc<Vec<Album>>,
+    _albums_task: Option<Task<()>>,
+    /// Every stack loaded, of which `stacks` are those shown: the ones the
+    /// search matches.
+    all_stacks: Arc<Vec<Stack>>,
     stacks: Arc<Vec<Stack>>,
+    /// Searching the library for kinds of object (see `search_objects`).
+    search: Entity<InputState>,
+    /// What's searched for, trimmed; empty to show every stack.
+    query: String,
+    /// Whether a search is underway, so its results aren't reported missing.
+    searching: bool,
+    _search_task: Option<Task<()>>,
+    _search_subscription: Subscription,
+    /// The kinds of object found in the library, suggested as a search is
+    /// typed. Read again as each new search starts.
+    object_kinds: Arc<Vec<ObjectKind>>,
+    _object_kinds_task: Option<Task<()>>,
+    /// The suggestion picked with the arrow keys, if any.
+    suggestion: Option<usize>,
+    /// Hides the suggestions until the search changes, after one's chosen
+    /// or they're dismissed.
+    suggestions_dismissed: bool,
     masonry: Option<Rc<MasonryState>>,
     /// Bumped whenever something new is shown, so results from in-flight
     /// work for what was shown before are ignored.
@@ -216,8 +309,19 @@ pub struct Gallery {
     in_flight: [usize; 2],
     max_in_flight: [usize; 2],
     frame: u64,
-    /// The stack selected with the keyboard (or last opened).
+    /// The stack selected last, with the keyboard or a click (or last
+    /// opened): where the keyboard moves from, and what the quick preview
+    /// shows. It's among `selection` unless it was just ⌘-clicked off.
     selected: Option<usize>,
+    /// Every stack selected.
+    selection: BTreeSet<usize>,
+    /// Where a range selected with Shift starts.
+    anchor: Option<usize>,
+    /// A box being dragged out over the grid, selecting what it touches.
+    marquee: Option<Marquee>,
+    /// The last mouse press became a box, so the click it ends with
+    /// doesn't select too.
+    marquee_dragged: bool,
     quick_preview: Option<Entity<QuickPreview>>,
     viewer: Option<Entity<PhotoViewer>>,
     _viewer_subscription: Option<Subscription>,
@@ -237,6 +341,30 @@ pub struct Gallery {
 
 impl Gallery {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let search = cx
+            .new(|cx| InputState::new(window, cx).placeholder("Search for objects, such as dogs"));
+        let search_subscription = cx.subscribe_in(
+            &search,
+            window,
+            |this, search, event: &InputEvent, _, cx| match event {
+                InputEvent::Change => {
+                    this.suggestion = None;
+                    this.suggestions_dismissed = false;
+                    let query = search.read(cx).value().trim().to_owned();
+                    // A new search: what's been found may have changed.
+                    if this.query.is_empty() && !query.is_empty() {
+                        this.load_object_kinds(cx);
+                    }
+                    if query != this.query {
+                        this.query = query;
+                        this.apply_search(SEARCH_DELAY, cx);
+                    }
+                    cx.notify();
+                }
+                // Enter is `AcceptSuggestion`.
+                _ => {}
+            },
+        );
         let mut gallery = Self {
             page: Page::Library,
             _appearance_subscription: settings::observe_system_appearance(window),
@@ -244,7 +372,19 @@ impl Gallery {
             scroll_handle: ScrollHandle::new(),
             source: Source::Library,
             status: Status::Loading,
+            albums: Arc::default(),
+            _albums_task: None,
+            all_stacks: Arc::default(),
             stacks: Arc::default(),
+            search,
+            query: String::new(),
+            searching: false,
+            _search_task: None,
+            _search_subscription: search_subscription,
+            object_kinds: Arc::default(),
+            _object_kinds_task: None,
+            suggestion: None,
+            suggestions_dismissed: false,
             masonry: None,
             generation: 0,
             thumbnails: HashMap::new(),
@@ -258,6 +398,10 @@ impl Gallery {
             },
             frame: 0,
             selected: None,
+            selection: BTreeSet::new(),
+            anchor: None,
+            marquee: None,
+            marquee_dragged: false,
             quick_preview: None,
             viewer: None,
             _viewer_subscription: None,
@@ -301,6 +445,160 @@ impl Gallery {
         }
     }
 
+    /// Whether the open library is shown, whole or an album of it.
+    fn showing_library(&self) -> bool {
+        matches!(self.source, Source::Library | Source::Album(_))
+    }
+
+    /// Reads the open library's albums again, for the sidebar.
+    fn load_albums(&mut self, cx: &mut Context<Self>) {
+        let Some(library) = library::current(cx) else {
+            self.albums = Arc::default();
+            return;
+        };
+        self._albums_task = Some(cx.spawn(async move |this, cx| {
+            let albums = cx.background_spawn(async move { library.albums() }).await;
+            this.update(cx, |this, cx| {
+                match albums {
+                    Ok(albums) => this.albums = Arc::new(albums),
+                    Err(error) => eprintln!("couldn't read the albums: {error:#}"),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Shows an album of the open library.
+    fn show_album(&mut self, album: AlbumId, window: &mut Window, cx: &mut Context<Self>) {
+        self.page = Page::Library;
+        if self.source == Source::Album(album) && !matches!(self.status, Status::Error(_)) {
+            self.close_viewer(window, cx);
+            return;
+        }
+        self.notice = None;
+        self.load(Source::Album(album), cx);
+    }
+
+    /// Asks for a name for a new album, in `parent` if given, makes it and
+    /// shows it.
+    fn new_album(&mut self, parent: Option<AlbumId>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(library) = library::current(cx) else {
+            return;
+        };
+        let title = match parent {
+            Some(parent) => format!("New Album in “{}”", album_title(&self.albums, parent)),
+            None => "New Album".into(),
+        };
+        let gallery = cx.weak_entity();
+        let create: NameCallback = Rc::new(move |name, window, cx| {
+            let library = library.clone();
+            let gallery = gallery.clone();
+            let create = cx.background_spawn(async move { library.create_album(&name, parent) });
+            window.spawn(cx, async move |cx| {
+                let album = create.await?;
+                gallery.update_in(cx, |gallery, window, cx| {
+                    gallery.show_album(album, window, cx)
+                })?;
+                Ok(())
+            })
+        });
+        prompt_for_album_name(title, "Create", "", create, window, cx);
+    }
+
+    fn rename_album(&mut self, album: AlbumId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(library) = library::current(cx) else {
+            return;
+        };
+        let Some(name) = self
+            .albums
+            .iter()
+            .find(|a| a.id == album)
+            .map(|a| a.name.clone())
+        else {
+            return;
+        };
+        let gallery = cx.weak_entity();
+        let rename: NameCallback = Rc::new(move |name, window, cx| {
+            let library = library.clone();
+            let gallery = gallery.clone();
+            let rename = cx.background_spawn(async move { library.rename_album(album, &name) });
+            window.spawn(cx, async move |cx| {
+                rename.await?;
+                gallery.update(cx, |gallery, cx| gallery.load_albums(cx))?;
+                Ok(())
+            })
+        });
+        prompt_for_album_name("Rename Album", "Rename", &name, rename, window, cx);
+    }
+
+    /// Asks to delete an album, and the albums in it, then does. Their
+    /// photos stay in the library.
+    fn delete_album(&mut self, album: AlbumId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(library) = library::current(cx) else {
+            return;
+        };
+        let Some(name) = self
+            .albums
+            .iter()
+            .find(|a| a.id == album)
+            .map(|a| a.name.clone())
+        else {
+            return;
+        };
+        let nested = tree_order(&self.albums)
+            .into_iter()
+            .filter(|(_, other)| {
+                other.id != album
+                    && album_path(&self.albums, other.id)
+                        .iter()
+                        .any(|a| a.id == album)
+            })
+            .count();
+        let detail = match nested {
+            0 => "Its photos stay in the library.".to_owned(),
+            1 => "The album in it is deleted too. Their photos stay in the library.".to_owned(),
+            count => format!(
+                "The {count} albums in it are deleted too. Their photos stay in the library."
+            ),
+        };
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("Delete the album “{name}”?"),
+            Some(&detail),
+            &["Delete", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            let delete = library.clone();
+            let result = cx
+                .background_spawn(async move { delete.delete_album(album) })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                if let Err(error) = result {
+                    show_error("The album couldn't be deleted.", &error, window, cx);
+                }
+                // Showing it, or an album in it: back to the library.
+                let showing_deleted = match this.source {
+                    Source::Album(shown) => album_path(&this.albums, shown)
+                        .iter()
+                        .any(|a| a.id == album),
+                    _ => false,
+                };
+                if showing_deleted {
+                    this.load(Source::Library, cx);
+                } else {
+                    this.load_albums(cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Shows `source`, reading its photos in the background.
     fn load(&mut self, source: Source, cx: &mut Context<Self>) {
         self.close(cx);
@@ -313,7 +611,30 @@ impl Gallery {
                     self.status = Status::Error(error);
                     return;
                 };
+                let thumbnails = library.clone();
+                cx.background_spawn(async move {
+                    if let Err(error) = thumbnails.make_missing_thumbnails() {
+                        eprintln!("couldn't make the library's thumbnails: {error:#}");
+                    }
+                    // From the thumbnails, so after them. Tests don't
+                    // download the model.
+                    if !cfg!(test)
+                        && let Err(error) = thumbnails.detect_missing_objects()
+                    {
+                        eprintln!("couldn't find objects in the library's photos: {error:#}");
+                    }
+                })
+                .detach();
+                self.load_albums(cx);
                 cx.background_spawn(async move { library.photos().map(photos::stacks) })
+            }
+            Source::Album(album) => {
+                let Some(library) = library::current(cx) else {
+                    self.status = Status::Error("No library is open.".into());
+                    return;
+                };
+                self.load_albums(cx);
+                cx.background_spawn(async move { library.album_photos(album).map(photos::stacks) })
             }
             Source::Device(device) => {
                 cx.background_spawn(async move { photos::load_device(&device.path) })
@@ -327,9 +648,9 @@ impl Gallery {
                 }
                 match result {
                     Ok(stacks) => {
-                        this.stacks = Arc::new(stacks);
-                        this.build_grid(cx);
+                        this.all_stacks = Arc::new(stacks);
                         this.status = Status::Loaded;
+                        this.apply_search(Duration::ZERO, cx);
                     }
                     Err(error) => this.status = Status::Error(format!("{error:#}").into()),
                 }
@@ -337,6 +658,180 @@ impl Gallery {
             })
             .ok();
         }));
+    }
+
+    /// Shows the stacks with photos of what's searched for, all of them if
+    /// nothing is, once they're found (after `delay`, so typing isn't
+    /// slowed by a search for each key). Devices aren't searched.
+    fn apply_search(&mut self, delay: Duration, cx: &mut Context<Self>) {
+        let library = match self.source {
+            Source::Library | Source::Album(_) if !self.query.is_empty() => library::current(cx),
+            _ => None,
+        };
+        let Some(library) = library else {
+            self._search_task = None;
+            self.searching = false;
+            self.show_stacks(self.all_stacks.clone(), cx);
+            return;
+        };
+        let query = self.query.clone();
+        self.searching = true;
+        self._search_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            let found = cx
+                .background_spawn(async move { library.search_objects(&query) })
+                .await;
+            this.update(cx, |this, cx| {
+                let found = found.unwrap_or_else(|error| {
+                    eprintln!("couldn't search the library: {error:#}");
+                    HashSet::new()
+                });
+                let stacks = this
+                    .all_stacks
+                    .iter()
+                    .filter(|stack| stack.photos.iter().any(|p| found.contains(&p.path)))
+                    .cloned()
+                    .collect();
+                this.searching = false;
+                this.show_stacks(Arc::new(stacks), cx);
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// Reads the kinds of object found in the library, to suggest.
+    fn load_object_kinds(&mut self, cx: &mut Context<Self>) {
+        let Some(library) = library::current(cx) else {
+            return;
+        };
+        self._object_kinds_task = Some(cx.spawn(async move |this, cx| {
+            let kinds = cx
+                .background_spawn(async move { library.object_kinds() })
+                .await;
+            this.update(cx, |this, cx| {
+                match kinds {
+                    Ok(kinds) => this.object_kinds = Arc::new(kinds),
+                    Err(error) => eprintln!("couldn't read the kinds of object: {error:#}"),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// The kinds of object to suggest for what's typed in the search field:
+    /// none once one's chosen, or when what's typed already names the only
+    /// one.
+    /// Only while the search field has focus.
+    fn visible_suggestions(&self, window: &Window, cx: &App) -> Vec<&ObjectKind> {
+        if !self.showing_library()
+            || self.suggestions_dismissed
+            || !self.search.focus_handle(cx).is_focused(window)
+        {
+            return Vec::new();
+        }
+        let mut found = library::suggestions(&self.query, &self.object_kinds);
+        found.truncate(MAX_SUGGESTIONS);
+        if let [only] = found.as_slice()
+            && only.label.eq_ignore_ascii_case(&self.query)
+        {
+            return Vec::new();
+        }
+        found
+    }
+
+    /// Moves the highlight through the suggestions by `step`, wrapping
+    /// around. Passes the key on to the search field when there are none.
+    fn move_suggestion(&mut self, step: isize, window: &Window, cx: &mut Context<Self>) {
+        let count = self.visible_suggestions(window, cx).len() as isize;
+        if count == 0 {
+            cx.propagate();
+            return;
+        }
+        let next = match self.suggestion {
+            Some(ix) => (ix as isize + step).rem_euclid(count),
+            None if step > 0 => 0,
+            None => count - 1,
+        };
+        self.suggestion = Some(next as usize);
+        cx.notify();
+    }
+
+    /// Enter in the search field: searches for the highlighted suggestion,
+    /// or, with none, goes on to the results, to pick one with the keyboard.
+    fn accept_suggestion(
+        &mut self,
+        _: &AcceptSuggestion,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let label = self.suggestion.and_then(|ix| {
+            let suggestions = self.visible_suggestions(window, cx);
+            suggestions.get(ix).map(|kind| kind.label.clone())
+        });
+        match label {
+            Some(label) => self.choose_suggestion(label, window, cx),
+            None => window.focus(&self.focus_handle, cx),
+        }
+    }
+
+    /// Searches for the kind of object `label`, and goes on to the results.
+    fn choose_suggestion(&mut self, label: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.search
+            .update(cx, |search, cx| search.set_value(label.clone(), window, cx));
+        self.suggestion = None;
+        self.suggestions_dismissed = true;
+        if label != self.query {
+            self.query = label;
+            self.apply_search(Duration::ZERO, cx);
+        }
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    fn dismiss_suggestions(
+        &mut self,
+        _: &DismissSuggestions,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.visible_suggestions(window, cx).is_empty() {
+            cx.propagate();
+            return;
+        }
+        self.suggestion = None;
+        self.suggestions_dismissed = true;
+        cx.notify();
+    }
+
+    /// Shows `stacks` in place of those shown, once loading's done; the
+    /// load shows what the search matches when it finishes.
+    fn show_stacks(&mut self, stacks: Arc<Vec<Stack>>, cx: &mut Context<Self>) {
+        if !matches!(self.status, Status::Loaded) {
+            return;
+        }
+        // Thumbnails on their way are for the stacks shown before.
+        self.generation += 1;
+        self._live_hover = None;
+        self.stop_live_preview(cx);
+        self.close_quick_preview(cx);
+        self.clear_selection();
+        self.clear_thumbnails(cx);
+        self.stacks = stacks;
+        self.build_grid(cx);
+        self.scroll_handle.set_offset(point(px(0.), px(0.)));
+        cx.notify();
+    }
+
+    fn clear_thumbnails(&mut self, cx: &mut Context<Self>) {
+        for (_, thumbnail) in self.thumbnails.drain() {
+            if let Some(image) = thumbnail.image {
+                cx.drop_image(image, None);
+            }
+        }
+        self.queues = Default::default();
+        self.in_flight = [0; 2];
     }
 
     /// Lays out the grid for the stacks shown, in the chosen layout. A square
@@ -455,20 +950,18 @@ impl Gallery {
         self._live_hover = None;
         self.stop_live_preview(cx);
         self.close_quick_preview(cx);
-        self.selected = None;
+        self.clear_selection();
 
         if let Some(viewer) = self.viewer.take() {
             viewer.update(cx, |viewer, cx| viewer.release_images(None, cx));
         }
         self._viewer_subscription = None;
 
-        for (_, thumbnail) in self.thumbnails.drain() {
-            if let Some(image) = thumbnail.image {
-                cx.drop_image(image, None);
-            }
-        }
-        self.queues = Default::default();
-        self.in_flight = [0; 2];
+        self.clear_thumbnails(cx);
+        self._search_task = None;
+        self.searching = false;
+        self.object_kinds = Arc::default();
+        self.all_stacks = Arc::default();
         self.stacks = Arc::default();
         self.masonry = None;
         self.status = Status::Loading;
@@ -525,7 +1018,7 @@ impl Gallery {
                 return;
             };
             this.update_in(cx, |this, window, cx| {
-                this.queue_import(ImportJob::Paths(paths), window, cx);
+                this.choose_import_album(ImportJob::Paths(paths), window, cx);
             })
             .ok();
         })
@@ -534,16 +1027,92 @@ impl Gallery {
 
     fn import_device(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Source::Device(device) = &self.source {
-            self.queue_import(ImportJob::Device(device.path.clone()), window, cx);
+            let job = ImportJob::Device(device.path.clone());
+            self.choose_import_album(job, window, cx);
         }
+    }
+
+    /// Asks which album to add the photos being imported to, if any, then
+    /// imports them. Starts with the album shown, if one is.
+    fn choose_import_album(&mut self, job: ImportJob, window: &mut Window, cx: &mut Context<Self>) {
+        if library::current(cx).is_none() {
+            return;
+        }
+        let shown = match self.source {
+            Source::Album(album) => Some(album),
+            _ => None,
+        };
+        let job = Rc::new(RefCell::new(Some(job)));
+        let gallery = cx.weak_entity();
+        let on_import = Rc::new(
+            move |album: Option<ImportAlbum>, window: &mut Window, cx: &mut App| {
+                let Some(job) = job.borrow_mut().take() else {
+                    return;
+                };
+                gallery
+                    .update(cx, |gallery, cx| {
+                        gallery.import_into(job, album, window, cx)
+                    })
+                    .ok();
+            },
+        );
+        prompt_for_import_album(&self.albums, shown, on_import, window, cx);
+    }
+
+    /// Imports into `album`, making it first if it's new.
+    fn import_into(
+        &mut self,
+        job: ImportJob,
+        album: Option<ImportAlbum>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (name, parent) = match album {
+            None => return self.queue_import(job, None, window, cx),
+            Some(ImportAlbum::Existing(album)) => {
+                return self.queue_import(job, Some(album), window, cx);
+            }
+            Some(ImportAlbum::New { name, parent }) => (name, parent),
+        };
+        let Some(library) = library::current(cx) else {
+            return;
+        };
+        let create = cx.background_spawn(async move { library.create_album(&name, parent) });
+        cx.spawn_in(window, async move |this, cx| {
+            let created = create.await;
+            this.update_in(cx, |this, window, cx| match created {
+                Ok(album) => {
+                    this.load_albums(cx);
+                    this.queue_import(job, Some(album), window, cx);
+                }
+                Err(error) => show_error("The album couldn't be made.", &error, window, cx),
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Adds an import to the queue, into the open library. Its photos are
     /// found in the background, then queued to be copied.
-    fn queue_import(&mut self, job: ImportJob, window: &mut Window, cx: &mut Context<Self>) {
+    fn queue_import(
+        &mut self,
+        job: ImportJob,
+        album: Option<AlbumId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(library) = library::current(cx) else {
             return;
         };
+        if library_settings::is_busy(cx) {
+            show_warning(
+                "Please wait until the library is free.",
+                "Photos can't be imported while a library is being moved or deleted.",
+                window,
+                cx,
+            );
+            return;
+        }
         if !self.imports.is_active() {
             self.notice = None;
         }
@@ -578,11 +1147,11 @@ impl Gallery {
                 imports.summary.failed.extend(failed);
                 for (key, shot) in shots {
                     match imports.lane(&key) {
-                        Some(lane) => lane.pending.push_back(shot),
+                        Some(lane) => lane.pending.push_back((shot, album)),
                         None => imports.lanes.push(ImportLane {
                             key,
                             library: library.clone(),
-                            pending: VecDeque::from([shot]),
+                            pending: VecDeque::from([(shot, album)]),
                             worker: None,
                         }),
                     }
@@ -643,7 +1212,7 @@ impl Gallery {
                     })
                     .ok()
                     .flatten();
-                let Some(shot) = next else {
+                let Some((shot, album)) = next else {
                     break;
                 };
                 let previous = session.take();
@@ -655,7 +1224,7 @@ impl Gallery {
                             None => ImportSession::new(library),
                         };
                         let result = match &mut current {
-                            Ok(session) => session.import(&shot),
+                            Ok(session) => session.import(&shot, album),
                             Err(error) => Err(anyhow::anyhow!("{error:#}")),
                         };
                         (current.ok(), shot.path, result)
@@ -664,7 +1233,9 @@ impl Gallery {
                 session = next_session;
                 this.update(cx, |this, cx| {
                     let imports = &mut this.imports;
-                    if matches!(result, Ok(Imported::Added)) {
+                    // Changed by what's added, or by an album added to.
+                    if matches!(result, Ok(Imported::Added)) || (album.is_some() && result.is_ok())
+                    {
                         imports.added_to.insert(key.0.clone());
                     }
                     imports.summary.record(&path, result);
@@ -701,6 +1272,9 @@ impl Gallery {
     fn finish_imports(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let imports = std::mem::take(&mut self.imports);
         cx.notify();
+        if self.page == Page::Settings {
+            library_settings::refresh_stats(cx);
+        }
         if imports.total == 0 && imports.summary.failed.is_empty() {
             self.notice = Some("No photos found to import.".into());
             return;
@@ -710,15 +1284,139 @@ impl Gallery {
             let detail = failure_list(&imports.summary.failed);
             show_warning("Some photos couldn't be imported.", &detail, window, cx);
         }
-        let showing_added_library = self.source == Source::Library
+        let showing_added_library = self.showing_library()
             && library::current(cx).is_some_and(|l| imports.added_to.contains(&l.info.id));
         if showing_added_library {
             if self.viewer.is_some() {
                 self.stale = true;
+                self.load_albums(cx);
             } else {
-                self.load(Source::Library, cx);
+                self.load(self.source.clone(), cx);
             }
         }
+    }
+
+    /// Whether a library can be moved or deleted now, warning if not.
+    fn can_change_libraries(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.imports.is_active()
+            || library_settings::is_busy(cx)
+            || sync_settings::is_syncing(cx)
+        {
+            show_warning(
+                "Please wait until the library is free.",
+                "Libraries can't be moved or deleted while photos are being imported or \
+                 synced, or another library is being moved or deleted.",
+                window,
+                cx,
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Asks where to move a library's folder, then moves it there.
+    fn move_library(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_change_libraries(window, cx) {
+            return;
+        }
+        let Some(handle) = library::handle(id, cx) else {
+            return;
+        };
+        let Some(parent) = handle.info.path.parent() else {
+            return;
+        };
+        let dest = cx.prompt_for_new_path(parent, Some(&handle.info.name));
+        let id = id.to_owned();
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(dest))) = dest.await else {
+                return;
+            };
+            let progress = cx.update(|_, cx| library_settings::start(&id, "Moving", cx));
+            let Ok(progress) = progress else {
+                return;
+            };
+            let to = dest.clone();
+            let result = cx
+                .background_spawn(async move { handle.move_to(&to, &progress) })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                library_settings::finish(&id, cx);
+                match result.and_then(|warning| {
+                    library::relocate(&id, dest, cx)?;
+                    Ok(warning)
+                }) {
+                    Ok(warning) => {
+                        if let Some(warning) = warning {
+                            show_warning("The library was moved.", &warning, window, cx);
+                        }
+                    }
+                    Err(error) => show_error("The library couldn't be moved.", &error, window, cx),
+                }
+                this.libraries_changed(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Asks to confirm, then moves a library's folder to the Trash and
+    /// forgets it.
+    fn delete_library(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_change_libraries(window, cx) {
+            return;
+        }
+        let Some(handle) = library::handle(id, cx) else {
+            return;
+        };
+        let photos = match library_settings::photo_count(id, cx) {
+            Some(1) => "its photo".to_owned(),
+            Some(count) => format!("all {count} of its photos"),
+            None => "all its photos".to_owned(),
+        };
+        let detail = format!(
+            "The library's folder, with {photos}, will be moved to the Trash from {}. \
+             Its catalog and sync settings will be deleted.",
+            handle.info.path.display()
+        );
+        let answer = window.prompt(
+            PromptLevel::Critical,
+            &format!("Delete “{}”?", handle.info.name),
+            Some(&detail),
+            &["Move to Trash", "Cancel"],
+            cx,
+        );
+        let id = id.to_owned();
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            if cx
+                .update(|_, cx| library_settings::start(&id, "Deleting", cx))
+                .is_err()
+            {
+                return;
+            }
+            let result = cx.background_spawn(async move { handle.delete() }).await;
+            this.update_in(cx, |this, window, cx| {
+                library_settings::finish(&id, cx);
+                if let Err(error) = result.and_then(|()| library::forget(&id, cx)) {
+                    show_error("The library couldn't be deleted.", &error, window, cx);
+                }
+                this.libraries_changed(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// After a library's moved or deleted: shows the open library afresh,
+    /// and updates the Libraries settings.
+    fn libraries_changed(&mut self, cx: &mut Context<Self>) {
+        if self.showing_library() {
+            self.load(Source::Library, cx);
+        }
+        library_settings::refresh_stats(cx);
+        cx.notify();
     }
 
     fn prompt_for_new_library(
@@ -756,6 +1454,7 @@ impl Gallery {
                 "Library",
                 library::current(cx).map_or_else(|| "None".into(), |l| l.info.name.clone().into()),
             ),
+            Source::Album(album) => ("Albums", album_title(&self.albums, *album).into()),
             Source::Device(device) => ("Devices", device.name.clone()),
         }
     }
@@ -770,12 +1469,22 @@ impl Gallery {
         self._live_hover = None;
         self.stop_live_preview(cx);
         self.close_quick_preview(cx);
-        self.selected = Some(ix);
+        if self.selection.contains(&ix) {
+            self.selected = Some(ix);
+        } else {
+            self.select_only(ix);
+        }
         let Some(stack) = self.stacks.get(ix).cloned() else {
             return;
         };
         let cover_thumbnail = self.thumbnails.get(&ix).and_then(|t| t.image.clone());
-        let viewer = cx.new(|cx| PhotoViewer::new(stack, cover_thumbnail, start, window, cx));
+        // For its albums menu.
+        let library = self
+            .showing_library()
+            .then(|| library::current(cx))
+            .flatten();
+        let viewer =
+            cx.new(|cx| PhotoViewer::new(stack, cover_thumbnail, start, library, window, cx));
         self._viewer_subscription = Some(cx.subscribe_in(
             &viewer,
             window,
@@ -783,6 +1492,12 @@ impl Gallery {
                 ViewerEvent::Close => this.close_viewer(window, cx),
                 ViewerEvent::Previous => this.open_adjacent_viewer(-1, window, cx),
                 ViewerEvent::Next => this.open_adjacent_viewer(1, window, cx),
+                ViewerEvent::AlbumsChanged => {
+                    this.load_albums(cx);
+                    if matches!(this.source, Source::Album(_)) {
+                        this.stale = true;
+                    }
+                }
             },
         ));
         let focus_handle = viewer.focus_handle(cx);
@@ -821,7 +1536,7 @@ impl Gallery {
         self._viewer_subscription = None;
         window.focus(&self.focus_handle, cx);
         if self.stale {
-            self.load(Source::Library, cx);
+            self.load(self.source.clone(), cx);
         }
         cx.notify();
     }
@@ -833,7 +1548,9 @@ impl Gallery {
         self.page == Page::Library && self.viewer.is_none() && !self.stacks.is_empty()
     }
 
-    fn move_selection(&mut self, direction: Direction, cx: &mut Context<Self>) {
+    /// Moves the selection to the neighbouring tile, or with `extend`,
+    /// selects the range from the anchor to it.
+    fn move_selection(&mut self, direction: Direction, extend: bool, cx: &mut Context<Self>) {
         if !self.is_browsing() {
             return;
         }
@@ -862,7 +1579,14 @@ impl Gallery {
             Some(ix) => layout.neighbor(ix, direction),
             None => self.first_visible(),
         };
-        if let Some(ix) = next {
+        let Some(ix) = next else {
+            return;
+        };
+        if extend {
+            self.select_range(ix, false);
+            self.scroll_into_view(ix);
+            cx.notify();
+        } else {
             self.select(ix, start, cx);
         }
     }
@@ -884,12 +1608,271 @@ impl Gallery {
     }
 
     fn select(&mut self, ix: usize, start: StartFrame, cx: &mut Context<Self>) {
-        self.selected = Some(ix);
+        self.select_only(ix);
         self.scroll_into_view(ix);
         if self.quick_preview.is_some() {
             self.open_quick_preview(start, cx);
         }
         cx.notify();
+    }
+
+    /// A point in the window, in the grid's layout.
+    fn grid_point(&self, position: gpui_kit::Point<gpui_kit::Pixels>) -> gpui_kit::Point<f32> {
+        let bounds = self.scroll_handle.bounds();
+        let offset = self.scroll_handle.offset();
+        gpui_kit::point(
+            f32::from(position.x - bounds.origin.x - offset.x) - GRID_PADDING,
+            f32::from(position.y - bounds.origin.y - offset.y) - GRID_PADDING,
+        )
+    }
+
+    /// A press in the grid: it may become a box, once it's dragged.
+    fn start_marquee(&mut self, event: &MouseDownEvent) {
+        self.marquee_dragged = false;
+        if !self.is_browsing() || self.quick_preview.is_some() {
+            return;
+        }
+        let point = self.grid_point(event.position);
+        // A press on the selection drags it instead (see
+        // `render_tile_with_menu`).
+        if self.showing_library() && self.selected_at(point) {
+            return;
+        }
+        let keep = event.modifiers.shift || event.modifiers.platform;
+        self.marquee = Some(Marquee {
+            start: point,
+            end: point,
+            base: if keep {
+                self.selection.clone()
+            } else {
+                BTreeSet::new()
+            },
+            dragging: false,
+        });
+    }
+
+    /// Whether a selected tile is at `point`, in the grid's layout.
+    fn selected_at(&self, point: gpui_kit::Point<f32>) -> bool {
+        let Some(layout) = self.masonry.as_ref().and_then(|state| state.layout()) else {
+            return false;
+        };
+        layout
+            .items_in_range(point.y, point.y)
+            .into_iter()
+            .filter(|ix| self.selection.contains(ix))
+            .any(|ix| {
+                layout.rect(ix).is_some_and(|rect| {
+                    (rect.origin.x..=rect.origin.x + rect.size.width).contains(&point.x)
+                        && (rect.origin.y..=rect.origin.y + rect.size.height).contains(&point.y)
+                })
+            })
+    }
+
+    /// Follows the mouse with the box, selecting the tiles it touches, and
+    /// scrolls when it's dragged past the top or bottom of the grid.
+    fn drag_marquee(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.marquee.is_none() {
+            return;
+        }
+        // Let go somewhere the gallery didn't see.
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.end_marquee(cx);
+            return;
+        }
+        let bounds = self.scroll_handle.bounds();
+        let beyond = if event.position.y < bounds.top() {
+            event.position.y - bounds.top()
+        } else if event.position.y > bounds.bottom() {
+            event.position.y - bounds.bottom()
+        } else {
+            px(0.)
+        };
+        if beyond != px(0.) {
+            let offset = self.scroll_handle.offset();
+            let max = self.scroll_handle.max_offset().y;
+            let y = (offset.y - beyond).clamp(-max, px(0.));
+            self.scroll_handle.set_offset(point(offset.x, y));
+        }
+        let end = self.grid_point(event.position);
+        let Some(marquee) = self.marquee.as_mut() else {
+            return;
+        };
+        marquee.end = end;
+        let moved = (end.x - marquee.start.x).hypot(end.y - marquee.start.y);
+        if !marquee.dragging && moved < MARQUEE_THRESHOLD {
+            return;
+        }
+        if !marquee.dragging {
+            marquee.dragging = true;
+            self.marquee_dragged = true;
+            self._live_hover = None;
+            self.stop_live_preview(cx);
+        }
+        self.select_in_marquee();
+        cx.notify();
+    }
+
+    fn end_marquee(&mut self, cx: &mut Context<Self>) {
+        if self.marquee.take().is_some_and(|marquee| marquee.dragging) {
+            cx.notify();
+        }
+    }
+
+    /// Selects the tiles the box touches, as well as what it started with.
+    fn select_in_marquee(&mut self) {
+        let (Some(marquee), Some(layout)) = (
+            self.marquee.as_ref(),
+            self.masonry.as_ref().and_then(|state| state.layout()),
+        ) else {
+            return;
+        };
+        let (left, right) = (
+            marquee.start.x.min(marquee.end.x),
+            marquee.start.x.max(marquee.end.x),
+        );
+        let (top, bottom) = (
+            marquee.start.y.min(marquee.end.y),
+            marquee.start.y.max(marquee.end.y),
+        );
+        let touched: Vec<usize> = layout
+            .items_in_range(top, bottom)
+            .into_iter()
+            .filter(|&ix| {
+                layout.rect(ix).is_some_and(|rect| {
+                    rect.origin.x <= right
+                        && rect.origin.x + rect.size.width >= left
+                        && rect.origin.y <= bottom
+                        && rect.origin.y + rect.size.height >= top
+                })
+            })
+            .collect();
+        let mut selection = marquee.base.clone();
+        selection.extend(touched.iter().copied());
+        self.selection = selection;
+        self.selected = touched
+            .iter()
+            .min()
+            .copied()
+            .or(self.selected.filter(|ix| self.selection.contains(ix)));
+        self.anchor = self.selected;
+    }
+
+    /// The box being dragged out, over the grid it's in.
+    fn render_marquee(&self, cx: &App) -> Option<impl IntoElement> {
+        let marquee = self.marquee.as_ref().filter(|marquee| marquee.dragging)?;
+        let offset = self.scroll_handle.offset();
+        let size = self.scroll_handle.bounds().size;
+        // From the grid's layout to the view, cut to what's in view.
+        let x = |x: f32| (x + GRID_PADDING + f32::from(offset.x)).clamp(0., f32::from(size.width));
+        let y = |y: f32| (y + GRID_PADDING + f32::from(offset.y)).clamp(0., f32::from(size.height));
+        let (left, right) = (
+            x(marquee.start.x.min(marquee.end.x)),
+            x(marquee.start.x.max(marquee.end.x)),
+        );
+        let (top, bottom) = (
+            y(marquee.start.y.min(marquee.end.y)),
+            y(marquee.start.y.max(marquee.end.y)),
+        );
+        let primary = cx.theme().primary;
+        Some(
+            div()
+                .absolute()
+                .left(px(left))
+                .top(px(top))
+                .w(px(right - left))
+                .h(px(bottom - top))
+                .rounded_sm()
+                .border_1()
+                .border_color(primary.opacity(0.7))
+                .bg(primary.opacity(0.15)),
+        )
+    }
+
+    /// Selects just the tile at `ix`.
+    fn select_only(&mut self, ix: usize) {
+        self.selection = BTreeSet::from([ix]);
+        self.selected = Some(ix);
+        self.anchor = Some(ix);
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection.clear();
+        self.selected = None;
+        self.anchor = None;
+    }
+
+    /// Selects the tiles from the anchor to `ix`, in the grid's order, in
+    /// place of what's selected, or with `add`, as well.
+    fn select_range(&mut self, ix: usize, add: bool) {
+        let anchor = self.anchor.or(self.selected).unwrap_or(ix);
+        let range = anchor.min(ix)..=anchor.max(ix);
+        if !add {
+            self.selection.clear();
+        }
+        self.selection.extend(range);
+        self.selected = Some(ix);
+        self.anchor = Some(anchor);
+    }
+
+    /// Selects the tile at `ix`, or deselects it if it's selected.
+    fn toggle_selected(&mut self, ix: usize) {
+        if !self.selection.remove(&ix) {
+            self.selection.insert(ix);
+        }
+        self.selected = Some(ix);
+        self.anchor = Some(ix);
+    }
+
+    /// A click on a tile: one selects it alone, with ⌘ toggles it, with
+    /// Shift selects the range to it (⌘⇧ adds the range); two open it.
+    fn click_tile(
+        &mut self,
+        ix: usize,
+        event: &ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.marquee_dragged {
+            return;
+        }
+        if event.click_count() >= 2 {
+            self.open_viewer(ix, StartFrame::Cover, window, cx);
+            return;
+        }
+        let modifiers = event.modifiers();
+        if modifiers.shift {
+            self.select_range(ix, modifiers.platform);
+        } else if modifiers.platform {
+            self.toggle_selected(ix);
+        } else {
+            self.select_only(ix);
+        }
+        if self.quick_preview.is_some() && self.selection.contains(&ix) {
+            self.open_quick_preview(StartFrame::Cover, cx);
+        }
+        cx.notify();
+    }
+
+    fn select_all(&mut self, cx: &mut Context<Self>) {
+        if !self.is_browsing() {
+            return;
+        }
+        self.selection = (0..self.stacks.len()).collect();
+        if self.selected.is_none() {
+            self.selected = Some(0);
+            self.anchor = Some(0);
+        }
+        cx.notify();
+    }
+
+    /// The photos of every stack selected (each frame of a bracket or
+    /// burst), in the grid's order.
+    fn selected_photos(&self) -> Vec<Photo> {
+        self.selection
+            .iter()
+            .filter_map(|&ix| self.stacks.get(ix))
+            .flat_map(|stack| stack.photos.iter().cloned())
+            .collect()
     }
 
     /// Scrolls the grid just enough to show the tile, plus a margin.
@@ -974,7 +1957,8 @@ impl Gallery {
     fn dismiss(&mut self, cx: &mut Context<Self>) {
         if self.quick_preview.is_some() {
             self.close_quick_preview(cx);
-        } else if self.is_browsing() && self.selected.take().is_some() {
+        } else if self.is_browsing() && !self.selection.is_empty() {
+            self.clear_selection();
             cx.notify();
         }
     }
@@ -1016,10 +2000,29 @@ impl Gallery {
             .child(div().text_sm().child("Settings"))
     }
 
+    fn library_actions(&self, cx: &mut Context<Self>) -> LibraryActions {
+        let gallery = cx.weak_entity();
+        let delete_gallery = gallery.clone();
+        LibraryActions {
+            move_library: Rc::new(move |id, window, cx| {
+                gallery
+                    .update(cx, |gallery, cx| gallery.move_library(id, window, cx))
+                    .ok();
+            }),
+            delete_library: Rc::new(move |id, window, cx| {
+                delete_gallery
+                    .update(cx, |gallery, cx| gallery.delete_library(id, window, cx))
+                    .ok();
+            }),
+        }
+    }
+
     fn render_navigation(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let gallery = cx.weak_entity();
         let show_device_gallery = gallery.clone();
         let eject_gallery = gallery.clone();
+        let albums_gallery = gallery.clone();
+        let new_album_gallery = gallery.clone();
         navigation_sidebar(
             NavigationContext {
                 page: self.page,
@@ -1031,7 +2034,7 @@ impl Gallery {
                 }),
                 open_device: match &self.source {
                     Source::Device(device) => Some(device.path.clone()),
-                    Source::Library => None,
+                    _ => None,
                 },
                 show_device: Rc::new(move |device, window, cx| {
                     show_device_gallery
@@ -1043,6 +2046,20 @@ impl Gallery {
                         .update(cx, |gallery, cx| gallery.eject_device(device, window, cx))
                         .ok();
                 }),
+                albums: self.albums.clone(),
+                open_album: match self.source {
+                    Source::Album(album) => Some(album),
+                    _ => None,
+                },
+                show_album: album_callback(&albums_gallery, Self::show_album),
+                new_album: Rc::new(move |parent, window, cx| {
+                    new_album_gallery
+                        .update(cx, |gallery, cx| gallery.new_album(parent, window, cx))
+                        .ok();
+                }),
+                rename_album: album_callback(&albums_gallery, Self::rename_album),
+                delete_album: album_callback(&albums_gallery, Self::delete_album),
+                drop_on_album: album_callback(&albums_gallery, Self::drop_on_album),
             },
             cx,
         )
@@ -1102,13 +2119,32 @@ impl Gallery {
         thumbnail.state = ThumbnailState::Loading(step);
         self.in_flight[step as usize] += 1;
         let generation = self.generation;
+        // Library photos' thumbnails are kept in the library once made.
+        let library = photo
+            .thumbnail
+            .is_some()
+            .then(|| library::current(cx))
+            .flatten();
 
         cx.spawn(async move |this, cx| {
+            // The image, and whether it's the finished thumbnail.
             let result = cx
                 .background_spawn(async move {
-                    match step {
-                        Step::Preview => Ok(decode::preview_thumbnail(&photo)),
-                        Step::Full => decode::full_thumbnail(&photo).map(Some),
+                    match (step, library) {
+                        (Step::Preview, _) => {
+                            if let Some(kept) =
+                                photo.thumbnail.as_deref().and_then(decode::kept_thumbnail)
+                            {
+                                return Ok((Some(kept), true));
+                            }
+                            Ok((decode::preview_thumbnail(&photo), false))
+                        }
+                        (Step::Full, Some(library)) => library
+                            .make_thumbnail(&photo)
+                            .map(|image| (Some(decode::to_render_image(image)), true)),
+                        (Step::Full, None) => {
+                            decode::full_thumbnail(&photo).map(|image| (Some(image), true))
+                        }
                     }
                 })
                 .await;
@@ -1119,17 +2155,19 @@ impl Gallery {
                 this.in_flight[step as usize] -= 1;
                 // The thumbnail may have been evicted while loading.
                 let Some(thumbnail) = this.thumbnails.get_mut(&ix) else {
-                    if let Ok(Some(image)) = result {
+                    if let Ok((Some(image), _)) = result {
                         cx.drop_image(image, None);
                     }
                     return;
                 };
-                if let Ok(Some(image)) = result
+                let finished = matches!(result, Ok((_, true)));
+                if let Ok((Some(image), _)) = result
                     && let Some(old) = thumbnail.image.replace(image)
                 {
                     cx.drop_image(old, None);
                 }
                 thumbnail.state = match step {
+                    Step::Preview if finished => ThumbnailState::Done,
                     Step::Preview => ThumbnailState::NeedsFull,
                     Step::Full if thumbnail.image.is_some() => ThumbnailState::Done,
                     Step::Full => ThumbnailState::Failed,
@@ -1143,25 +2181,11 @@ impl Gallery {
     }
 
     fn evict_thumbnails(&mut self, visible: &[usize], window: &mut Window, cx: &mut App) {
-        let loaded = self
-            .thumbnails
-            .values()
-            .filter(|t| t.image.is_some())
-            .count();
-        if loaded <= MAX_CACHED_THUMBNAILS {
-            return;
-        }
-
-        let visible: HashSet<usize> = visible.iter().copied().collect();
-        let mut candidates: Vec<(u64, usize)> = self
-            .thumbnails
-            .iter()
-            .filter(|(ix, t)| t.image.is_some() && !visible.contains(ix))
-            .map(|(&ix, t)| (t.last_shown, ix))
-            .collect();
-        candidates.sort_unstable();
-
-        for (_, ix) in candidates.into_iter().take(loaded - MAX_CACHED_THUMBNAILS) {
+        let loaded = self.thumbnails.iter().filter_map(|(&ix, thumbnail)| {
+            let bytes = thumbnail.image.as_ref()?.as_bytes(0).map_or(0, <[u8]>::len);
+            Some((ix, thumbnail.last_shown, bytes))
+        });
+        for ix in evictions(loaded, visible, THUMBNAIL_BUDGET) {
             if let Some(image) = self.thumbnails.remove(&ix).and_then(|t| t.image) {
                 cx.drop_image(image, Some(window));
             }
@@ -1212,6 +2236,197 @@ impl Gallery {
         }
     }
 
+    /// A tile, with a menu on right-click to add the selected photos (this
+    /// tile's, if it isn't selected) to an album, if they're the library's.
+    fn render_tile_with_menu(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let tile = self.render_tile(ix, cx);
+        if !self.showing_library() {
+            // Found by UI tests.
+            return tile.test_support().into_any_element();
+        }
+        // The selection is dragged by any of its tiles, onto an album in the
+        // sidebar. (Elsewhere, dragging draws a box: see `start_marquee`.)
+        let tile = if self.selection.contains(&ix) {
+            let dragged = DraggedPhotos {
+                count: self.selection.len(),
+            };
+            tile.on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
+        } else {
+            tile
+        };
+        let tile = tile.test_support();
+        let gallery = cx.weak_entity();
+        let albums = self.albums.clone();
+        let shown_album = match self.source {
+            Source::Album(album) => Some(album),
+            _ => None,
+        };
+        tile.context_menu(move |menu, window, cx| {
+            let (gallery, albums) = (gallery.clone(), albums.clone());
+            let remove = shown_album.map(|_| {
+                let gallery = gallery.clone();
+                PopupMenuItem::new("Remove from Album").on_click(move |_, window, cx| {
+                    gallery
+                        .update(cx, |gallery, cx| {
+                            gallery.remove_from_shown_album(window, cx)
+                        })
+                        .ok();
+                })
+            });
+            let menu = menu.submenu("Add to Album", window, cx, move |mut menu, _, _| {
+                for (_, album) in tree_order(&albums) {
+                    let album = album.id;
+                    let title = album_title(&albums, album);
+                    let gallery = gallery.clone();
+                    menu = menu.item(PopupMenuItem::new(title.clone()).on_click(
+                        move |_, window, cx| {
+                            gallery
+                                .update(cx, |gallery, cx| {
+                                    gallery.add_to_album(album, &title, window, cx)
+                                })
+                                .ok();
+                        },
+                    ));
+                }
+                if !albums.is_empty() {
+                    menu = menu.separator();
+                }
+                let gallery = gallery.clone();
+                menu.item(
+                    PopupMenuItem::new("New Album…").on_click(move |_, window, cx| {
+                        gallery
+                            .update(cx, |gallery, cx| gallery.add_to_new_album(window, cx))
+                            .ok();
+                    }),
+                )
+            });
+            match remove {
+                Some(remove) => menu.item(remove),
+                None => menu,
+            }
+        })
+        .into_any_element()
+    }
+
+    /// Photos dragged onto an album in the sidebar: the selection.
+    fn drop_on_album(&mut self, album: AlbumId, window: &mut Window, cx: &mut Context<Self>) {
+        let title = album_title(&self.albums, album);
+        self.add_to_album(album, &title, window, cx);
+    }
+
+    /// Takes the selected photos out of the album shown. They stay in the
+    /// library.
+    fn remove_from_shown_album(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Source::Album(album) = self.source else {
+            return;
+        };
+        let photos = self.selected_photos();
+        let Some(library) = library::current(cx).filter(|_| !photos.is_empty()) else {
+            return;
+        };
+        let title = album_title(&self.albums, album);
+        let remove = cx.background_spawn(async move { library.remove_from_album(album, &photos) });
+        cx.spawn_in(window, async move |this, cx| {
+            let removed = remove.await;
+            this.update_in(cx, |this, window, cx| match removed {
+                Ok(removed) => {
+                    this.load(this.source.clone(), cx);
+                    this.notice = Some(removed_from_album_text(&title, removed).into());
+                }
+                Err(error) => show_error(
+                    "The photos couldn't be taken out of the album.",
+                    &error,
+                    window,
+                    cx,
+                ),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Adds the selected photos (every frame of a bracket or burst) to an
+    /// album called `title`.
+    fn add_to_album(
+        &mut self,
+        album: AlbumId,
+        title: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let photos = self.selected_photos();
+        let Some(library) = library::current(cx).filter(|_| !photos.is_empty()) else {
+            return;
+        };
+        let count = photos.len();
+        let title = title.to_owned();
+        let add = cx.background_spawn(async move { library.add_to_album(album, &photos) });
+        cx.spawn_in(window, async move |this, cx| {
+            let added = add.await;
+            this.update_in(cx, |this, window, cx| match added {
+                Ok(added) => this.added_to_album(album, &title, count, added, cx),
+                Err(error) => show_error(
+                    "The photos couldn't be added to the album.",
+                    &error,
+                    window,
+                    cx,
+                ),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Asks for a name for a new album, makes it, and adds the selected
+    /// photos to it.
+    fn add_to_new_album(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let photos = self.selected_photos();
+        let Some(library) = library::current(cx).filter(|_| !photos.is_empty()) else {
+            return;
+        };
+        let gallery = cx.weak_entity();
+        let create: NameCallback = Rc::new(move |name, window, cx| {
+            let (library, photos, gallery) = (library.clone(), photos.clone(), gallery.clone());
+            let count = photos.len();
+            let title = name.trim().to_owned();
+            let create = cx.background_spawn(async move {
+                let album = library.create_album(&name, None)?;
+                let added = library.add_to_album(album, &photos)?;
+                anyhow::Ok((album, added))
+            });
+            window.spawn(cx, async move |cx| {
+                let (album, added) = create.await?;
+                gallery.update(cx, |gallery, cx| {
+                    gallery.added_to_album(album, &title, count, added, cx)
+                })?;
+                Ok(())
+            })
+        });
+        prompt_for_album_name("New Album", "Create", "", create, window, cx);
+    }
+
+    /// Says how adding `count` photos to an album went, and shows them in
+    /// it.
+    fn added_to_album(
+        &mut self,
+        album: AlbumId,
+        title: &str,
+        count: usize,
+        added: usize,
+        cx: &mut Context<Self>,
+    ) {
+        self.notice = Some(added_to_album_text(title, count, added).into());
+        self.load_albums(cx);
+        if added > 0 && self.source == Source::Album(album) {
+            if self.viewer.is_some() {
+                self.stale = true;
+            } else {
+                self.load(self.source.clone(), cx);
+            }
+        }
+        cx.notify();
+    }
+
     fn render_tile(&self, ix: usize, cx: &mut Context<Self>) -> Stateful<Div> {
         let tile = div()
             .id(("tile", ix))
@@ -1220,9 +2435,22 @@ impl Gallery {
             .rounded(px(TILE_RADIUS))
             .bg(cx.theme().muted)
             .cursor_pointer()
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.open_viewer(ix, StartFrame::Cover, window, cx)
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                // Not on to the grid, which would clear the selection.
+                cx.stop_propagation();
+                this.click_tile(ix, event, window, cx)
             }))
+            // Right-clicking a tile that isn't selected selects it, for its
+            // menu to act on.
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, _, _, cx| {
+                    if !this.selection.contains(&ix) {
+                        this.select_only(ix);
+                        cx.notify();
+                    }
+                }),
+            )
             .on_hover(
                 cx.listener(move |this, hovered: &bool, _, cx| this.hover_tile(ix, *hovered, cx)),
             );
@@ -1300,7 +2528,7 @@ impl Gallery {
             );
         }
         let tile = tile.when(!segments.is_empty(), |tile| tile.child(badge(segments)));
-        tile.when(self.selected == Some(ix), |tile| {
+        tile.when(self.selection.contains(&ix), |tile| {
             // A ring just outside the tile, in the gap between tiles.
             tile.child(
                 div()
@@ -1313,7 +2541,7 @@ impl Gallery {
         })
     }
 
-    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_toolbar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let toolbar = div().flex().flex_none().items_center().gap_3().h(px(44.));
         let no_library = library::current(cx).is_none();
         let layout = settings::get(cx).grid_layout;
@@ -1341,7 +2569,7 @@ impl Gallery {
                 this.set_grid_layout(layout, cx);
             }));
         let button = match &self.source {
-            Source::Library => Button::new("import")
+            Source::Library | Source::Album(_) => Button::new("import")
                 .icon(Icon::new(LucideIcon::Import))
                 .label("Import")
                 .small()
@@ -1374,20 +2602,142 @@ impl Gallery {
                     .text_color(cx.theme().muted_foreground),
             )
             .child(div().truncate().child(name));
+        let search = self.showing_library().then(|| {
+            div()
+                .relative()
+                .w(px(SEARCH_WIDTH))
+                .min_w(px(140.))
+                .key_context(SEARCH_KEY_CONTEXT)
+                .on_action(cx.listener(|this, _: &NextSuggestion, window, cx| {
+                    this.move_suggestion(1, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &PreviousSuggestion, window, cx| {
+                    this.move_suggestion(-1, window, cx)
+                }))
+                .on_action(cx.listener(Self::accept_suggestion))
+                .on_action(cx.listener(Self::dismiss_suggestions))
+                .child(
+                    Input::new(&self.search)
+                        .small()
+                        .cleanable(true)
+                        .prefix(
+                            Icon::new(IconName::Search)
+                                .small()
+                                .text_color(cx.theme().muted_foreground),
+                        )
+                        .disabled(no_library),
+                )
+                .children(self.render_suggestions(window, cx))
+        });
+        // The sides share what's left equally, so the search is centred.
         navigation::title_bar_start(toolbar, cx)
             .pr_3()
             .border_b_1()
             .border_color(cx.theme().title_bar_border)
             .bg(cx.theme().title_bar)
-            .child(title)
-            .child(div().flex_1())
-            .child(layout_toggle)
-            .child(button)
+            .child(div().flex_1().min_w_0().child(title))
+            .children(search)
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap_3()
+                    .child(layout_toggle)
+                    .child(button),
+            )
+    }
+
+    /// The kinds of object that what's typed could be, under the search
+    /// field, with how many photos each is in.
+    fn render_suggestions(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let suggestions = self.visible_suggestions(window, cx);
+        if suggestions.is_empty() {
+            return None;
+        }
+        let theme = cx.theme();
+        let (accent, accent_foreground, muted_foreground) = (
+            theme.accent,
+            theme.accent_foreground,
+            theme.muted_foreground,
+        );
+        let list = div()
+            .id("object-suggestions")
+            .absolute()
+            .top_full()
+            .left_0()
+            .right_0()
+            .mt_1()
+            // Keep the mouse from reaching the grid underneath.
+            .occlude()
+            .p_1()
+            .flex()
+            .flex_col()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.popover)
+            .text_color(theme.popover_foreground)
+            .shadow_md()
+            .children(suggestions.into_iter().enumerate().map(|(ix, kind)| {
+                let highlighted = self.suggestion == Some(ix);
+                let photos = match kind.photos {
+                    1 => "1 photo".to_owned(),
+                    count => format!("{count} photos"),
+                };
+                let label = kind.label.clone();
+                div()
+                    .id(("object-suggestion", ix))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .text_sm()
+                    .cursor_pointer()
+                    .hover(|row| row.bg(accent))
+                    .when(highlighted, |row| {
+                        row.bg(accent).text_color(accent_foreground)
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(crate::details::capitalize(&kind.label)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(muted_foreground)
+                            .child(photos),
+                    )
+                    // On mouse down, before the search field loses focus and
+                    // the suggestions go.
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.choose_suggestion(label.clone(), window, cx);
+                        }),
+                    )
+                    // Found by UI tests.
+                    .test_support()
+            }));
+        // Over the grid, drawn after it.
+        Some(deferred(list).with_priority(1))
     }
 
     fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let imports = &self.imports;
-        let progress = imports.is_active().then(|| {
+        let import_progress = imports.is_active().then(|| {
             let (label, percent) = import_progress_text(imports.done, imports.total);
             div()
                 .flex()
@@ -1403,16 +2753,46 @@ impl Gallery {
                 )
                 .child(div().text_color(cx.theme().foreground).child(label))
         });
+        let sync_progress = sync_settings::progress(cx).map(|sync| {
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    Progress::new("sync-progress")
+                        .w(px(140.))
+                        .small()
+                        .value(sync.percent)
+                        .accessibility_label("Sync progress"),
+                )
+                .child(div().text_color(cx.theme().foreground).child(sync.text()))
+        });
+        let progress = (import_progress.is_some() || sync_progress.is_some()).then(|| {
+            div()
+                .flex()
+                .items_center()
+                .gap_4()
+                .children(import_progress)
+                .children(sync_progress)
+        });
         let detail: Option<SharedString> = if let Some(notice) = &self.notice {
             Some(notice.clone())
         } else {
             match &self.status {
+                Status::Loaded if self.searching => Some("Searching…".into()),
                 Status::Loaded => {
                     let photos: usize = self.stacks.iter().map(|s| s.photos.len()).sum();
-                    Some(if photos == self.stacks.len() {
-                        format!("{photos} photos").into()
+                    let mut count = if photos == self.stacks.len() {
+                        format!("{photos} photos")
                     } else {
-                        format!("{photos} photos in {} items", self.stacks.len()).into()
+                        format!("{photos} photos in {} items", self.stacks.len())
+                    };
+                    if self.selection.len() > 1 {
+                        count = format!("{} selected of {count}", self.selection.len());
+                    }
+                    Some(match self.is_searched() {
+                        true => format!("{count} with “{}”", self.query).into(),
+                        false => count.into(),
                     })
                 }
                 Status::Loading => Some("Loading…".into()),
@@ -1425,6 +2805,11 @@ impl Gallery {
             .px_3()
             .when_some(progress, |bar, progress| bar.left(progress))
             .when_some(detail, |bar, detail| bar.right(detail))
+    }
+
+    /// Whether the stacks shown are those a search matched.
+    fn is_searched(&self) -> bool {
+        self.showing_library() && !self.query.is_empty()
     }
 
     fn render_body(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
@@ -1444,13 +2829,24 @@ impl Gallery {
             Status::Loading => centered()
                 .child(match self.source {
                     Source::Library => "Loading the library…",
+                    Source::Album(_) => "Loading the album…",
                     Source::Device(_) => "Reading the device…",
                 })
                 .into_any_element(),
             Status::Error(error) => centered().child(error.clone()).into_any_element(),
+            Status::Loaded if self.stacks.is_empty() && self.searching => {
+                centered().child("Searching…").into_any_element()
+            }
+            Status::Loaded if self.stacks.is_empty() && self.is_searched() => centered()
+                .child(format!("No photos with “{}”.", self.query))
+                .into_any_element(),
             Status::Loaded if self.stacks.is_empty() => match self.source {
                 Source::Library => centered()
                     .child("No photos yet. Import some to get started.")
+                    .child(import_button("empty-import", cx))
+                    .into_any_element(),
+                Source::Album(_) => centered()
+                    .child("No photos in this album yet. Import some into it.")
                     .child(import_button("empty-import", cx))
                     .into_any_element(),
                 Source::Device(_) => centered()
@@ -1471,6 +2867,24 @@ impl Gallery {
                         div()
                             .id("gallery-scroll")
                             .size_full()
+                            // A click between the tiles clears the selection.
+                            .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                                let modifiers = event.modifiers();
+                                if !modifiers.shift && !modifiers.platform && !this.marquee_dragged
+                                {
+                                    this.clear_selection();
+                                    cx.notify();
+                                }
+                            }))
+                            // Dragging, on the tiles or between them, draws
+                            // a box (followed by the gallery's own handlers,
+                            // so it can leave the grid).
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, event: &MouseDownEvent, _, _| {
+                                    this.start_marquee(event)
+                                }),
+                            )
                             .overflow_y_scroll()
                             .track_scroll(&self.scroll_handle)
                             .p_2()
@@ -1480,6 +2894,7 @@ impl Gallery {
                                 update_and_render(&gallery, visible, window, cx)
                             })),
                     )
+                    .children(self.render_marquee(cx))
                     .vertical_scrollbar(&self.scroll_handle)
                     .into_any_element()
             }
@@ -1492,10 +2907,13 @@ fn update_and_render(
     visible: &[usize],
     window: &mut Window,
     cx: &mut App,
-) -> Vec<Stateful<Div>> {
+) -> Vec<AnyElement> {
     gallery.update(cx, |this, cx| {
         this.update_visible(visible, window, cx);
-        visible.iter().map(|&ix| this.render_tile(ix, cx)).collect()
+        visible
+            .iter()
+            .map(|&ix| this.render_tile_with_menu(ix, cx))
+            .collect()
     })
 }
 
@@ -1600,11 +3018,45 @@ fn failure_list(failed: &[(PathBuf, String)]) -> String {
     lines.join("\n")
 }
 
-fn show_error(message: &str, error: &anyhow::Error, window: &mut Window, cx: &mut App) {
+/// How adding `count` photos to the album `title` went, when `added` of
+/// them weren't in it already.
+fn added_to_album_text(title: &str, count: usize, added: usize) -> String {
+    match (count, added) {
+        (1, 0) => format!("It's already in “{title}”."),
+        (_, 0) => format!("They're already in “{title}”."),
+        (1, _) => format!("Added the photo to “{title}”."),
+        (count, added) if added == count => format!("Added {count} photos to “{title}”."),
+        (count, added) => {
+            format!("Added {added} of {count} photos to “{title}”; the rest were already in it.")
+        }
+    }
+}
+
+fn removed_from_album_text(title: &str, removed: usize) -> String {
+    match removed {
+        1 => format!("Took the photo out of “{title}”."),
+        count => format!("Took {count} photos out of “{title}”."),
+    }
+}
+
+/// Calls `f` on the gallery with the album the sidebar acted on.
+fn album_callback(
+    gallery: &gpui_kit::WeakEntity<Gallery>,
+    f: fn(&mut Gallery, AlbumId, &mut Window, &mut Context<Gallery>),
+) -> navigation::AlbumCallback {
+    let gallery = gallery.clone();
+    Rc::new(move |album, window, cx| {
+        gallery
+            .update(cx, |gallery, cx| f(gallery, album, window, cx))
+            .ok();
+    })
+}
+
+pub(crate) fn show_error(message: &str, error: &anyhow::Error, window: &mut Window, cx: &mut App) {
     show_warning(message, &format!("{error:#}"), window, cx);
 }
 
-fn show_warning(message: &str, detail: &str, window: &mut Window, cx: &mut App) {
+pub(crate) fn show_warning(message: &str, detail: &str, window: &mut Window, cx: &mut App) {
     let answer = window.prompt(PromptLevel::Warning, message, Some(detail), &["OK"], cx);
     cx.foreground_executor()
         .spawn(async move {
@@ -1620,26 +3072,47 @@ impl Focusable for Gallery {
 }
 
 impl Render for Gallery {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .track_focus(&self.focus_handle)
             .key_context(KEY_CONTEXT)
             .on_action(cx.listener(Self::prompt_for_import))
             .on_action(cx.listener(Self::prompt_for_new_library))
             .on_action(
-                cx.listener(|this, _: &SelectLeft, _, cx| this.move_selection(Direction::Left, cx)),
+                cx.listener(|this, _: &NewAlbum, window, cx| this.new_album(None, window, cx)),
             )
+            .on_action(cx.listener(|this, _: &SelectLeft, _, cx| {
+                this.move_selection(Direction::Left, false, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectRight, _, cx| {
+                this.move_selection(Direction::Right, false, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectUp, _, cx| {
+                this.move_selection(Direction::Up, false, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectDown, _, cx| {
+                this.move_selection(Direction::Down, false, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ExtendLeft, _, cx| {
+                this.move_selection(Direction::Left, true, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ExtendRight, _, cx| {
+                this.move_selection(Direction::Right, true, cx)
+            }))
             .on_action(
-                cx.listener(|this, _: &SelectRight, _, cx| {
-                    this.move_selection(Direction::Right, cx)
+                cx.listener(|this, _: &ExtendUp, _, cx| {
+                    this.move_selection(Direction::Up, true, cx)
                 }),
             )
-            .on_action(
-                cx.listener(|this, _: &SelectUp, _, cx| this.move_selection(Direction::Up, cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &SelectDown, _, cx| this.move_selection(Direction::Down, cx)),
-            )
+            .on_action(cx.listener(|this, _: &ExtendDown, _, cx| {
+                this.move_selection(Direction::Down, true, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectAll, _, cx| this.select_all(cx)))
+            .on_action(cx.listener(|this, _: &RemoveFromAlbum, window, cx| {
+                if this.is_browsing() {
+                    this.remove_from_shown_album(window, cx)
+                }
+            }))
             .on_action(
                 cx.listener(|this, _: &OpenSelected, window, cx| this.open_selected(window, cx)),
             )
@@ -1649,9 +3122,21 @@ impl Render for Gallery {
             .on_action(cx.listener(|this, _: &Dismiss, _, cx| this.dismiss(cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, _, cx| {
                 this.close_quick_preview(cx);
+                if this.page != Page::Settings {
+                    library_settings::refresh_stats(cx);
+                }
                 this.page = Page::Settings;
                 cx.notify();
             }))
+            .on_mouse_move(cx.listener(Self::drag_marquee))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.end_marquee(cx)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.end_marquee(cx)),
+            )
             .size_full()
             .flex()
             .bg(cx.theme().background)
@@ -1665,22 +3150,58 @@ impl Render for Gallery {
                     .flex()
                     .flex_col()
                     .map(|this| match (self.page, &self.viewer) {
-                        (Page::Settings, _) => this
-                            .child(self.render_settings_title_bar(cx))
-                            .child(div().flex_1().min_h_0().child(settings::settings_view())),
+                        (Page::Settings, _) => {
+                            this.child(self.render_settings_title_bar(cx)).child(
+                                div()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .child(settings::settings_view(self.library_actions(cx), cx)),
+                            )
+                        }
                         // The viewer replaces the grid; the grid's scroll
                         // position lives in `scroll_handle`, so it survives
                         // the round trip.
                         (Page::Library, Some(viewer)) => this.child(viewer.clone()),
                         (Page::Library, None) => this
                             .relative()
-                            .child(self.render_toolbar(cx))
+                            .child(self.render_toolbar(window, cx))
                             .child(self.render_body(cx))
                             .child(self.render_status_bar(cx))
                             .children(self.render_quick_preview(cx)),
                     }),
             )
     }
+}
+
+/// The thumbnails to evict, of those `loaded` (each index, when it was last
+/// shown, and its size in bytes), to bring them within `budget`: those
+/// shown longest ago, but none of those `visible`.
+fn evictions(
+    loaded: impl Iterator<Item = (usize, u64, usize)>,
+    visible: &[usize],
+    budget: usize,
+) -> Vec<usize> {
+    let mut candidates = Vec::new();
+    let mut total = 0;
+    for (ix, last_shown, bytes) in loaded {
+        total += bytes;
+        if !visible.contains(&ix) {
+            candidates.push((last_shown, ix, bytes));
+        }
+    }
+    if total <= budget {
+        return Vec::new();
+    }
+    candidates.sort_unstable();
+    candidates
+        .into_iter()
+        .take_while(|&(_, _, bytes)| {
+            let over = total > budget;
+            total -= bytes;
+            over
+        })
+        .map(|(_, ix, _)| ix)
+        .collect()
 }
 
 #[cfg(test)]
@@ -1700,7 +3221,9 @@ mod tests {
         ));
         std::fs::create_dir_all(&folder).unwrap();
         for ix in 0..count {
-            image::RgbImage::from_pixel(64, 64, image::Rgb([ix as u8 * 20, 90, 160]))
+            // A different colour each, so none are duplicates.
+            let red = (ix as u8).wrapping_mul(20);
+            image::RgbImage::from_pixel(64, 64, image::Rgb([red, 90, 160]))
                 .save(folder.join(format!("photo-{ix:02}.jpg")))
                 .unwrap();
         }
@@ -1956,6 +3479,117 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn keeps_the_librarys_thumbnails(cx: &mut TestAppContext) {
+        let folder = photo_folder(5);
+        let (window, gallery) = open_gallery(folder.clone(), cx);
+        let library = cx.update(|cx| library::current(cx)).unwrap();
+        let root = library
+            .info
+            .path
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let photos = library.photos().unwrap();
+        assert_eq!(photos.len(), 5);
+        for photo in &photos {
+            let thumbnail = photo.thumbnail.as_ref().unwrap();
+            assert!(thumbnail.starts_with(library.info.path.join("Thumbnails")));
+            assert!(thumbnail.is_file(), "{} is missing", thumbnail.display());
+        }
+
+        // Next time they're shown as kept, without decoding the photos.
+        let day = photos[0].path.parent().unwrap();
+        library::test_support::remove(day);
+        assert!(!photos[0].path.exists());
+        gallery.update(cx, |gallery, cx| gallery.load(Source::Library, cx));
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        cx.run_until_parked();
+        gallery.read_with(cx, |gallery, _| {
+            assert_eq!(gallery.thumbnails.len(), 5);
+            for thumbnail in gallery.thumbnails.values() {
+                assert_eq!(thumbnail.state, ThumbnailState::Done);
+                assert!(thumbnail.image.is_some());
+            }
+        });
+
+        drop(library);
+        library::test_support::remove(&root);
+        std::fs::remove_dir_all(folder).ok();
+    }
+
+    #[gpui_kit::test]
+    fn moves_and_deletes_the_library_from_settings(cx: &mut TestAppContext) {
+        let folder = photo_folder(3);
+        let (window, gallery) = open_gallery(folder.clone(), cx);
+        let library = cx.update(|cx| library::current(cx)).unwrap();
+        let (id, old_path) = (library.info.id.clone(), library.info.path.clone());
+        let root = old_path.parent().unwrap().parent().unwrap().to_path_buf();
+        drop(library);
+
+        // Opening Settings counts the library's photos.
+        press(window, "cmd-,", cx);
+        cx.update_window(window, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        gallery.read_with(cx, |gallery, _| assert_eq!(gallery.page, Page::Settings));
+        assert_eq!(
+            cx.update(|cx| library_settings::photo_count(&id, cx)),
+            Some(3)
+        );
+
+        // Moving asks where to, then shows the library from there.
+        let dest = root.join("Elsewhere");
+        cx.update_window(window, |_, window, cx| {
+            gallery.update(cx, |gallery, cx| gallery.move_library(&id, window, cx));
+        })
+        .unwrap();
+        cx.simulate_new_path_selection(|_| Some(dest.clone()));
+        cx.run_until_parked();
+        let library = cx.update(|cx| library::current(cx)).unwrap();
+        assert_eq!(library.info.path, dest);
+        assert!(!old_path.exists());
+        drop(library);
+        gallery.read_with(cx, |gallery, _| {
+            assert!(matches!(gallery.status, Status::Loaded));
+            assert_eq!(gallery.stacks.len(), 3);
+            assert!(gallery.stacks[0].cover().path.starts_with(&dest));
+        });
+
+        // Deleting asks first; cancelling keeps it.
+        let delete = |cx: &mut TestAppContext| {
+            cx.update_window(window, |_, window, cx| {
+                gallery.update(cx, |gallery, cx| gallery.delete_library(&id, window, cx));
+            })
+            .unwrap();
+        };
+        delete(cx);
+        assert_eq!(
+            cx.pending_prompt().map(|(title, _)| title),
+            Some("Delete “Elsewhere”?".into())
+        );
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert!(dest.exists());
+        delete(cx);
+        cx.simulate_prompt_answer("Move to Trash");
+        cx.run_until_parked();
+        assert!(!dest.exists());
+        assert!(cx.update(|cx| library::list(cx).is_empty()));
+        assert!(cx.update(|cx| library::current(cx)).is_none());
+        gallery.read_with(cx, |gallery, _| {
+            assert!(matches!(gallery.status, Status::Error(_)));
+        });
+        cx.update_window(window, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+
+        library::test_support::remove(&root);
+        std::fs::remove_dir_all(folder).ok();
+    }
+
+    #[gpui_kit::test]
     fn shows_a_device_and_returns_to_the_library_when_disconnected(cx: &mut TestAppContext) {
         let folder = photo_folder(2);
         let (window, gallery) = open_gallery(folder.clone(), cx);
@@ -1992,12 +3626,14 @@ mod tests {
             assert_eq!(gallery.stacks.len(), 2);
         });
 
-        // Import All copies them into the library. Importing again while
-        // the first is under way queues it, and skips what's imported.
+        // Import All copies them into the library (once an album's chosen,
+        // as `imports_into_albums` tests). Importing again while the first
+        // is under way queues it, and skips what's imported.
         cx.update_window(window, |_, window, cx| {
             gallery.update(cx, |gallery, cx| {
-                gallery.import_device(window, cx);
-                gallery.import_device(window, cx);
+                let job = || ImportJob::Device(device.path.clone());
+                gallery.queue_import(job(), None, window, cx);
+                gallery.queue_import(job(), None, window, cx);
                 assert!(gallery.imports.is_active());
                 assert_eq!(gallery.imports.preparing, 2);
             });
@@ -2177,5 +3813,874 @@ mod tests {
             import_progress_text(1, 1),
             ("Imported 1 of 1 photo · 100%".into(), Some(100.))
         );
+    }
+
+    #[gpui_kit::test]
+    fn searches_for_objects_and_draws_their_boxes(cx: &mut TestAppContext) {
+        let folder = photo_folder(6);
+        let (window, gallery) = open_gallery(folder.clone(), cx);
+        let dog = crate::detect::DetectedObject {
+            label: "dog".into(),
+            confidence: 0.9,
+            bounds: [0.1, 0.2, 0.6, 0.9],
+        };
+        let dog_photo = gallery.read_with(cx, |gallery, cx| {
+            let photo = gallery.stacks[2].cover().clone();
+            let library = library::current(cx).unwrap();
+            library.set_objects(&photo, &[dog]).unwrap();
+            photo.path
+        });
+        let shown = |cx: &mut TestAppContext| {
+            gallery.read_with(cx, |gallery, _| {
+                gallery
+                    .stacks
+                    .iter()
+                    .map(|stack| stack.cover().path.clone())
+                    .collect::<Vec<_>>()
+            })
+        };
+        let wait = |cx: &mut TestAppContext| {
+            cx.executor().advance_clock(SEARCH_DELAY);
+            cx.run_until_parked();
+            cx.update_window(window, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+        };
+
+        // Typing a space searches; it doesn't open the quick preview.
+        cx.update_window(window, |_, window, cx| {
+            let search = gallery.read(cx).search.clone();
+            search.focus_handle(cx).focus(window, cx);
+            window.input("dog", cx);
+        })
+        .unwrap();
+        press(window, "space", cx);
+        wait(cx);
+        gallery.read_with(cx, |gallery, cx| {
+            assert_eq!(gallery.search.read(cx).value().as_ref(), "dog ");
+            assert!(gallery.quick_preview.is_none());
+        });
+        assert_eq!(shown(cx), [dog_photo.clone()]);
+
+        // Found by the plural too; nothing for what isn't there.
+        cx.update_window(window, |_, window, cx| {
+            window.press("backspace", cx);
+            window.input("s", cx);
+        })
+        .unwrap();
+        wait(cx);
+        assert_eq!(shown(cx), [dog_photo.clone()]);
+        cx.update_window(window, |_, window, cx| {
+            let search = gallery.read(cx).search.clone();
+            search.update(cx, |search, cx| search.set_value("", window, cx));
+            window.input("cat", cx);
+        })
+        .unwrap();
+        wait(cx);
+        assert!(shown(cx).is_empty());
+
+        // Clearing the search shows everything again.
+        cx.update_window(window, |_, window, cx| {
+            let search = gallery.read(cx).search.clone();
+            search.update(cx, |search, cx| search.set_value("c", window, cx));
+            window.press("backspace", cx);
+        })
+        .unwrap();
+        wait(cx);
+        assert_eq!(shown(cx).len(), 6);
+
+        // In the viewer, the info sidebar's button draws the boxes.
+        let ix = shown(cx)
+            .iter()
+            .position(|path| *path == dog_photo)
+            .unwrap();
+        gallery.update(cx, |gallery, cx| {
+            gallery.selected = Some(ix);
+            cx.notify();
+        });
+        cx.update_window(window, |_, window, cx| {
+            let focus_handle = gallery.read(cx).focus_handle.clone();
+            window.focus(&focus_handle, cx);
+        })
+        .unwrap();
+        press(window, "enter", cx);
+        wait(cx);
+        // Drawn without a hitbox, so as not to get in the way of panning,
+        // the boxes can't be found in the window; the viewer says.
+        let has_boxes = |cx: &mut TestAppContext| {
+            gallery.read_with(cx, |gallery, cx| {
+                let viewer = gallery.viewer.as_ref().unwrap().read(cx);
+                viewer
+                    .object_boxes(cx)
+                    .is_some_and(|boxes| boxes.len() == 1)
+            })
+        };
+        assert!(!has_boxes(cx));
+        cx.update_window(window, |_, window, cx| window.click("object-boxes", cx))
+            .unwrap();
+        wait(cx);
+        assert!(cx.update(|cx| settings::get(cx).show_object_boxes));
+        assert!(has_boxes(cx));
+        // The shimmer moves on.
+        cx.executor().advance_clock(Duration::from_millis(500));
+        wait(cx);
+        assert!(has_boxes(cx));
+
+        std::fs::remove_dir_all(folder).ok();
+    }
+
+    #[gpui_kit::test]
+    fn suggests_kinds_of_object(cx: &mut TestAppContext) {
+        let folder = photo_folder(7);
+        let (window, gallery) = open_gallery(folder.clone(), cx);
+        let object = |label: &str| crate::detect::DetectedObject {
+            label: label.into(),
+            confidence: 0.9,
+            bounds: [0., 0., 1., 1.],
+        };
+        // Dogs in two photos, a donut in one, a hot dog in three.
+        let paths = gallery.read_with(cx, |gallery, cx| {
+            let library = library::current(cx).unwrap();
+            let found = [
+                vec![object("dog")],
+                vec![object("dog"), object("hot dog")],
+                vec![object("donut"), object("hot dog")],
+                vec![object("hot dog")],
+            ];
+            found
+                .iter()
+                .zip(gallery.stacks.iter())
+                .map(|(objects, stack)| {
+                    library.set_objects(stack.cover(), objects).unwrap();
+                    stack.cover().path.clone()
+                })
+                .collect::<Vec<_>>()
+        });
+        let suggested = |cx: &mut TestAppContext| {
+            cx.update_window(window, |_, window, cx| {
+                gallery
+                    .read(cx)
+                    .visible_suggestions(window, cx)
+                    .iter()
+                    .map(|kind| (kind.label.clone(), kind.photos))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap()
+        };
+        let shown = |cx: &mut TestAppContext| {
+            gallery.read_with(cx, |gallery, _| {
+                let mut shown: Vec<_> = gallery
+                    .stacks
+                    .iter()
+                    .map(|stack| stack.cover().path.clone())
+                    .collect();
+                shown.sort();
+                shown
+            })
+        };
+        let wait = |cx: &mut TestAppContext| {
+            cx.executor().advance_clock(SEARCH_DELAY);
+            cx.run_until_parked();
+            cx.update_window(window, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+            cx.run_until_parked();
+        };
+        let type_in_search = |text: &str, cx: &mut TestAppContext| {
+            cx.update_window(window, |_, window, cx| {
+                let search = gallery.read(cx).search.clone();
+                search.update(cx, |search, cx| search.set_value("", window, cx));
+                search.focus_handle(cx).focus(window, cx);
+                window.input(text, cx);
+            })
+            .unwrap();
+            wait(cx);
+        };
+
+        // Names that start with what's typed first, then the most common.
+        type_in_search("do", cx);
+        let expected = [
+            ("dog".into(), 2),
+            ("donut".into(), 1),
+            ("hot dog".into(), 3),
+        ];
+        assert_eq!(suggested(cx), expected);
+
+        // Down and Enter choose one, searching for just that kind, and go
+        // on to the results.
+        press(window, "down", cx);
+        press(window, "down", cx);
+        assert_eq!(
+            gallery.read_with(cx, |gallery, _| gallery.suggestion),
+            Some(1)
+        );
+        press(window, "enter", cx);
+        wait(cx);
+        gallery.read_with(cx, |gallery, cx| {
+            assert_eq!(gallery.search.read(cx).value().as_ref(), "donut");
+        });
+        assert_eq!(shown(cx), [paths[2].clone()]);
+        assert!(suggested(cx).is_empty());
+        cx.update_window(window, |_, window, cx| {
+            assert!(gallery.read(cx).focus_handle.is_focused(window));
+        })
+        .unwrap();
+
+        // Clicking one chooses it too. "dog" is a kind of its own, not
+        // "hot dog".
+        type_in_search("d", cx);
+        assert_eq!(suggested(cx).len(), 3);
+        cx.update_window(window, |_, window, cx| {
+            window.click(("object-suggestion", 0usize), cx)
+        })
+        .unwrap();
+        wait(cx);
+        let mut dogs = vec![paths[0].clone(), paths[1].clone()];
+        dogs.sort();
+        assert_eq!(shown(cx), dogs);
+
+        // Escape hides them; typing brings them back. Up from none goes to
+        // the last, and wraps around.
+        type_in_search("hot", cx);
+        assert_eq!(suggested(cx), [("hot dog".into(), 3)]);
+        press(window, "escape", cx);
+        assert!(suggested(cx).is_empty());
+        cx.update_window(window, |_, window, cx| window.input(" ", cx))
+            .unwrap();
+        wait(cx);
+        assert_eq!(suggested(cx).len(), 1);
+        type_in_search("do", cx);
+        press(window, "up", cx);
+        assert_eq!(
+            gallery.read_with(cx, |gallery, _| gallery.suggestion),
+            Some(2)
+        );
+        press(window, "down", cx);
+        assert_eq!(
+            gallery.read_with(cx, |gallery, _| gallery.suggestion),
+            Some(0)
+        );
+
+        // Enter with none highlighted searches for what's typed.
+        type_in_search("hot dog", cx);
+        assert!(suggested(cx).is_empty());
+        press(window, "enter", cx);
+        wait(cx);
+        let mut hot_dogs = vec![paths[1].clone(), paths[2].clone(), paths[3].clone()];
+        hot_dogs.sort();
+        assert_eq!(shown(cx), hot_dogs);
+
+        std::fs::remove_dir_all(folder).ok();
+    }
+
+    #[gpui_kit::test]
+    fn imports_into_albums(cx: &mut TestAppContext) {
+        let folder = photo_folder(8);
+        let (window, gallery) = open_gallery(folder.clone(), cx);
+        let frame = |cx: &mut TestAppContext| {
+            cx.run_until_parked();
+            cx.update_window(window, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+            cx.run_until_parked();
+        };
+        let albums = |cx: &mut TestAppContext| {
+            gallery.read_with(cx, |gallery, _| {
+                gallery
+                    .albums
+                    .iter()
+                    .map(|album| (album.name.clone(), album.parent, album.photos))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let shown_album = |cx: &mut TestAppContext| {
+            gallery.read_with(cx, |gallery, _| match gallery.source {
+                Source::Album(album) => album,
+                _ => panic!("not showing an album"),
+            })
+        };
+        let in_window = |cx: &mut TestAppContext, f: &dyn Fn(&mut Window, &mut App)| {
+            cx.update_window(window, |_, window, cx| f(window, cx))
+                .unwrap();
+            frame(cx);
+        };
+
+        let with_gallery =
+            |cx: &mut TestAppContext,
+             f: &dyn Fn(&mut Gallery, &mut Window, &mut Context<Gallery>)| {
+                cx.update_window(window, |_, window, cx| {
+                    gallery.update(cx, |gallery, cx| f(gallery, window, cx))
+                })
+                .unwrap();
+                frame(cx);
+            };
+
+        // New Album asks for a name, makes the album and shows it.
+        in_window(cx, &|window, cx| {
+            window.dispatch_action(Box::new(NewAlbum), cx)
+        });
+        in_window(cx, &|window, cx| window.input("Trips", cx));
+        in_window(cx, &|window, cx| window.click("confirm", cx));
+        let trips = shown_album(cx);
+        assert_eq!(albums(cx), [("Trips".into(), None, 0)]);
+        gallery.read_with(cx, |gallery, _| assert!(gallery.stacks.is_empty()));
+
+        // One inside it, from the sidebar's menu; Enter makes it too.
+        with_gallery(cx, &|gallery, window, cx| {
+            gallery.new_album(Some(trips), window, cx)
+        });
+        in_window(cx, &|window, cx| window.input("Japan", cx));
+        in_window(cx, &|window, cx| window.press("enter", cx));
+        let japan = shown_album(cx);
+        assert_eq!(
+            albums(cx),
+            [("Japan".into(), Some(trips), 0), ("Trips".into(), None, 0)]
+        );
+        gallery.read_with(cx, |gallery, cx| {
+            assert_eq!(gallery.source_title(cx).1.as_ref(), "Trips › Japan");
+        });
+
+        // Importing while it's shown adds to it by default: the photos
+        // already in the library too.
+        with_gallery(cx, &|gallery, window, cx| {
+            gallery.choose_import_album(ImportJob::Paths(vec![folder.clone()]), window, cx)
+        });
+        in_window(cx, &|window, cx| window.click("start-import", cx));
+        assert_eq!(albums(cx)[0], ("Japan".into(), Some(trips), 8));
+        gallery.read_with(cx, |gallery, _| {
+            assert_eq!(gallery.source, Source::Album(japan));
+            assert_eq!(gallery.stacks.len(), 8);
+        });
+
+        // Or into a new album, made for the import.
+        with_gallery(cx, &|gallery, window, cx| {
+            let job = ImportJob::Paths(vec![folder.join("photo-00.jpg")]);
+            let album = ImportAlbum::New {
+                name: "Best".into(),
+                parent: Some(trips),
+            };
+            gallery.import_into(job, Some(album), window, cx)
+        });
+        assert_eq!(albums(cx)[0], ("Best".into(), Some(trips), 1));
+
+        // Renaming.
+        with_gallery(cx, &|gallery, window, cx| {
+            gallery.rename_album(trips, window, cx)
+        });
+        in_window(cx, &|window, cx| window.press("cmd-a", cx));
+        in_window(cx, &|window, cx| window.input("Travel", cx));
+        in_window(cx, &|window, cx| window.click("confirm", cx));
+        assert!(albums(cx).contains(&("Travel".into(), None, 0)));
+
+        // Deleting it deletes the albums in it, and goes back to the
+        // library, whose photos stay.
+        with_gallery(cx, &|gallery, window, cx| {
+            gallery.delete_album(trips, window, cx)
+        });
+        cx.simulate_prompt_answer("Delete");
+        frame(cx);
+        assert!(albums(cx).is_empty());
+        gallery.read_with(cx, |gallery, _| {
+            assert_eq!(gallery.source, Source::Library);
+            assert_eq!(gallery.stacks.len(), 8);
+        });
+
+        std::fs::remove_dir_all(folder).ok();
+    }
+
+    #[gpui_kit::test]
+    fn adds_photos_to_albums(cx: &mut TestAppContext) {
+        let folder = photo_folder(10);
+        let (window, gallery) = open_gallery(folder.clone(), cx);
+        let frame = |cx: &mut TestAppContext| {
+            cx.run_until_parked();
+            cx.update_window(window, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+            cx.run_until_parked();
+        };
+        let library = cx.update(|cx| library::current(cx)).unwrap();
+        let trips = library.create_album("Trips", None).unwrap();
+        let japan = library.create_album("Japan", Some(trips)).unwrap();
+        gallery.update(cx, |gallery, cx| gallery.load_albums(cx));
+        frame(cx);
+        let notice = |cx: &mut TestAppContext| {
+            gallery.read_with(cx, |gallery, _| gallery.notice.clone().unwrap_or_default())
+        };
+        // Right-click a tile, then pick from its Add to Album menu: the
+        // albums, by their place among the others, then New Album….
+        let add_to_album = |tile: usize, item: usize, cx: &mut TestAppContext| {
+            cx.update_window(window, |_, window, cx| {
+                window.right_click(("tile", tile), cx)
+            })
+            .unwrap();
+            frame(cx);
+            cx.update_window(window, |_, window, cx| {
+                window
+                    .within(("tile", tile))
+                    .within("popup-menu")
+                    .click(0usize, cx);
+            })
+            .unwrap();
+            frame(cx);
+            cx.update_window(window, |_, window, cx| {
+                window
+                    .within(("tile", tile))
+                    .within("submenu")
+                    .click(item, cx);
+            })
+            .unwrap();
+            frame(cx);
+        };
+
+        add_to_album(1, 1, cx);
+        assert_eq!(notice(cx), "Added the photo to “Trips › Japan”.");
+        let photo = gallery.read_with(cx, |gallery, _| gallery.stacks[1].cover().path.clone());
+        let in_japan = |library: &Library| {
+            library
+                .album_photos(japan)
+                .unwrap()
+                .into_iter()
+                .map(|photo| photo.path)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(in_japan(&library), [photo.clone()]);
+        // The sidebar's counts follow.
+        gallery.read_with(cx, |gallery, _| {
+            let japan = gallery.albums.iter().find(|a| a.id == japan).unwrap();
+            assert_eq!(japan.photos, 1);
+        });
+        add_to_album(1, 1, cx);
+        assert_eq!(notice(cx), "It's already in “Trips › Japan”.");
+        assert_eq!(in_japan(&library), [photo]);
+
+        // New Album… asks for a name, and adds the photo to the new album,
+        // staying where it is.
+        add_to_album(2, 3, cx);
+        cx.update_window(window, |_, window, cx| window.input("Favourites", cx))
+            .unwrap();
+        frame(cx);
+        cx.update_window(window, |_, window, cx| window.click("confirm", cx))
+            .unwrap();
+        frame(cx);
+        assert_eq!(notice(cx), "Added the photo to “Favourites”.");
+        let favourites = library
+            .albums()
+            .unwrap()
+            .into_iter()
+            .find(|album| album.name == "Favourites")
+            .unwrap();
+        assert_eq!((favourites.parent, favourites.photos), (None, 1));
+        gallery.read_with(cx, |gallery, _| assert_eq!(gallery.source, Source::Library));
+
+        std::fs::remove_dir_all(folder).ok();
+    }
+
+    #[test]
+    fn describes_adding_to_albums() {
+        let text = |count, added| added_to_album_text("Japan", count, added);
+        assert_eq!(text(1, 1), "Added the photo to “Japan”.");
+        assert_eq!(text(3, 3), "Added 3 photos to “Japan”.");
+        assert_eq!(
+            text(3, 2),
+            "Added 2 of 3 photos to “Japan”; the rest were already in it."
+        );
+        assert_eq!(text(1, 0), "It's already in “Japan”.");
+        assert_eq!(text(3, 0), "They're already in “Japan”.");
+    }
+
+    /// Clicks at `position` with `modifiers` held, `count` times.
+    fn click_at(
+        window: AnyWindowHandle,
+        position: gpui_kit::Point<gpui_kit::Pixels>,
+        modifiers: gpui_kit::Modifiers,
+        count: usize,
+        cx: &mut TestAppContext,
+    ) {
+        use gpui_kit::{InputEvent as _, MouseDownEvent, MouseUpEvent};
+        cx.update_window(window, |_, window, cx| {
+            for click_count in 1..=count {
+                let down = MouseDownEvent {
+                    button: MouseButton::Left,
+                    position,
+                    modifiers,
+                    click_count,
+                    first_mouse: false,
+                };
+                window.dispatch_event(down.to_platform_input(), cx);
+                let up = MouseUpEvent {
+                    button: MouseButton::Left,
+                    position,
+                    modifiers,
+                    click_count,
+                };
+                window.dispatch_event(up.to_platform_input(), cx);
+            }
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+
+    #[gpui_kit::test]
+    fn selects_several_photos_and_opens_on_double_click(cx: &mut TestAppContext) {
+        let folder = photo_folder(11);
+        let (window, gallery) = open_gallery(folder.clone(), cx);
+        let tile = |ix: usize, cx: &mut TestAppContext| {
+            cx.update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                window.find(("tile", ix)).bounds()
+            })
+            .unwrap()
+        };
+        let click = |ix: usize, modifiers: gpui_kit::Modifiers, count, cx: &mut TestAppContext| {
+            let center = tile(ix, cx).center();
+            click_at(window, center, modifiers, count, cx);
+        };
+        let selection = |cx: &mut TestAppContext| {
+            gallery.read_with(cx, |gallery, _| {
+                (
+                    gallery.selection.iter().copied().collect::<Vec<_>>(),
+                    gallery.selected,
+                    gallery.viewer.is_some(),
+                )
+            })
+        };
+        let none = gpui_kit::Modifiers::default();
+        let command = gpui_kit::Modifiers::command();
+        let shift = gpui_kit::Modifiers::shift();
+
+        // Three columns: tiles 0 to 5 are fully in view.
+        // One click selects just that photo; it doesn't open it.
+        click(1, none, 1, cx);
+        assert_eq!(selection(cx), (vec![1], Some(1), false));
+        click(4, none, 1, cx);
+        assert_eq!(selection(cx), (vec![4], Some(4), false));
+
+        // ⌘ adds and removes; Shift selects the range from the last click.
+        click(2, command, 1, cx);
+        assert_eq!(selection(cx), (vec![2, 4], Some(2), false));
+        click(4, command, 1, cx);
+        assert_eq!(selection(cx), (vec![2], Some(4), false));
+        click(5, shift, 1, cx);
+        assert_eq!(selection(cx), (vec![4, 5], Some(5), false));
+        // The range runs either way from where it started, in place of what
+        // was selected; ⌘⇧ adds it.
+        click(0, shift, 1, cx);
+        assert_eq!(selection(cx), (vec![0, 1, 2, 3, 4], Some(0), false));
+        click(3, none, 1, cx);
+        click(5, shift, 1, cx);
+        assert_eq!(selection(cx).0, [3, 4, 5]);
+        let command_shift = gpui_kit::Modifiers {
+            platform: true,
+            shift: true,
+            ..Default::default()
+        };
+        click(0, command, 1, cx);
+        click(1, command_shift, 1, cx);
+        assert_eq!(selection(cx).0, [0, 1, 3, 4, 5]);
+
+        // Shift with the arrows extends it too; ⌘A selects everything, and
+        // Escape nothing.
+        click(1, none, 1, cx);
+        press(window, "shift-right", cx);
+        assert_eq!(selection(cx).0, [1, 2]);
+        press(window, "cmd-a", cx);
+        assert_eq!(selection(cx).0.len(), 11);
+        assert_eq!(
+            gallery.read_with(cx, |gallery, _| gallery.selected),
+            Some(2)
+        );
+        press(window, "escape", cx);
+        assert_eq!(selection(cx), (vec![], None, false));
+
+        // A click between the tiles clears the selection.
+        click(3, none, 1, cx);
+        let first = tile(0, cx);
+        let gap = gpui_kit::point(first.right() + gpui_kit::px(2.), first.center().y);
+        click_at(window, gap, none, 1, cx);
+        assert_eq!(selection(cx), (vec![], None, false));
+
+        // Right-clicking acts on the selection, if the tile's in it.
+        click(2, none, 1, cx);
+        click(3, command, 1, cx);
+        cx.update_window(window, |_, window, cx| {
+            window.right_click(("tile", 3usize), cx)
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(selection(cx).0, [2, 3]);
+        assert_eq!(
+            gallery.read_with(cx, |gallery, _| gallery.selected_photos().len()),
+            2
+        );
+        press(window, "escape", cx);
+        cx.update_window(window, |_, window, cx| {
+            window.right_click(("tile", 4usize), cx)
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(selection(cx).0, [4]);
+        let photos = gallery.read_with(cx, |gallery, _| gallery.selected_photos().len());
+        assert_eq!(photos, 1);
+
+        // A double-click opens the photo.
+        press(window, "escape", cx);
+        click(5, none, 2, cx);
+        assert_eq!(selection(cx), (vec![5], Some(5), true));
+
+        std::fs::remove_dir_all(folder).ok();
+    }
+
+    /// Drags from `from` to `to` with `modifiers` held, in steps.
+    fn drag_between(
+        window: AnyWindowHandle,
+        from: gpui_kit::Point<gpui_kit::Pixels>,
+        to: gpui_kit::Point<gpui_kit::Pixels>,
+        modifiers: gpui_kit::Modifiers,
+        cx: &mut TestAppContext,
+    ) {
+        use gpui_kit::{InputEvent as _, MouseUpEvent};
+        cx.update_window(window, |_, window, cx| {
+            let down = MouseDownEvent {
+                button: MouseButton::Left,
+                position: from,
+                modifiers,
+                click_count: 1,
+                first_mouse: false,
+            };
+            window.dispatch_event(down.to_platform_input(), cx);
+            for step in 1..=4 {
+                let position = from + (to - from) * (step as f32 / 4.);
+                let moved = MouseMoveEvent {
+                    position,
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers,
+                };
+                window.dispatch_event(moved.to_platform_input(), cx);
+                window.render_frame(cx);
+            }
+            let up = MouseUpEvent {
+                button: MouseButton::Left,
+                position: to,
+                modifiers,
+                click_count: 1,
+            };
+            window.dispatch_event(up.to_platform_input(), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+
+    #[gpui_kit::test]
+    fn selects_with_a_box(cx: &mut TestAppContext) {
+        let folder = photo_folder(13);
+        let (window, gallery) = open_gallery(folder.clone(), cx);
+        // Three columns, as in `selects_several_photos_and_opens_on_double_click`.
+        let tile = |ix: usize, cx: &mut TestAppContext| {
+            cx.update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                window.find(("tile", ix)).bounds()
+            })
+            .unwrap()
+        };
+        let selection = |cx: &mut TestAppContext| {
+            gallery.read_with(cx, |gallery, _| {
+                gallery.selection.iter().copied().collect::<Vec<_>>()
+            })
+        };
+        let none = gpui_kit::Modifiers::default();
+
+        // From inside one tile to inside another: everything it touches,
+        // and the click it ends with neither selects nor opens anything.
+        let from = tile(0, cx).center();
+        let to = tile(4, cx).center();
+        drag_between(window, from, to, none, cx);
+        assert_eq!(selection(cx), [0, 1, 3, 4]);
+        gallery.read_with(cx, |gallery, _| {
+            assert!(gallery.viewer.is_none());
+            assert!(gallery.marquee.is_none());
+        });
+
+        // Backwards, from the gap beside a tile, it replaces the selection.
+        let start = tile(1, cx);
+        let from = gpui_kit::point(
+            start.right() + gpui_kit::px(3.),
+            start.top() + gpui_kit::px(10.),
+        );
+        let to = tile(0, cx).center();
+        drag_between(window, from, to, none, cx);
+        assert_eq!(selection(cx), [0, 1]);
+
+        // With ⌘, it adds to it.
+        let from = tile(3, cx).center();
+        let to = from + gpui_kit::point(gpui_kit::px(20.), gpui_kit::px(20.));
+        drag_between(window, from, to, gpui_kit::Modifiers::command(), cx);
+        assert_eq!(selection(cx), [0, 1, 3]);
+
+        // A press that hardly moves is still a click.
+        let center = tile(5, cx).center();
+        drag_between(
+            window,
+            center,
+            center + gpui_kit::point(gpui_kit::px(1.), gpui_kit::px(1.)),
+            none,
+            cx,
+        );
+        assert_eq!(selection(cx), [5]);
+
+        std::fs::remove_dir_all(folder).ok();
+    }
+
+    #[gpui_kit::test]
+    fn changes_albums_by_menu_drag_and_viewer(cx: &mut TestAppContext) {
+        let folder = photo_folder(14);
+        let (window, gallery) = open_gallery(folder.clone(), cx);
+        let frame = |cx: &mut TestAppContext| {
+            cx.run_until_parked();
+            cx.update_window(window, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+            cx.run_until_parked();
+        };
+        let library = cx.update(|cx| library::current(cx)).unwrap();
+        let trips = library.create_album("Trips", None).unwrap();
+        let family = library.create_album("Family", None).unwrap();
+        let photos = library.photos().unwrap();
+        library.add_to_album(trips, &photos[..3]).unwrap();
+        gallery.update(cx, |gallery, cx| gallery.load_albums(cx));
+        frame(cx);
+        let in_album = |album, cx: &mut TestAppContext| {
+            cx.run_until_parked();
+            library.album_photos(album).unwrap().len()
+        };
+        let notice = |cx: &mut TestAppContext| {
+            gallery.read_with(cx, |gallery, _| gallery.notice.clone().unwrap_or_default())
+        };
+        let click = |id: (&'static str, usize), cx: &mut TestAppContext| {
+            cx.update_window(window, |_, window, cx| window.click(id, cx))
+                .unwrap();
+            frame(cx);
+        };
+
+        // In an album, ⌘⌫ takes the selection out of it.
+        cx.update_window(window, |_, window, cx| {
+            gallery.update(cx, |gallery, cx| gallery.show_album(trips, window, cx))
+        })
+        .unwrap();
+        frame(cx);
+        click(("tile", 0), cx);
+        press(window, "cmd-backspace", cx);
+        assert_eq!(in_album(trips, cx), 2);
+        assert_eq!(notice(cx), "Took the photo out of “Trips”.");
+        gallery.read_with(cx, |gallery, _| assert_eq!(gallery.stacks.len(), 2));
+
+        // So does its right-click menu, after Add to Album.
+        cx.update_window(window, |_, window, cx| {
+            window.right_click(("tile", 1usize), cx)
+        })
+        .unwrap();
+        frame(cx);
+        cx.update_window(window, |_, window, cx| {
+            window
+                .within(("tile", 1usize))
+                .within("popup-menu")
+                .click(1usize, cx);
+        })
+        .unwrap();
+        frame(cx);
+        assert_eq!(in_album(trips, cx), 1);
+
+        // Back in the library, the selection is dragged onto an album in
+        // the sidebar.
+        cx.update_window(window, |_, window, cx| {
+            gallery.update(cx, |gallery, cx| gallery.load(Source::Library, cx));
+            window.render_frame(cx);
+        })
+        .unwrap();
+        frame(cx);
+        click(("tile", 0), cx);
+        cx.update_window(window, |_, window, cx| {
+            // As ⌘-clicks would.
+            gallery.update(cx, |gallery, cx| {
+                gallery.toggle_selected(1);
+                gallery.toggle_selected(2);
+                cx.notify();
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update_window(window, |_, window, cx| {
+            window.drag_to(("tile", 0usize), ("album-drop", family as u64), cx)
+        })
+        .unwrap();
+        frame(cx);
+        assert_eq!(in_album(family, cx), 3);
+        assert_eq!(notice(cx), "Added 3 photos to “Family”.");
+        // A drag from the selection doesn't draw a box.
+        gallery.read_with(cx, |gallery, _| {
+            assert!(gallery.marquee.is_none());
+            assert_eq!(gallery.selection.len(), 3);
+        });
+
+        // The viewer shows the albums a photo is in, and its menu changes
+        // them.
+        let photo_albums = |cx: &mut TestAppContext| {
+            gallery.read_with(cx, |gallery, cx| {
+                let viewer = gallery.viewer.as_ref().unwrap().read(cx);
+                viewer.photo_albums().map(<[AlbumId]>::to_vec)
+            })
+        };
+        cx.update_window(window, |_, window, cx| {
+            window.double_click(("tile", 0usize), cx)
+        })
+        .unwrap();
+        frame(cx);
+        assert_eq!(photo_albums(cx), Some(vec![family]));
+        cx.update_window(window, |_, window, cx| window.click("photo-albums", cx))
+            .unwrap();
+        frame(cx);
+        // Its albums, by name, checked if the photo's in them: Family, Trips,
+        // then New Album….
+        cx.update_window(window, |_, window, cx| {
+            window
+                .within("popover:dropdown-menu:Name(\"photo-albums\")")
+                .within("popup-menu")
+                .click(1usize, cx);
+        })
+        .unwrap();
+        frame(cx);
+        assert_eq!(photo_albums(cx), Some(vec![trips, family]));
+        assert_eq!(in_album(trips, cx), 2);
+        // The sidebar's counts follow.
+        gallery.read_with(cx, |gallery, _| {
+            let trips = gallery.albums.iter().find(|a| a.id == trips).unwrap();
+            assert_eq!(trips.photos, 2);
+        });
+
+        // Right-clicking the photo shows the same menu; choosing an album
+        // it's in takes it out.
+        cx.update_window(window, |_, window, cx| window.right_click("image-pane", cx))
+            .unwrap();
+        frame(cx);
+        cx.update_window(window, |_, window, cx| {
+            window
+                .within("image-pane")
+                .within("popup-menu")
+                .click(1usize, cx);
+        })
+        .unwrap();
+        frame(cx);
+        assert_eq!(photo_albums(cx), Some(vec![trips]));
+        assert_eq!(in_album(family, cx), 2);
+
+        std::fs::remove_dir_all(folder).ok();
+    }
+
+    #[test]
+    fn evicts_thumbnails_shown_longest_ago_to_fit_the_budget() {
+        // (index, last shown, bytes)
+        let loaded = || [(0, 5, 40), (1, 1, 30), (2, 3, 30), (3, 9, 30)].into_iter();
+        // Within budget: nothing.
+        assert!(evictions(loaded(), &[], 130).is_empty());
+        // 130 bytes into 70: the two shown longest ago go.
+        assert_eq!(evictions(loaded(), &[], 70), [1, 2]);
+        // Those on screen stay, whatever the budget.
+        assert_eq!(evictions(loaded(), &[1], 70), [2, 0]);
+        assert_eq!(evictions(loaded(), &[0, 1, 2, 3], 0), Vec::<usize>::new());
     }
 }

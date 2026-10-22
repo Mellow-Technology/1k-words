@@ -56,6 +56,85 @@ Location is shown in the info sidebar (`src/location.rs`). Ideas for later:
   it should be opt-in and cached.
 - _More map ideas to come._
 
+## Sync
+
+Targets are set up on the Sync page in Settings, and each library chooses
+its targets on the Libraries page (`src/sync_settings.rs`).
+
+- **Sync in the background**, after imports and on a timer, rather than only
+  with Sync Now.
+- **Choose a library's folder in a target.** It's `<name>-<start of id>`,
+  fixed when the target's added.
+- **Secure settings on Windows and Linux.** On macOS targets' settings are in
+  the keychain; elsewhere they're in `sync-targets.json` as plain JSON. Use
+  Credential Manager and the Secret Service.
+- **Sign the app** so the keychain doesn't ask again after each update (items
+  are tied to the binary's code signature).
+- **Download and listing.** The plugin interface has them; the app doesn't
+  use them yet (restoring a library, adopting files already on a service).
+- **Parallel and multipart uploads** for big libraries and long videos.
+- **Plugins from users.** `.wasm` files in the app's `plugins` folder are
+  loaded, but there's no way to install them or review what they can reach.
+- **Thumbnails first, originals on demand.** Thumbnails (and other
+  derivatives, `src/library/derivatives.rs`) are kept in the library,
+  catalogued apart from the originals, and uploaded ahead of them. Still to
+  do for a device short on space:
+  - sync the catalog itself, so another device knows the library's photos;
+  - download a library's derivatives, and its originals only when asked;
+  - record which originals are on the device (say, a column on `photos`),
+    and show and open photos whose originals aren't;
+  - free up space by removing originals that are safely synced.
+- **More derivatives**, such as viewer-sized previews and video posters.
+  Each is a `DerivativeKind`, with its own folder.
+
+## Object detection
+
+Objects are found with YOLO11 (`src/detect.rs`), from each photo's
+thumbnail, and recorded in the catalog (`src/library/objects.rs`). The
+viewer's info sidebar lists them and toggles shimmering boxes around them
+(`src/object_boxes.rs`); the gallery's search field finds them, suggesting
+the kinds found so far as it's typed.
+
+- **Ask before downloading the model.** It's 228 MB, fetched from Hugging
+  Face the first time a library is opened. Offer a setting, or bundle a
+  smaller model (YOLO11n is ~11 MB) once there's a trusted ONNX export.
+- **Refresh search results** as the first scan finds more; a search shows
+  what had been found when it ran.
+- **Progress** for the first scan of a big library.
+- **A smaller model.** The helper process takes ~440 MB while it runs,
+  most of it YOLO11x's weights; YOLO11s or m would likely find much the
+  same kinds of object in a fraction of that. Bumping `MODEL` rescans.
+
+## Memory
+
+- **The viewer's full image.** A 24 MP photo peaks above 300 MB:
+  `decode::viewer_preview` clones the decoded image only to shrink it
+  (`thumbnail_exact` takes `&self`), and the full texture is capped at
+  `MAX_TEXTURE_SIZE` rather than what the display can show at the
+  furthest zoom. Tiling would bound it altogether.
+- **Concurrent raw decodes.** Developing a raw file takes a few hundred
+  MB, and the gallery runs up to six full decodes at once; raw files
+  should count for more than JPEGs against that limit.
+
+## Albums
+
+Albums are kept in each library's catalog (`src/library/albums.rs`), shown
+nested in the sidebar, and filled by importing into them
+(`src/album_dialogs.rs`), from the gallery's right-click menu, by dragging
+the selection onto one, or from the viewer's albums menu, which also shows
+the albums a photo is in.
+
+- **Drop onto a whole sidebar row.** GPUI Kit's sidebar items take no
+  drops, so an album's drop target is its row's suffix, stretched over the
+  label (`navigation::album_item`); the icon and caret aren't covered. A
+  drop hook upstream would be cleaner.
+- **Box selection from a selected photo.** Dragging the selection moves it
+  (onto an album), so a box can only start elsewhere.
+- **Move albums** into other albums, by dragging them in the sidebar.
+- **Keep albums safe.** Unlike the rest of the catalog, they can't be found
+  again from the originals; syncing the catalog (see Sync) would cover them.
+- **Show the photos of the albums inside** an album, optionally.
+
 ## Automated Updates
 
 - Integrate [GPUI Updater](https://github.com/AprilNEA/gpui-updater) for automatic updates

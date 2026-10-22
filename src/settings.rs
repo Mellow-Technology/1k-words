@@ -10,6 +10,9 @@ use gpui_kit::component::{IconName, Theme, ThemeMode, ThemeSet};
 use gpui_kit::{App, Global, IntoElement, SharedString, Subscription, Window};
 use serde::{Deserialize, Serialize};
 
+use crate::library_settings::{self, LibraryActions};
+use crate::sync_settings;
+
 const THEME: &str = include_str!("../themes/1k-words.json");
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,6 +61,8 @@ pub enum GridLayout {
 pub struct AppSettings {
     pub appearance: Appearance,
     pub grid_layout: GridLayout,
+    /// Whether the viewer draws boxes around the objects found in photos.
+    pub show_object_boxes: bool,
 }
 
 impl Global for AppSettings {}
@@ -84,6 +89,10 @@ pub fn set_grid_layout(layout: GridLayout, cx: &mut App) {
     update(cx, |settings| settings.grid_layout = layout);
 }
 
+pub fn set_show_object_boxes(show: bool, cx: &mut App) {
+    update(cx, |settings| settings.show_object_boxes = show);
+}
+
 /// Applies the appearance setting, reading the system appearance from
 /// `window` when given.
 pub fn apply_appearance(window: Option<&mut Window>, cx: &mut App) {
@@ -104,8 +113,9 @@ pub fn observe_system_appearance(window: &mut Window) -> Subscription {
     })
 }
 
-/// The settings page shown in the main area.
-pub fn settings_view() -> impl IntoElement {
+/// The settings page shown in the main area. `libraries` does what the
+/// Libraries page's buttons ask.
+pub fn settings_view(libraries: LibraryActions, cx: &App) -> impl IntoElement {
     let appearance = SettingField::dropdown(
         Appearance::ALL
             .iter()
@@ -122,16 +132,19 @@ pub fn settings_view() -> impl IntoElement {
     )
     .default_value(SharedString::from(Appearance::default().key()));
 
-    Settings::new("settings").page(
-        SettingPage::new("Appearance")
-            .icon(IconName::Palette)
-            .group(
-                SettingGroup::new().item(
-                    SettingItem::new("Theme", appearance)
-                        .description("Use a light or dark appearance, or match the system."),
+    Settings::new("settings")
+        .page(
+            SettingPage::new("Appearance")
+                .icon(IconName::Palette)
+                .group(
+                    SettingGroup::new().item(
+                        SettingItem::new("Theme", appearance)
+                            .description("Use a light or dark appearance, or match the system."),
+                    ),
                 ),
-            ),
-    )
+        )
+        .page(library_settings::page(libraries, cx))
+        .page(sync_settings::page(cx))
 }
 
 /// Registers the app's light and dark themes with GPUI Kit.
