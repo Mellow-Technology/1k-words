@@ -10,19 +10,24 @@ use std::sync::Arc;
 
 use gpui_kit::assets::IconName as LucideIcon;
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::menu::PopupMenuItem;
 use gpui_kit::component::sidebar::{
     Sidebar, SidebarCollapsible, SidebarGroup, SidebarItem, SidebarMenu, SidebarMenuItem,
     SidebarToggleButton,
 };
-use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable};
+use gpui_kit::component::{
+    ActiveTheme, Collapsible, Icon, IconName, Sizable, StyledExt as _, h_flex, v_flex,
+};
 use gpui_kit::{
-    App, Context, Div, Global, InteractiveElement as _, IntoElement, KeyBinding, ParentElement,
-    Render, RenderOnce, Styled, TestSupportExt as _, ViewElement, Window, div, px,
+    AnyElement, App, AppContext as _, Context, Div, ElementId, Global, Hsla,
+    InteractiveElement as _, IntoElement, KeyBinding, ParentElement, Render, RenderOnce, Role,
+    SharedString, Stateful, StatefulInteractiveElement as _, StyleRefinement, Styled,
+    TestSupportExt as _, ViewElement, Window, div, percentage, prelude::FluentBuilder as _, px,
 };
 
 use crate::devices::{self, Device};
-use crate::library::{self, Album, AlbumId, child_albums};
+use crate::library::{self, Album, AlbumId, child_albums, nested_albums};
 
 gpui_kit::actions!(navigation, [ToggleSidebar, OpenSettings]);
 
@@ -81,6 +86,8 @@ pub type DeviceCallback = Rc<dyn Fn(&Device, &mut Window, &mut App)>;
 pub type AlbumCallback = Rc<dyn Fn(AlbumId, &mut Window, &mut App)>;
 /// Makes an album, in the one given if any.
 pub type NewAlbumCallback = Rc<dyn Fn(Option<AlbumId>, &mut Window, &mut App)>;
+/// Puts an album in another, or at the top level.
+pub type MoveAlbumCallback = Rc<dyn Fn(AlbumId, Option<AlbumId>, &mut Window, &mut App)>;
 
 /// What the sidebar shows about the app's current state.
 pub struct NavigationContext {
@@ -105,6 +112,9 @@ pub struct NavigationContext {
     pub delete_album: AlbumCallback,
     /// Adds the photos being dragged (see `DraggedPhotos`) to an album.
     pub drop_on_album: AlbumCallback,
+    pub move_album: MoveAlbumCallback,
+    /// Turns showing the photos of the albums in an album on or off.
+    pub toggle_show_nested: AlbumCallback,
 }
 
 /// The gallery's selected photos, being dragged onto an album.
@@ -120,24 +130,42 @@ impl Render for DraggedPhotos {
             1 => "1 photo".to_owned(),
             count => format!("{count} photos"),
         };
-        div()
-            .flex()
-            .items_center()
-            .gap_1p5()
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .shadow_md()
-            .text_sm()
-            .bg(cx.theme().primary)
-            .text_color(cx.theme().primary_foreground)
-            .child(Icon::new(LucideIcon::Images).small())
-            .child(label)
+        drag_badge(LucideIcon::Images, label.into(), cx)
     }
 }
 
+/// An album being dragged in the sidebar, to put it in another.
+#[derive(Clone)]
+pub struct DraggedAlbum {
+    pub id: AlbumId,
+    pub name: SharedString,
+}
+
+impl Render for DraggedAlbum {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        drag_badge(LucideIcon::Album, self.name.clone(), cx)
+    }
+}
+
+fn drag_badge(icon: LucideIcon, label: SharedString, cx: &App) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_1p5()
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .shadow_md()
+        .text_sm()
+        .bg(cx.theme().primary)
+        .text_color(cx.theme().primary_foreground)
+        .child(Icon::new(icon).small())
+        .child(label)
+}
+
 pub fn navigation_sidebar(context: NavigationContext, cx: &App) -> impl IntoElement {
-    let devices = devices_group(&context, cx);
+    let context = Rc::new(context);
+    let devices = devices_group(&context, cx).map(Section::Menu);
     let current = library::current(cx).map(|library| library.info.id.clone());
     let items: Vec<SidebarMenuItem> = library::list(cx)
         .iter()
@@ -166,7 +194,9 @@ pub fn navigation_sidebar(context: NavigationContext, cx: &App) -> impl IntoElem
                 .justify_end()
                 .child(toggle_button(false)),
         )
-        .child(SidebarGroup::new("Libraries").child(SidebarMenu::new().children(items)))
+        .child(Section::Menu(
+            SidebarGroup::new("Libraries").child(SidebarMenu::new().children(items)),
+        ))
         .children(albums_group(&context, cx))
         .children(devices)
         .footer(MenuElement(
@@ -179,92 +209,292 @@ pub fn navigation_sidebar(context: NavigationContext, cx: &App) -> impl IntoElem
         ))
 }
 
+/// A group of the sidebar: a menu, or the albums, which draw their own
+/// rows (see `AlbumTree`).
+#[derive(Clone)]
+enum Section {
+    Menu(SidebarGroup<SidebarMenu>),
+    Albums(SidebarGroup<AlbumTree>),
+}
+
+impl Collapsible for Section {
+    fn is_collapsed(&self) -> bool {
+        match self {
+            Section::Menu(group) => group.is_collapsed(),
+            Section::Albums(group) => group.is_collapsed(),
+        }
+    }
+
+    fn collapsed(self, collapsed: bool) -> Self {
+        match self {
+            Section::Menu(group) => Section::Menu(group.collapsed(collapsed)),
+            Section::Albums(group) => Section::Albums(group.collapsed(collapsed)),
+        }
+    }
+}
+
+impl SidebarItem for Section {
+    fn render(
+        self,
+        id: impl Into<ElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> impl IntoElement {
+        match self {
+            Section::Menu(group) => group.render(id, window, cx).into_any_element(),
+            Section::Albums(group) => group.render(id, window, cx).into_any_element(),
+        }
+    }
+}
+
 /// The open library's albums, nested as they are, and a button to make
 /// one.
-fn albums_group(context: &NavigationContext, cx: &App) -> Option<SidebarGroup<SidebarMenu>> {
+fn albums_group(context: &Rc<NavigationContext>, cx: &App) -> Option<Section> {
     library::current(cx)?;
-    // The albums the open one is in start out open, to show it.
-    let open_path: Vec<AlbumId> = context
-        .open_album
-        .map(|id| {
-            library::album_path(&context.albums, id)
-                .iter()
-                .map(|album| album.id)
-                .collect()
-        })
-        .unwrap_or_default();
-    let albums =
-        child_albums(&context.albums, None).map(|album| album_item(context, album, &open_path));
-    let new_album = context.new_album.clone();
-    let add = SidebarMenuItem::new("New Album…")
-        .icon(Icon::new(LucideIcon::FolderPlus))
+    Some(Section::Albums(SidebarGroup::new("Albums").child(
+        AlbumTree {
+            context: context.clone(),
+            collapsed: false,
+        },
+    )))
+}
+
+/// The albums in the sidebar. They're drawn like GPUI Kit's
+/// `SidebarMenuItem`s, but each whole row can be dragged, to move the album
+/// into another, and photos and albums dropped on it, which its rows don't
+/// allow.
+#[derive(Clone)]
+struct AlbumTree {
+    context: Rc<NavigationContext>,
+    collapsed: bool,
+}
+
+impl Collapsible for AlbumTree {
+    fn is_collapsed(&self) -> bool {
+        self.collapsed
+    }
+
+    fn collapsed(mut self, collapsed: bool) -> Self {
+        self.collapsed = collapsed;
+        self
+    }
+}
+
+impl SidebarItem for AlbumTree {
+    fn render(
+        self,
+        _: impl Into<ElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> impl IntoElement {
+        let context = &self.context;
+        // The albums the open one is in start out open, to show it.
+        let open_path: Vec<AlbumId> = context
+            .open_album
+            .map(|id| {
+                library::album_path(&context.albums, id)
+                    .iter()
+                    .map(|album| album.id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let new_album = context.new_album.clone();
+        let add = sidebar_row(
+            "new-album".into(),
+            LucideIcon::FolderPlus,
+            "New Album…".into(),
+            false,
+            cx,
+        )
         .on_click(move |_, window, cx| new_album(None, window, cx));
-    Some(SidebarGroup::new("Albums").child(SidebarMenu::new().children(albums.chain([add]))))
+        v_flex()
+            .gap_2()
+            .children(
+                child_albums(&context.albums, None)
+                    .map(|album| album_item(context, album, &open_path, window, cx)),
+            )
+            .child(add)
+    }
+}
+
+/// A row as GPUI Kit's sidebar draws its menu items.
+fn sidebar_row(
+    id: ElementId,
+    icon: LucideIcon,
+    label: SharedString,
+    active: bool,
+    cx: &App,
+) -> Stateful<Div> {
+    let theme = cx.theme();
+    h_flex()
+        .id(id)
+        .role(Role::TreeItem)
+        .aria_label(label.clone())
+        .aria_selected(active)
+        .w_full()
+        .h_7()
+        .flex_shrink_0()
+        .overflow_x_hidden()
+        .p_2()
+        .gap_x_2()
+        .rounded(theme.radius)
+        .text_sm()
+        .when(!active, |row| {
+            let (accent, foreground) = (theme.sidebar_accent, theme.sidebar_accent_foreground);
+            row.hover(move |row| row.bg(accent.opacity(0.8)).text_color(foreground))
+        })
+        .when(active, |row| {
+            row.font_medium()
+                .bg(theme.tokens.sidebar_accent)
+                .text_color(theme.sidebar_accent_foreground)
+        })
+        .child(Icon::new(icon))
+        .child(h_flex().flex_1().overflow_x_hidden().child(label))
 }
 
 /// An album, with the albums in it beneath, and a menu to make an album in
-/// it, rename it, or delete it.
+/// it, rename it, move it or delete it.
 fn album_item(
-    context: &NavigationContext,
+    context: &Rc<NavigationContext>,
     album: &Album,
     open_path: &[AlbumId],
-) -> SidebarMenuItem {
-    let children: Vec<SidebarMenuItem> = child_albums(&context.albums, Some(album.id))
-        .map(|child| album_item(context, child, open_path))
-        .collect();
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
     let id = album.id;
+    let children: Vec<&Album> = child_albums(&context.albums, Some(id)).collect();
+    let has_children = !children.is_empty();
     let active = context.page == Page::Library && context.open_album == Some(id);
-    let contains_open = open_path.contains(&id) && context.open_album != Some(id);
+    let open = has_children.then(|| {
+        let contains_open = open_path.contains(&id) && context.open_album != Some(id);
+        window.use_keyed_state(("album-open", id.key()), cx, move |_, _| contains_open)
+    });
+    let is_open = open.as_ref().is_some_and(|open| *open.read(cx));
+    let highlight = cx.theme().primary;
+
+    let mut row = sidebar_row(
+        ("album", id.key()).into(),
+        LucideIcon::Album,
+        album.name.clone().into(),
+        active,
+        cx,
+    );
+    if let Some(open) = open {
+        row = row.child(
+            Button::new("caret")
+                .xsmall()
+                .ghost()
+                .icon(
+                    Icon::new(IconName::ChevronRight)
+                        .size_4()
+                        .when(is_open, |icon| icon.rotate(percentage(0.25))),
+                )
+                .on_click(move |_, _, cx| {
+                    // Not showing the album too.
+                    cx.stop_propagation();
+                    open.update(cx, |open, cx| {
+                        *open = !*open;
+                        cx.notify();
+                    });
+                }),
+        );
+    }
     let show_album = context.show_album.clone();
+    let drop_on_album = context.drop_on_album.clone();
+    let move_album = context.move_album.clone();
+    let albums = context.albums.clone();
+    let row = row
+        .on_click(move |_, window, cx| show_album(id, window, cx))
+        .on_drag(
+            DraggedAlbum {
+                id,
+                name: album.name.clone().into(),
+            },
+            |dragged, _, _, cx| cx.new(|_| dragged.clone()),
+        )
+        // Not into itself, or an album in it.
+        .can_drop(move |dragged, _, _| {
+            dragged
+                .downcast_ref::<DraggedAlbum>()
+                .is_none_or(|album| !nested_albums(&albums, album.id).contains(&id))
+        })
+        .drag_over::<DraggedPhotos>(move |style, _, _, _| drop_highlight(style, highlight))
+        .drag_over::<DraggedAlbum>(move |style, _, _, _| drop_highlight(style, highlight))
+        .on_drop(move |_: &DraggedPhotos, window, cx| drop_on_album(id, window, cx))
+        .on_drop({
+            let move_album = move_album.clone();
+            move |album: &DraggedAlbum, window, cx| move_album(album.id, Some(id), window, cx)
+        })
+        // Found by UI tests.
+        .test_support();
+
     let new_album = context.new_album.clone();
     let rename_album = context.rename_album.clone();
     let delete_album = context.delete_album.clone();
-    let drop_on_album = context.drop_on_album.clone();
-    SidebarMenuItem::new(album.name.clone())
-        .icon(Icon::new(LucideIcon::Album))
-        .active(active)
-        .default_open(contains_open)
-        .on_click(move |_, window, cx| show_album(id, window, cx))
-        // Photos are dropped on the row. Its suffix is the only place for
-        // that, so it's stretched over the row's label, without taking its
-        // clicks.
-        .suffix(move |_, cx| {
-            let drop_on_album = drop_on_album.clone();
-            let highlight = cx.theme().primary;
-            div()
-                .id(("album-drop", id as u64))
-                .absolute()
-                .inset_0()
-                .rounded_sm()
-                .drag_over::<DraggedPhotos>(move |style, _, _, _| {
-                    style
-                        .bg(highlight.opacity(0.2))
-                        .border_1()
-                        .border_color(highlight)
-                })
-                .on_drop(move |_: &DraggedPhotos, window, cx| drop_on_album(id, window, cx))
-                // Found by UI tests.
-                .test_support()
-        })
-        .children(children)
-        .context_menu(move |menu, _, _| {
-            let new_album = new_album.clone();
-            let rename_album = rename_album.clone();
-            let delete_album = delete_album.clone();
+    let toggle_show_nested = context.toggle_show_nested.clone();
+    let (show_nested, nested) = (album.show_nested, album.parent.is_some());
+    let row = row.context_menu(move |menu, _, _| {
+        let new_album = new_album.clone();
+        let rename_album = rename_album.clone();
+        let delete_album = delete_album.clone();
+        let move_album = move_album.clone();
+        let toggle_show_nested = toggle_show_nested.clone();
+        menu.item(
+            PopupMenuItem::new("New Album Inside…")
+                .on_click(move |_, window, cx| new_album(Some(id), window, cx)),
+        )
+        .item(
+            PopupMenuItem::new("Rename…")
+                .on_click(move |_, window, cx| rename_album(id, window, cx)),
+        )
+        .when(has_children, |menu| {
             menu.item(
-                PopupMenuItem::new("New Album Inside…")
-                    .on_click(move |_, window, cx| new_album(Some(id), window, cx)),
-            )
-            .item(
-                PopupMenuItem::new("Rename…")
-                    .on_click(move |_, window, cx| rename_album(id, window, cx)),
-            )
-            .separator()
-            .item(
-                PopupMenuItem::new("Delete Album…")
-                    .on_click(move |_, window, cx| delete_album(id, window, cx)),
+                PopupMenuItem::new("Show Photos from Albums Inside")
+                    .checked(show_nested)
+                    .on_click(move |_, window, cx| toggle_show_nested(id, window, cx)),
             )
         })
+        .when(nested, |menu| {
+            menu.item(
+                PopupMenuItem::new("Move to Top Level")
+                    .on_click(move |_, window, cx| move_album(id, None, window, cx)),
+            )
+        })
+        .separator()
+        .item(
+            PopupMenuItem::new("Delete Album…")
+                .on_click(move |_, window, cx| delete_album(id, window, cx)),
+        )
+    });
+
+    let border = cx.theme().sidebar_border;
+    v_flex()
+        .w_full()
+        .child(row)
+        .when(is_open, |item| {
+            item.child(
+                v_flex()
+                    .border_l_1()
+                    .border_color(border)
+                    .gap_1()
+                    .ml_3p5()
+                    .pl_2p5()
+                    .py_0p5()
+                    .children(
+                        children
+                            .into_iter()
+                            .map(|child| album_item(context, child, open_path, window, cx)),
+                    ),
+            )
+        })
+        .into_any_element()
+}
+
+fn drop_highlight(style: StyleRefinement, highlight: Hsla) -> StyleRefinement {
+    style
+        .bg(highlight.opacity(0.2))
+        .border_1()
+        .border_color(highlight)
 }
 
 /// The removable devices, if any are mounted, each with an eject button.

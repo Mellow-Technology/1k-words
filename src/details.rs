@@ -342,7 +342,7 @@ mod tests {
         let object = |label: &str, confidence| DetectedObject {
             label: label.into(),
             confidence,
-            bounds: [0., 0., 1., 1.],
+            bounds: Some([0., 0., 1., 1.]),
         };
         assert!(objects_section(&[]).is_none());
         let section = objects_section(&[

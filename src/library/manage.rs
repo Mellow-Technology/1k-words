@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context as _, Result, bail};
 
 use super::catalog::Catalog;
+use super::device::Device;
 use super::sync::{LibraryTarget, SyncStatus};
 use super::{Library, LibraryInfo, ORIGINALS_DIR, marker_id, protect, sync};
 
@@ -48,7 +49,14 @@ impl LibraryHandle {
         if !self.catalog_path.exists() {
             return Ok(None);
         }
-        f(&Catalog::open(&self.catalog_path)?).map(Some)
+        // Catalogs are kept in `<config>/libraries`.
+        let config_dir = self
+            .catalog_path
+            .parent()
+            .and_then(Path::parent)
+            .context("a catalog outside the config directory")?;
+        let device = Device::load(config_dir)?;
+        f(&Catalog::open(&self.catalog_path, &device)?).map(Some)
     }
 
     pub fn stats(&self) -> Result<LibraryStats> {

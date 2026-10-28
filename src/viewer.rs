@@ -29,6 +29,7 @@ use crate::navigation;
 use crate::object_boxes::ObjectBoxes;
 use crate::photos::{Stack, StackKind, StartFrame};
 use crate::settings;
+use crate::tiles::{FullImage, Tiles};
 use crate::video::{PlaybackState, VideoPlayer};
 use crate::zoom::{ZoomState, zoomed_image};
 
@@ -77,6 +78,9 @@ pub enum ViewerEvent {
 
 struct LoadedImage {
     image: Arc<RenderImage>,
+    /// Whether it's the photo at full resolution, rather than a preview or
+    /// the photo scaled to fit the window.
+    full: bool,
 }
 
 enum LoadState {
@@ -107,6 +111,16 @@ pub struct PhotoViewer {
     /// quick click after double-clicking a gallery tile to open it.
     pane_clicked: bool,
     _load_image: Task<()>,
+    /// Loading the photo at full resolution, once it's zoomed in further
+    /// than the image shown can show sharply.
+    load_full: Option<Task<()>>,
+    /// The photo at full resolution, once loaded, and the tiles of it in
+    /// view (see `tiles`).
+    tiles: Option<Tiles>,
+    /// Cutting tiles that have come into view.
+    cutting: Option<Task<()>>,
+    /// Loading it failed, so it isn't tried again for this photo.
+    full_failed: bool,
     _load_details: Task<()>,
     _load_filmstrip: Vec<Task<()>>,
     /// The library the photos are in, if they're a library's, for albums.
@@ -144,6 +158,10 @@ impl PhotoViewer {
             pane_clicked: false,
             live: None,
             _load_image: Task::ready(()),
+            load_full: None,
+            tiles: None,
+            cutting: None,
+            full_failed: false,
             _load_details: Task::ready(()),
             _load_filmstrip: Vec::new(),
             library,
@@ -158,6 +176,7 @@ impl PhotoViewer {
 
     fn select(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.stop_live(cx);
+        self.release_tiles(cx);
         let Some(photo) = self.stack.photos.get(ix) else {
             return;
         };
@@ -165,6 +184,8 @@ impl PhotoViewer {
             cx.drop_image(loaded.image, Some(window));
         }
         self.load_state = LoadState::Loading;
+        self.load_full = None;
+        self.full_failed = false;
         self.photo_albums = None;
         self.objects = None;
         self.selected = ix;
@@ -172,6 +193,11 @@ impl PhotoViewer {
             .borrow_mut()
             .set_image_size(image_size(&self.stack, ix));
 
+        let (viewport, scale) = (window.viewport_size(), window.scale_factor());
+        let fit = size(
+            (f32::from(viewport.width) * scale).ceil() as u32,
+            (f32::from(viewport.height) * scale).ceil() as u32,
+        );
         let photo = photo.clone();
         self._load_image = cx.spawn({
             let photo = photo.clone();
@@ -182,43 +208,28 @@ impl PhotoViewer {
                     async move { decode::viewer_embedded_preview(&photo) }
                 });
                 if let Some(preview) = preview.await {
-                    this.update(cx, |this, cx| this.show(preview, cx)).ok();
+                    this.update(cx, |this, cx| this.show(preview, false, cx))
+                        .ok();
                 }
 
-                let decoded = cx.background_spawn(async move { decode::decode_full(&photo) });
-                let decoded = match decoded.await {
-                    Ok(decoded) => decoded,
-                    Err(error) => {
-                        this.update(cx, |this, cx| {
-                            this.load_state = LoadState::Failed(error.to_string().into());
-                            cx.notify();
-                        })
-                        .ok();
-                        return;
-                    }
-                };
-
-                // Without an embedded preview, show a scaled down copy first;
-                // it's much quicker to convert and upload to the GPU.
-                let needs_preview = this.read_with(cx, |this, _| this.image.is_none());
-                let decoded = if needs_preview.unwrap_or(false) {
-                    let (preview, decoded) = cx
-                        .background_spawn(
-                            async move { (decode::viewer_preview(&decoded), decoded) },
-                        )
-                        .await;
-                    this.update(cx, |this, cx| this.show(preview, cx)).ok();
-                    decoded
-                } else {
-                    decoded
-                };
-
-                let full = cx
-                    .background_spawn(async move { decode::viewer_full(decoded) })
+                // Then the photo, scaled to fit the window: all that's
+                // needed until it's zoomed in (see `load_full_if_needed`).
+                // Its full resolution would take several times the memory.
+                let loaded = cx
+                    .background_spawn(async move {
+                        let decoded = decode::decode_full(&photo)?;
+                        anyhow::Ok(decode::viewer_image(decoded, fit.width, fit.height))
+                    })
                     .await;
-                this.update(cx, |this, cx| {
-                    this.show(full, cx);
-                    this.load_state = LoadState::Done;
+                this.update(cx, |this, cx| match loaded {
+                    Ok((image, full)) => {
+                        this.show(image, full, cx);
+                        this.load_state = LoadState::Done;
+                    }
+                    Err(error) => {
+                        this.load_state = LoadState::Failed(error.to_string().into());
+                        cx.notify();
+                    }
                 })
                 .ok();
             }
@@ -437,7 +448,7 @@ impl PhotoViewer {
         if self.live.is_some() {
             return;
         }
-        let player = cx.new(|cx| VideoPlayer::new(video, cx));
+        let player = cx.new(|cx| VideoPlayer::new(video, true, cx));
         let observe = cx.observe(&player, |this, player, cx| {
             if *player.read(cx).state() != PlaybackState::Playing {
                 this.stop_live(cx);
@@ -454,11 +465,121 @@ impl PhotoViewer {
         }
     }
 
-    fn show(&mut self, image: Arc<RenderImage>, cx: &mut Context<Self>) {
-        if let Some(old) = self.image.replace(LoadedImage { image }) {
-            cx.drop_image(old.image, None);
+    fn show(&mut self, image: Arc<RenderImage>, full: bool, cx: &mut Context<Self>) {
+        if let Some(old) = self.image.replace(LoadedImage { image, full }) {
+            decode::release(old.image, cx);
         }
         cx.notify();
+    }
+
+    /// Whether it's zoomed in further than the image shown has pixels for.
+    fn needs_full(&self) -> bool {
+        let Some(loaded) = &self.image else {
+            return false;
+        };
+        if loaded.full {
+            return false;
+        }
+        let shown = loaded.image.size(0);
+        let needed = self.zoom.borrow().displayed_pixels();
+        needed.width > shown.width.0 as f32 || needed.height > shown.height.0 as f32
+    }
+
+    /// Loads the photo at full resolution if it's zoomed in further than
+    /// the image shown has pixels for. It's kept on the CPU, and shown in
+    /// tiles (see `update_tiles`).
+    fn load_full_if_needed(&mut self, cx: &mut Context<Self>) {
+        if self.tiles.is_some()
+            || self.load_full.is_some()
+            || self.full_failed
+            || !matches!(self.load_state, LoadState::Done)
+            || !self.needs_full()
+        {
+            return;
+        }
+        let photo = self.stack.photos[self.selected].clone();
+        self.load_full = Some(cx.spawn(async move |this, cx| {
+            let loaded = cx
+                .background_spawn(async move {
+                    anyhow::Ok(FullImage::new(decode::decode_full(&photo)?))
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.load_full = None;
+                match loaded {
+                    Ok(full) => this.tiles = Some(Tiles::new(full)),
+                    // The image fitted stays.
+                    Err(error) => {
+                        eprintln!("couldn't load the full photo: {error:#}");
+                        this.full_failed = true;
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// Cuts the tiles of the full-resolution photo that have come into
+    /// view, and releases those that have gone out of it, or all of them
+    /// once it's zoomed out.
+    fn update_tiles(&mut self, cx: &mut Context<Self>) {
+        let visible = if self.needs_full() {
+            self.zoom.borrow().visible_fraction()
+        } else {
+            None
+        };
+        let Some(tiles) = &mut self.tiles else {
+            return;
+        };
+        let (released, missing) = tiles.update(visible);
+        for tile in released {
+            decode::release(tile, cx);
+        }
+        if missing.is_empty() || self.cutting.is_some() {
+            return;
+        }
+        let source = tiles.source.clone();
+        self.cutting = Some(cx.spawn(async move |this, cx| {
+            let cut = cx
+                .background_spawn({
+                    let source = source.clone();
+                    async move {
+                        missing
+                            .into_iter()
+                            .map(|key| (key, source.cut(key)))
+                            .collect::<Vec<_>>()
+                    }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.cutting = None;
+                match &mut this.tiles {
+                    // Those that have gone out of view meanwhile are
+                    // released at the next update.
+                    Some(tiles) if Arc::ptr_eq(&tiles.source, &source) => tiles.insert(cut),
+                    // Another photo's been selected.
+                    _ => {
+                        for (_, tile) in cut {
+                            decode::release(tile, cx);
+                        }
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Frees the full-resolution photo and its tiles.
+    fn release_tiles(&mut self, cx: &mut App) {
+        self.cutting = None;
+        if let Some(mut tiles) = self.tiles.take() {
+            for tile in tiles.take_all() {
+                decode::release(tile, cx);
+            }
+        }
     }
 
     fn load_filmstrip(&mut self, cx: &mut Context<Self>) {
@@ -490,12 +611,19 @@ impl PhotoViewer {
     /// given when called during an update of that window.
     pub fn release_images(&mut self, mut window: Option<&mut Window>, cx: &mut App) {
         self.stop_live(cx);
+        self.cutting = None;
+        let tiles = self
+            .tiles
+            .take()
+            .map(|mut tiles| tiles.take_all())
+            .unwrap_or_default();
         for image in self
             .image
             .take()
             .map(|loaded| loaded.image)
             .into_iter()
             .chain(self.filmstrip.iter_mut().filter_map(Option::take))
+            .chain(tiles)
         {
             cx.drop_image(image, window.as_deref_mut());
         }
@@ -517,6 +645,26 @@ impl PhotoViewer {
         } else {
             self.select(ix as usize, window, cx);
         }
+    }
+
+    /// The size of the image shown, and whether it's at full resolution.
+    #[cfg(test)]
+    pub fn shown_image(&self) -> Option<(u32, u32, bool)> {
+        let loaded = self.image.as_ref()?;
+        let size = loaded.image.size(0);
+        Some((size.width.0 as u32, size.height.0 as u32, loaded.full))
+    }
+
+    /// The full-resolution photo's size and how many tiles of it are
+    /// shown, once it's loaded.
+    #[cfg(test)]
+    pub fn full_tiles(&self) -> Option<(u32, u32, usize)> {
+        let tiles = self.tiles.as_ref()?;
+        Some((
+            tiles.source.width(),
+            tiles.source.height(),
+            tiles.shown().len(),
+        ))
     }
 
     #[cfg(test)]
@@ -607,9 +755,11 @@ impl PhotoViewer {
                 self.stack.photos.len()
             )
         });
+        let loading_full = self.load_full.is_some();
         let status = match (&self.load_state, &self.image) {
             (LoadState::Failed(_), Some(_)) => Some("Preview only"),
-            (LoadState::Loading, _) => Some("Loading full resolution…"),
+            (LoadState::Loading, _) => Some("Loading…"),
+            _ if loading_full => Some("Loading full resolution…"),
             _ => None,
         };
         let zoom = self.zoom.borrow();
@@ -693,7 +843,18 @@ impl PhotoViewer {
             _ => None,
         };
         let zoom = self.zoom.borrow();
-        let boxes = self.object_boxes(cx);
+        // A playing Live Photo covers the photo, zoomed and panned with it;
+        // the object boxes mark the photo, so they're hidden meanwhile.
+        let live_frame = self
+            .live
+            .as_ref()
+            .and_then(|(player, _)| player.read(cx).render_frame(ObjectFit::Cover))
+            .map(|frame| div().relative().size_full().overflow_hidden().child(frame));
+        let boxes = if live_frame.is_some() {
+            None
+        } else {
+            self.object_boxes(cx)
+        };
 
         let pane = div()
             .id("image-pane")
@@ -717,10 +878,12 @@ impl PhotoViewer {
                 cx.listener(|this, _, _, cx| this.update_zoom(cx, ZoomState::end_drag)),
             )
             .children(image.map(|image| {
-                let image = zoomed_image(image, self.zoom.clone());
-                match boxes {
-                    Some(objects) => image.overlay(ObjectBoxes::new(objects)),
-                    None => image,
+                let tiles = self.tiles.as_ref().map(Tiles::shown).unwrap_or_default();
+                let image = zoomed_image(image, self.zoom.clone()).tiles(tiles);
+                match (live_frame, boxes) {
+                    (Some(frame), _) => image.overlay(frame),
+                    (None, Some(objects)) => image.overlay(ObjectBoxes::new(objects)),
+                    (None, None) => image,
                 }
             }))
             .children(error.map(|error| {
@@ -748,24 +911,11 @@ impl PhotoViewer {
             .into_any_element()
     }
 
-    /// For Live Photos: the video while it plays, and the LIVE button that
-    /// plays it (on hover, like Photos, or on click).
-    fn render_live(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        if self.stack.photos[self.selected].live_video.is_none() {
-            return Vec::new();
-        }
-        let video = self
-            .live
-            .as_ref()
-            .and_then(|(player, _)| player.read(cx).render_frame(ObjectFit::Contain))
-            .map(|video| {
-                div()
-                    .absolute()
-                    .inset_0()
-                    .bg(cx.theme().background)
-                    .child(video)
-                    .into_any_element()
-            });
+    /// For Live Photos: the LIVE button that plays the video (on hover, like
+    /// Photos, or on click). The video is drawn over the photo by
+    /// `render_image_pane`.
+    fn render_live(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        self.stack.photos[self.selected].live_video.as_ref()?;
         let button = div()
             .id("live")
             .absolute()
@@ -793,7 +943,7 @@ impl PhotoViewer {
             }))
             .on_click(cx.listener(|this, _, _, cx| this.play_live(cx)))
             .into_any_element();
-        video.into_iter().chain([button]).collect()
+        Some(button)
     }
 
     /// Every frame of a bracket or burst, floating over the bottom of the
@@ -949,6 +1099,8 @@ impl Focusable for PhotoViewer {
 
 impl Render for PhotoViewer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.load_full_if_needed(cx);
+        self.update_tiles(cx);
         div()
             .track_focus(&self.focus_handle)
             .key_context(KEY_CONTEXT)

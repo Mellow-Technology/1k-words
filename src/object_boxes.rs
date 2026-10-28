@@ -47,8 +47,9 @@ impl RenderOnce for ObjectBoxes {
             .id("object-box-overlay")
             .relative()
             .size_full()
-            .children(self.objects.iter().enumerate().map(|(ix, object)| {
-                let [left, top, right, bottom] = object.bounds;
+            // Not every detector says where objects are.
+            .children(self.objects.iter().enumerate().filter_map(|(ix, object)| {
+                let [left, top, right, bottom] = object.bounds?;
                 let outline = BoxOutline { phase: None };
                 let outline = if animate {
                     outline
@@ -64,14 +65,15 @@ impl RenderOnce for ObjectBoxes {
                 } else {
                     outline.into_any_element()
                 };
-                div()
+                let object_box = div()
                     .absolute()
                     .left(relative(left))
                     .top(relative(top))
                     .w(relative(right - left))
                     .h(relative(bottom - top))
                     .child(outline)
-                    .child(label(object))
+                    .child(label(object));
+                Some(object_box)
             }))
     }
 }

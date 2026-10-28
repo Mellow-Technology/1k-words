@@ -1,6 +1,13 @@
-//! Object detection: finds things such as people, dogs and cars in photos,
-//! with YOLO11 run by ONNX Runtime (through yolo-rs). Libraries record what's
-//! found in their catalogs (see `Library::detect_missing_objects`).
+//! Object detection: finds things such as people, dogs and cars in photos.
+//! Libraries record what's found in their catalogs (see
+//! `Library::detect_missing_objects`), kept apart for each `Detector`:
+//!
+//! - The built-in one is YOLO11, run on this device by ONNX Runtime (through
+//!   yolo-rs).
+//! - Detection plugins (see `plugins`) can do it otherwise, such as by
+//!   asking a vision model on a service.
+//!
+//! The rest of this is about the built-in model.
 //!
 //! The model is too big to build into the app, so it's downloaded the first
 //! time it's needed, into the app's config directory, and checked against
@@ -17,10 +24,11 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use image::DynamicImage;
 use ort::session::Session;
 use serde::{Deserialize, Serialize};
@@ -28,15 +36,16 @@ use sha2::{Digest, Sha256};
 use yolo_rs::model::YoloModelSession;
 
 use crate::paths;
+use crate::plugins::{self, Config, DetectError};
 
-/// How catalogs refer to the model. Photos are looked at again when it
-/// changes.
+/// How catalogs refer to the built-in model. Photos are looked at again
+/// when it changes.
 pub const MODEL: &str = "yolo11x";
 
 /// The model, pinned to a revision of yolo-rs's author's export of YOLO11x
 /// (trained on COCO's 80 kinds of object).
 const MODEL_URL: &str = "https://huggingface.co/pan93412/yolo-v11-onnx/resolve/a2b3cf2eb0795b6997ef8e16846fee4babddcb06/yolo11x.onnx";
-const MODEL_SIZE: u64 = 228_016_485;
+pub const MODEL_SIZE: u64 = 228_016_485;
 const MODEL_SHA256: &str = "c3d0431659993c018741a085af1ba4a399f9a92a0c013a037510552b935b43c2";
 
 /// The helper process the model runs in, while it's running. Running the
@@ -58,8 +67,118 @@ pub struct DetectedObject {
     /// How sure the model is, from 0 to 1.
     pub confidence: f32,
     /// Its bounds (left, top, right, bottom), as fractions of the photo's
-    /// width and height, so they're the same at any size.
-    pub bounds: [f32; 4],
+    /// width and height, so they're the same at any size; if the detector
+    /// knows them.
+    pub bounds: Option<[f32; 4]>,
+}
+
+/// What finds objects in photos.
+#[derive(Clone)]
+pub enum Detector {
+    /// YOLO11, run on this device.
+    BuiltIn,
+    /// A detection plugin, with its settings.
+    Plugin {
+        plugin: Arc<plugins::Detector>,
+        config: Config,
+    },
+}
+
+/// Why a photo couldn't be looked at.
+#[derive(Debug)]
+pub enum DetectFailure {
+    /// Nothing more can be: the settings are wrong, or the model can't run.
+    Stop(anyhow::Error),
+    /// This photo couldn't be, this time, such as when the network's down.
+    Skip(anyhow::Error),
+    /// The detector won't look at this photo.
+    Rejected(String),
+}
+
+impl From<DetectFailure> for anyhow::Error {
+    fn from(failure: DetectFailure) -> Self {
+        match failure {
+            DetectFailure::Stop(error) | DetectFailure::Skip(error) => error,
+            DetectFailure::Rejected(message) => anyhow!(message),
+        }
+    }
+}
+
+impl Detector {
+    /// How catalogs refer to it: what it finds is kept apart from what
+    /// others do.
+    pub fn key(&self) -> String {
+        key_for(match self {
+            Detector::BuiltIn => None,
+            Detector::Plugin { plugin, .. } => Some(&plugin.info.id),
+        })
+    }
+
+    /// Gets it ready to look at photos, which for the built-in model means
+    /// downloading it if need be, adding the bytes to `downloaded` as they
+    /// come. Blocks.
+    pub fn prepare(&self, downloaded: &AtomicU64) -> Result<()> {
+        match self {
+            Detector::BuiltIn => download_model(downloaded),
+            Detector::Plugin { .. } => Ok(()),
+        }
+    }
+
+    /// Whether it can look at photos without `prepare`.
+    pub fn ready(&self) -> bool {
+        match self {
+            Detector::BuiltIn => model_available(),
+            Detector::Plugin { .. } => true,
+        }
+    }
+
+    /// Finds the objects in `image`, most certain first. Blocks for as
+    /// long as that takes: for a plugin, perhaps seconds.
+    pub fn detect(&self, image: &DynamicImage) -> Result<Vec<DetectedObject>, DetectFailure> {
+        let (plugin, config) = match self {
+            Detector::BuiltIn => return detect(image).map_err(DetectFailure::Stop),
+            Detector::Plugin { plugin, config } => (plugin, config),
+        };
+        let rgb = image.to_rgb8();
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 85)
+            .encode_image(&rgb)
+            .map_err(|error| DetectFailure::Skip(error.into()))?;
+        let image = plugins::Image {
+            width: rgb.width(),
+            height: rgb.height(),
+            jpeg,
+        };
+        let found = plugin
+            .session(config.clone())
+            .and_then(|mut session| session.detect(&image))
+            // The plugin crashed.
+            .map_err(DetectFailure::Skip)?;
+        match found {
+            Ok(objects) => Ok(objects
+                .into_iter()
+                .map(|object| DetectedObject {
+                    label: object.label,
+                    confidence: object.confidence.clamp(0., 1.),
+                    bounds: object
+                        .bounds
+                        .map(|b| [b.left, b.top, b.right, b.bottom].map(|edge| edge.clamp(0., 1.))),
+                })
+                .collect()),
+            Err(DetectError::Config(message)) => Err(DetectFailure::Stop(anyhow!(message))),
+            Err(DetectError::Transient(message)) => Err(DetectFailure::Skip(anyhow!(message))),
+            Err(DetectError::Rejected(message)) => Err(DetectFailure::Rejected(message)),
+        }
+    }
+}
+
+/// The key (see `Detector::key`) of the built-in detector, or the
+/// detection plugin `plugin`.
+pub fn key_for(plugin: Option<&str>) -> String {
+    match plugin {
+        None => MODEL.to_owned(),
+        Some(id) => format!("plugin:{id}"),
+    }
 }
 
 fn model_dir() -> Result<PathBuf> {
@@ -78,9 +197,10 @@ pub fn model_available() -> bool {
     !cfg!(test) && model_path().is_ok_and(|path| path.is_file())
 }
 
-/// Downloads the model if it isn't there yet. Blocks until done, which may
-/// be a while: it's over 200 MB.
-pub fn download_model() -> Result<()> {
+/// Downloads the model if it isn't there yet, adding the bytes to
+/// `downloaded` as they come. Blocks until done, which may be a while: it's
+/// over 200 MB (`MODEL_SIZE`).
+pub fn download_model(downloaded: &AtomicU64) -> Result<()> {
     let _downloading = DOWNLOADING.lock().unwrap_or_else(|e| e.into_inner());
     let path = model_path()?;
     if path.is_file() {
@@ -104,6 +224,7 @@ pub fn download_model() -> Result<()> {
                 break;
             }
             size += read as u64;
+            downloaded.fetch_add(read as u64, Ordering::Relaxed);
             if size > MODEL_SIZE {
                 bail!("the model is bigger than expected");
             }
@@ -125,11 +246,11 @@ pub fn download_model() -> Result<()> {
     Ok(())
 }
 
-/// Finds the objects in `image`, most certain first. Starts the helper
-/// process if it isn't running; the model must have been downloaded.
-/// Blocks for as long as running the model takes (tens of milliseconds on
-/// Apple silicon, once the helper's started).
-pub fn detect(image: &DynamicImage) -> Result<Vec<DetectedObject>> {
+/// Finds the objects in `image` with the built-in model, most certain
+/// first. Starts the helper process if it isn't running; the model must
+/// have been downloaded. Blocks for as long as running the model takes
+/// (tens of milliseconds on Apple silicon, once the helper's started).
+fn detect(image: &DynamicImage) -> Result<Vec<DetectedObject>> {
     let mut helper = HELPER.lock().unwrap_or_else(|e| e.into_inner());
     if helper.is_none() {
         if !model_path()?.is_file() {
@@ -287,12 +408,12 @@ fn detect_here(
             DetectedObject {
                 label: object.label.to_string(),
                 confidence: object.confidence,
-                bounds: [
+                bounds: Some([
                     fraction(bounds.x1, width),
                     fraction(bounds.y1, height),
                     fraction(bounds.x2, width),
                     fraction(bounds.y2, height),
-                ],
+                ]),
             }
         })
         .collect())
@@ -338,7 +459,7 @@ mod tests {
     #[test]
     #[ignore = "downloads the model"]
     fn downloads_and_runs_the_model() {
-        download_model().unwrap();
+        download_model(&AtomicU64::new(0)).unwrap();
         let blank = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
             560,
             373,

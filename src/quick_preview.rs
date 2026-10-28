@@ -65,7 +65,7 @@ impl QuickPreview {
             return;
         };
         if let Some(image) = self.image.take() {
-            cx.drop_image(image, None);
+            decode::release(image, cx);
         }
         self.selected = ix;
         self.failed = false;
@@ -140,6 +140,11 @@ impl QuickPreview {
     }
 
     #[cfg(test)]
+    pub fn image(&self) -> Option<Arc<RenderImage>> {
+        self.image.clone()
+    }
+
+    #[cfg(test)]
     pub fn selected_frame(&self) -> usize {
         self.selected
     }
@@ -152,7 +157,7 @@ impl QuickPreview {
             .into_iter()
             .chain(self.filmstrip.iter_mut().filter_map(Option::take))
         {
-            cx.drop_image(image, None);
+            decode::release(image, cx);
         }
     }
 

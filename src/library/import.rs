@@ -127,6 +127,9 @@ pub struct ImportSession {
     staged: usize,
     /// The first failure to make folders read-only again.
     relock_error: Option<std::io::Error>,
+    /// Whether photos were added to an album, so the copy of the albums
+    /// is written when it's finished.
+    added_to_album: bool,
 }
 
 impl ImportSession {
@@ -147,6 +150,7 @@ impl ImportSession {
             staging,
             staged: 0,
             relock_error: None,
+            added_to_album: false,
         })
     }
 
@@ -161,6 +165,7 @@ impl ImportSession {
                 .catalog
                 .add_to_album(album, &hash, size)
                 .context("adding it to the album")?;
+            self.added_to_album = true;
         }
         result
     }
@@ -215,6 +220,9 @@ impl ImportSession {
     /// Removes this session's staging folder, and reports if any folder
     /// couldn't be made read-only again.
     pub fn finish(mut self) -> Result<()> {
+        if self.added_to_album {
+            self.library.save_albums();
+        }
         std::fs::remove_dir_all(&self.staging).ok();
         {
             let _placing = self.library.placing();

@@ -4,17 +4,20 @@
 //! Each file is stored under the target's prefix by the path the app gives
 //! it (the library's folder, then the file's path in the library), e.g.
 //! `photos/1K Words-3f2a9c1e/Originals/2026/10/15/IMG_0001.JPG`.
+//!
+//! Big files, such as long videos, are uploaded in parts with S3's multipart
+//! uploads, which the app sends at once.
 
 mod sigv4;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use exports::onekwords::sync::plugin::{
-    Capabilities, Config, ConfigField, FieldKind, Guest, Listing, LocalItem, PluginInfo,
-    RemoteItem, SyncError,
+use exports::onekwords::plugins::sync::{
+    Capabilities, Guest, Listing, LocalItem, Multipart, PluginInfo, RemoteItem, SyncError,
 };
-use onekwords::sync::files::{Sink, Source};
-use onekwords::sync::http::{self, Request, Response};
+use onekwords::plugins::files::{Sink, Source};
+use onekwords::plugins::http::{self, Request, Response};
+use onekwords::plugins::settings::{Config, ConfigField, FieldKind};
 
 wit_bindgen::generate!({
     path: "../../wit",
@@ -23,6 +26,11 @@ wit_bindgen::generate!({
 
 /// How much of a file is read at a time, to hash it.
 const READ_SIZE: u32 = 1 << 20;
+/// Files this big are uploaded in parts of `PART_SIZE`. S3 takes parts of
+/// at least 5 MiB (but the last), and up to 10,000 of them.
+const MULTIPART_THRESHOLD: u64 = 32 << 20;
+const PART_SIZE: u64 = 16 << 20;
+const MAX_PARTS: u32 = 10_000;
 
 struct S3;
 
@@ -42,7 +50,7 @@ impl Guest for S3 {
             id: "s3".into(),
             name: "S3-Compatible Storage".into(),
             version: env!("CARGO_PKG_VERSION").into(),
-            capabilities: Capabilities::UPLOAD,
+            capabilities: Capabilities::UPLOAD | Capabilities::MULTIPART,
             config: vec![
                 field(
                     "endpoint",
@@ -95,12 +103,17 @@ impl Guest for S3 {
                 ),
             ],
             hosts: Vec::new(),
+            multipart: Some(Multipart {
+                threshold: MULTIPART_THRESHOLD,
+                part_size: PART_SIZE,
+                max_parts: MAX_PARTS,
+            }),
         }
     }
 
     fn validate(config: Config) -> Result<(), SyncError> {
         let target = Target::new(&config)?;
-        let response = target.send("HEAD", "", &[], &sigv4::sha256_hex(b""), |request| {
+        let response = target.send("HEAD", "", &[], &[], &sigv4::sha256_hex(b""), |request| {
             http::send(&request, &[])
         })?;
         match response.status {
@@ -125,7 +138,7 @@ impl Guest for S3 {
         let key = format!("{}{}", target.prefix, item.path);
         let hash = sha256_of(data)?;
         let headers = [("content-type".to_owned(), item.media_type.clone())];
-        let response = target.send("PUT", &key, &headers, &hash, |request| {
+        let response = target.send("PUT", &key, &[], &headers, &hash, |request| {
             http::send_file(&request, data)
         })?;
         if !(200..300).contains(&response.status) {
@@ -138,6 +151,106 @@ impl Guest for S3 {
             version: etag,
             size: Some(item.size),
         })
+    }
+
+    fn begin_upload(config: Config, item: LocalItem) -> Result<String, SyncError> {
+        let target = Target::new(&config)?;
+        let key = format!("{}{}", target.prefix, item.path);
+        let headers = [("content-type".to_owned(), item.media_type.clone())];
+        let response = target.send(
+            "POST",
+            &key,
+            &[("uploads", "")],
+            &headers,
+            &sigv4::sha256_hex(b""),
+            |request| http::send(&request, &[]),
+        )?;
+        if !(200..300).contains(&response.status) {
+            return Err(error_from(&response));
+        }
+        xml_tag(&response.body, "UploadId")
+            .ok_or_else(|| SyncError::Transient("The service didn't start the upload.".into()))
+    }
+
+    fn upload_part(
+        config: Config,
+        item: LocalItem,
+        upload: String,
+        part: u32,
+        data: &Source,
+    ) -> Result<String, SyncError> {
+        let target = Target::new(&config)?;
+        let key = format!("{}{}", target.prefix, item.path);
+        let hash = sha256_of(data)?;
+        let part = part.to_string();
+        let query = [("partNumber", part.as_str()), ("uploadId", upload.as_str())];
+        let response = target.send("PUT", &key, &query, &[], &hash, |request| {
+            http::send_file(&request, data)
+        })?;
+        if !(200..300).contains(&response.status) {
+            return Err(error_from(&response));
+        }
+        header(&response, "etag")
+            .map(str::to_owned)
+            .ok_or_else(|| SyncError::Transient("The service didn't say it had the part.".into()))
+    }
+
+    fn finish_upload(
+        config: Config,
+        item: LocalItem,
+        upload: String,
+        parts: Vec<String>,
+    ) -> Result<RemoteItem, SyncError> {
+        let target = Target::new(&config)?;
+        let key = format!("{}{}", target.prefix, item.path);
+        let mut body = String::from("<CompleteMultipartUpload>");
+        for (ix, etag) in parts.iter().enumerate() {
+            body.push_str(&format!(
+                "<Part><PartNumber>{}</PartNumber><ETag>{}</ETag></Part>",
+                ix + 1,
+                xml_escape(etag)
+            ));
+        }
+        body.push_str("</CompleteMultipartUpload>");
+        let headers = [("content-type".to_owned(), "application/xml".to_owned())];
+        let response = target.send(
+            "POST",
+            &key,
+            &[("uploadId", upload.as_str())],
+            &headers,
+            &sigv4::sha256_hex(body.as_bytes()),
+            |request| http::send(&request, body.as_bytes()),
+        )?;
+        // It can fail after a 200, with an error in the body.
+        let failed = String::from_utf8_lossy(&response.body).contains("<Error>");
+        if !(200..300).contains(&response.status) || failed {
+            return Err(error_from(&response));
+        }
+        let etag = xml_tag(&response.body, "ETag")
+            .map(|etag| etag.replace("&quot;", "\"").trim_matches('"').to_owned());
+        Ok(RemoteItem {
+            key,
+            path: Some(item.path),
+            version: etag,
+            size: Some(item.size),
+        })
+    }
+
+    fn abort_upload(config: Config, item: LocalItem, upload: String) -> Result<(), SyncError> {
+        let target = Target::new(&config)?;
+        let key = format!("{}{}", target.prefix, item.path);
+        let response = target.send(
+            "DELETE",
+            &key,
+            &[("uploadId", upload.as_str())],
+            &[],
+            &sigv4::sha256_hex(b""),
+            |request| http::send(&request, &[]),
+        )?;
+        match response.status {
+            200..=299 | 404 => Ok(()),
+            _ => Err(error_from(&response)),
+        }
     }
 
     fn download(_: Config, _: RemoteItem, _: &Sink) -> Result<(), SyncError> {
@@ -213,11 +326,13 @@ impl<'a> Target<'a> {
     }
 
     /// Signs and sends a request for the object `key` (or the bucket, if
-    /// empty), with the body whose hash is `payload_hash`.
+    /// empty), with `query` (unencoded), and the body whose hash is
+    /// `payload_hash`.
     fn send(
         &self,
         method: &str,
         key: &str,
+        query: &[(&str, &str)],
         headers: &[(String, String)],
         payload_hash: &str,
         send: impl FnOnce(Request) -> Result<Response, http::Error>,
@@ -256,7 +371,7 @@ impl<'a> Target<'a> {
             &sigv4::Request {
                 method,
                 path: &path,
-                query: &[],
+                query,
                 headers: &headers,
                 payload_hash,
             },
@@ -269,9 +384,21 @@ impl<'a> Target<'a> {
             &amz_date,
         );
         headers.push(("authorization".to_owned(), authorization));
+        let query: String = query
+            .iter()
+            .enumerate()
+            .map(|(ix, (name, value))| {
+                let separator = if ix == 0 { '?' } else { '&' };
+                format!(
+                    "{separator}{}={}",
+                    sigv4::encode(name, true),
+                    sigv4::encode(value, true)
+                )
+            })
+            .collect();
         send(Request {
             method: method.to_owned(),
-            url: format!("{}://{host}{path}", self.scheme),
+            url: format!("{}://{host}{path}{query}", self.scheme),
             headers,
         })
         .map_err(SyncError::Transient)
@@ -296,6 +423,21 @@ fn sha256_of(data: &Source) -> Result<String, SyncError> {
     Ok(sigv4::hex(&hasher.finalize()))
 }
 
+/// The text of the first `<name>` element in an XML response.
+fn xml_tag(body: &[u8], name: &str) -> Option<String> {
+    let body = String::from_utf8_lossy(body);
+    let start = body.find(&format!("<{name}>"))? + name.len() + 2;
+    let end = start + body[start..].find(&format!("</{name}>"))?;
+    Some(body[start..end].to_owned())
+}
+
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 fn header<'a>(response: &'a Response, name: &str) -> Option<&'a str> {
     response
         .headers
@@ -306,12 +448,7 @@ fn header<'a>(response: &'a Response, name: &str) -> Option<&'a str> {
 
 /// Classifies a failed response by its status and S3 error code.
 fn error_from(response: &Response) -> SyncError {
-    let body = String::from_utf8_lossy(&response.body);
-    let tag = |name: &str| {
-        let start = body.find(&format!("<{name}>"))? + name.len() + 2;
-        let end = start + body[start..].find(&format!("</{name}>"))?;
-        Some(body[start..end].to_owned())
-    };
+    let tag = |name: &str| xml_tag(&response.body, name);
     let code = tag("Code");
     let message = match (&code, tag("Message")) {
         (Some(code), Some(message)) => format!("{code}: {message}"),

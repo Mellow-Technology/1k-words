@@ -29,7 +29,7 @@ serde_json = "1"
 rawler = "0.8"
 # Each library's catalog. Embedded and synchronous, so no async runtime.
 turso = { version = "0.8.3", default-features = false }
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v7"] }
 # Sync plugins: WebAssembly components (`wit/sync.wit`, `plugins/*`).
 wasmtime = "49"
 wasmtime-wasi = "49"
@@ -43,6 +43,7 @@ yolo-rs = "0.2.2"
 ort = "=2.0.0-rc.12"
 # Checking the downloaded detection model.
 sha2 = "0.10"
+cpal = "0.18.2"
 
 [dev-dependencies]
 # Headless UI tests: simulated key presses and clicks in a real window.

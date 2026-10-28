@@ -72,9 +72,14 @@ its targets on the Libraries page (`src/sync_settings.rs`).
   are tied to the binary's code signature).
 - **Download and listing.** The plugin interface has them; the app doesn't
   use them yet (restoring a library, adopting files already on a service).
-- **Parallel and multipart uploads** for big libraries and long videos.
+- **Resume big uploads.** Files are uploaded several at once, and big ones
+  in parts (`library::sync`), but a file whose upload in parts is stopped
+  is given up on and starts again next time. S3 keeps the parts of an open
+  upload, so they could be recorded and resumed.
 - **Plugins from users.** `.wasm` files in the app's `plugins` folder are
   loaded, but there's no way to install them or review what they can reach.
+  Plugins built against the first interface (`onekwords:sync@0.1.0`) no
+  longer load; the interface is `onekwords:plugins@0.2.0` now.
 - **Thumbnails first, originals on demand.** Thumbnails (and other
   derivatives, `src/library/derivatives.rs`) are kept in the library,
   catalogued apart from the originals, and uploaded ahead of them. Still to
@@ -89,8 +94,11 @@ its targets on the Libraries page (`src/sync_settings.rs`).
 
 ## Object detection
 
-Objects are found with YOLO11 (`src/detect.rs`), from each photo's
-thumbnail, and recorded in the catalog (`src/library/objects.rs`). The
+Objects are found from each photo's thumbnail by the detector chosen in
+Settings (`src/detection_settings.rs`): YOLO11 on this device
+(`src/detect.rs`), or a detection plugin, such as the built-in one for
+OpenAI-compatible vision models (`plugins/openai-vision`). Each detector's
+findings are recorded apart in the catalog (`src/library/objects.rs`). The
 viewer's info sidebar lists them and toggles shimmering boxes around them
 (`src/object_boxes.rs`); the gallery's search field finds them, suggesting
 the kinds found so far as it's typed.
@@ -101,46 +109,45 @@ the kinds found so far as it's typed.
 - **Refresh search results** as the first scan finds more; a search shows
   what had been found when it ran.
 - **Progress** for the first scan of a big library.
+- **Several photos at once for remote detectors.** Photos are looked at one
+  at a time, which suits the built-in model, but a vision model on a
+  service takes seconds each. Like uploads, several could go at once.
+- **Say what a remote detector will cost.** Choosing one has it look at
+  every photo, once each; with a paid API, say how many before starting.
+- **Pick the photo size for a detector.** Plugins get the 560-pixel-wide
+  thumbnail; some models would do better with more, or as well with less.
 - **A smaller model.** The helper process takes ~440 MB while it runs,
   most of it YOLO11x's weights; YOLO11s or m would likely find much the
   same kinds of object in a fraction of that. Bumping `MODEL` rescans.
 
 ## Memory
 
-- **The viewer's full image.** A 24 MP photo peaks above 300 MB:
-  `decode::viewer_preview` clones the decoded image only to shrink it
-  (`thumbnail_exact` takes `&self`), and the full texture is capped at
-  `MAX_TEXTURE_SIZE` rather than what the display can show at the
-  furthest zoom. Tiling would bound it altogether.
-- **Concurrent raw decodes.** Developing a raw file takes a few hundred
-  MB, and the gallery runs up to six full decodes at once; raw files
-  should count for more than JPEGs against that limit.
+- **Tiled full-resolution images.** The viewer loads a photo scaled to
+  the window, and its full resolution only once it's zoomed in past that
+  (`PhotoViewer::load_full_if_needed`), when a 24 MP photo takes ~100 MB
+  in memory and as much in the GPU atlas. Loading just the tiles in view
+  would bound it at any size.
 
 ## Albums
 
 Albums are kept in each library's catalog (`src/library/albums.rs`), shown
-nested in the sidebar, and filled by importing into them
-(`src/album_dialogs.rs`), from the gallery's right-click menu, by dragging
-the selection onto one, or from the viewer's albums menu, which also shows
-the albums a photo is in.
+nested in the sidebar (`navigation::AlbumTree`), and filled by importing
+into them (`src/album_dialogs.rs`), from the gallery's right-click menu, by
+dragging the selection onto one, or from the viewer's albums menu, which
+also shows the albums a photo is in. They're moved by dragging them onto
+one another, and can show the photos of the albums in them. A copy is kept
+in the library's `Catalog` folder and restored into a catalog with none.
 
-- **Drop onto a whole sidebar row.** GPUI Kit's sidebar items take no
-  drops, so an album's drop target is its row's suffix, stretched over the
-  label (`navigation::album_item`); the icon and caret aren't covered. A
-  drop hook upstream would be cleaner.
-- **Box selection from a selected photo.** Dragging the selection moves it
-  (onto an album), so a box can only start elsewhere.
-- **Move albums** into other albums, by dragging them in the sidebar.
-- **Keep albums safe.** Unlike the rest of the catalog, they can't be found
-  again from the originals; syncing the catalog (see Sync) would cover them.
-- **Show the photos of the albums inside** an album, optionally.
+- **Rebuild a lost catalog from the originals.** Albums are restored from
+  their copy, but only photos in the catalog can go back in them; a catalog
+  that's lost altogether comes back empty, so its albums do too (the copy
+  is kept as `Catalog/albums-<time>.json`). Cataloguing the originals
+  already in a library's folder would fix both.
+- **Sync the albums' copy** with the photos (see Sync); it's rewritten as
+  albums change, so it needs uploading again each time.
+- **Drop onto the top level.** An album goes back to the top level from
+  its menu; there's nowhere to drop it.
 
 ## Automated Updates
 
 - Integrate [GPUI Updater](https://github.com/AprilNEA/gpui-updater) for automatic updates
-
-## Turso Integration
-
--
--
--

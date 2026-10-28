@@ -11,14 +11,18 @@
 //!
 //! The gallery and viewer show the preview first and replace it with an
 //! image generated from the full decode.
+//!
+//! Full decodes take a lot of memory while they run (a few hundred MB for
+//! a 24 megapixel raw file), so those running at once are held to
+//! `DECODE_BUDGET` between them.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 
 use anyhow::Result;
-use gpui_kit::RenderImage;
+use gpui_kit::{App, RenderImage};
 use image::metadata::Orientation;
-use image::{DynamicImage, Frame, ImageDecoder, ImageReader};
+use image::{DynamicImage, Frame, ImageDecoder, ImageReader, RgbaImage};
 
 use crate::heif::{self, is_heif};
 use crate::photos::{Photo, read_exif};
@@ -29,14 +33,21 @@ use crate::raw::{self, is_raw};
 pub const THUMBNAIL_WIDTH: u32 = 560;
 /// Filmstrip thumbnails in the viewer are decoded at this height.
 pub const FILMSTRIP_THUMBNAIL_HEIGHT: u32 = 180;
-/// The viewer first shows the photo scaled to fit this size, then swaps in
-/// the full resolution image.
+/// The quick preview shows photos scaled to fit this size.
 pub const VIEWER_PREVIEW_SIZE: u32 = 2048;
 /// Embedded previews smaller than this (on their long side) aren't worth
 /// showing in the viewer; the gallery thumbnail is about as good.
 const MIN_VIEWER_PREVIEW_SIZE: u32 = 1000;
 /// The largest texture GPUI's atlas can hold.
 const MAX_TEXTURE_SIZE: u32 = 16384;
+
+/// The most memory, roughly, that full decodes running at once may take
+/// between them: about three 24 megapixel raw files, or a dozen JPEGs.
+/// Decodes wait for room, but one always runs, however big.
+const DECODE_BUDGET: u64 = 1536 << 20;
+/// Bytes of decodes running (estimated by `decode_cost`).
+static DECODING: Mutex<u64> = Mutex::new(0);
+static DECODE_DONE: Condvar = Condvar::new();
 
 /// The photo's embedded preview, oriented, if it has one. Raw+JPEG pairs use
 /// the raw file's preview, which is much larger than a JPEG's EXIF
@@ -58,6 +69,7 @@ pub fn embedded_preview(photo: &Photo) -> Option<DynamicImage> {
 /// Decodes the photo's displayed file at full resolution, oriented. Raw
 /// files are developed with rawler.
 pub fn decode_full(photo: &Photo) -> Result<DynamicImage> {
+    let _room = DecodeRoom::wait(decode_cost(photo));
     let path = photo.path.as_path();
     if is_raw(path) {
         let mut image = raw::develop(path)?;
@@ -82,13 +94,9 @@ pub fn preview_thumbnail(photo: &Photo) -> Option<Arc<RenderImage>> {
     Some(to_render_image(fit(preview, THUMBNAIL_WIDTH, u32::MAX)))
 }
 
-/// A gallery thumbnail generated from the full image.
+/// A gallery thumbnail as a library would keep it (see `thumbnail_image`).
 pub fn full_thumbnail(photo: &Photo) -> Result<Arc<RenderImage>> {
-    Ok(to_render_image(fit(
-        decode_full(photo)?,
-        THUMBNAIL_WIDTH,
-        u32::MAX,
-    )))
+    Ok(to_render_image(thumbnail_image(photo)?))
 }
 
 /// The thumbnail a library keeps for a photo (see `library::derivatives`):
@@ -150,15 +158,22 @@ pub fn quick_preview(photo: &Photo) -> Result<Arc<RenderImage>> {
     )))
 }
 
-/// The full image scaled down to viewer preview size.
-pub fn viewer_preview(image: &DynamicImage) -> Arc<RenderImage> {
-    to_render_image(fit(image.clone(), VIEWER_PREVIEW_SIZE, VIEWER_PREVIEW_SIZE))
-}
-
-/// The full image at full resolution (unless it exceeds the maximum
-/// texture size).
-pub fn viewer_full(image: DynamicImage) -> Arc<RenderImage> {
-    to_render_image(fit(image, MAX_TEXTURE_SIZE, MAX_TEXTURE_SIZE))
+/// The full image scaled down (never up) to fit `max_width` x
+/// `max_height`, or at full resolution, if that's no bigger (and doesn't
+/// exceed the maximum texture size). Returns whether it's at full
+/// resolution.
+pub fn viewer_image(
+    image: DynamicImage,
+    max_width: u32,
+    max_height: u32,
+) -> (Arc<RenderImage>, bool) {
+    let full = image.width() <= max_width && image.height() <= max_height;
+    let image = fit(
+        image,
+        max_width.min(MAX_TEXTURE_SIZE),
+        max_height.min(MAX_TEXTURE_SIZE),
+    );
+    (to_render_image(image), full)
 }
 
 /// Scales `image` down (never up) to fit within `max_width` x `max_height`.
@@ -173,13 +188,83 @@ fn fit(image: DynamicImage, max_width: u32, max_height: u32) -> DynamicImage {
     image.thumbnail_exact(new_width, new_height)
 }
 
-/// Converts to the BGRA layout GPUI expects.
+/// Removes `image` from every window's GPU atlas once it's no longer
+/// shown. `App::drop_image` skips the window being updated, as in a key
+/// handler, unless it's given; deferred, every window's there.
+pub fn release(image: Arc<RenderImage>, cx: &mut App) {
+    cx.defer(move |cx| cx.drop_image(image, None));
+}
+
+/// Converts to the BGRA layout GPUI expects. Images without alpha are
+/// widened in place, rather than copied, which would briefly take both.
 pub fn to_render_image(image: DynamicImage) -> Arc<RenderImage> {
-    let mut buffer = image.into_rgba8();
-    for pixel in buffer.as_chunks_mut::<4>().0 {
-        pixel.swap(0, 2);
+    Arc::new(RenderImage::new([Frame::new(to_bgra(image))]))
+}
+
+/// The image's pixels in the BGRA layout GPUI expects (see
+/// `to_render_image`).
+pub fn to_bgra(image: DynamicImage) -> RgbaImage {
+    if image.color().has_alpha() {
+        let mut buffer = image.into_rgba8();
+        for pixel in buffer.as_chunks_mut::<4>().0 {
+            pixel.swap(0, 2);
+        }
+        buffer
+    } else {
+        rgb_to_bgra(image.into_rgb8())
     }
-    Arc::new(RenderImage::new([Frame::new(buffer)]))
+}
+
+fn rgb_to_bgra(image: image::RgbImage) -> image::RgbaImage {
+    let (width, height) = image.dimensions();
+    let pixels = width as usize * height as usize;
+    let mut data = image.into_raw();
+    data.resize(pixels * 4, 0);
+    // From the end, so each pixel's read before it's written over: pixel
+    // `ix` is written at `4 * ix`, at or after where it, and every pixel
+    // before it, was read from.
+    for ix in (0..pixels).rev() {
+        let [r, g, b] = [data[3 * ix], data[3 * ix + 1], data[3 * ix + 2]];
+        data[4 * ix..4 * ix + 4].copy_from_slice(&[b, g, r, u8::MAX]);
+    }
+    image::RgbaImage::from_raw(width, height, data).expect("sized above")
+}
+
+/// Roughly how much memory decoding the photo takes at its peak, from its
+/// size: developing a raw file holds the sensor data, a floating-point
+/// copy and the 16-bit result at once.
+fn decode_cost(photo: &Photo) -> u64 {
+    let pixels = match u64::from(photo.width) * u64::from(photo.height) {
+        // Not known: guess at a typical camera's.
+        0 => 24_000_000,
+        pixels => pixels,
+    };
+    let bytes_per_pixel = if is_raw(&photo.path) { 20 } else { 5 };
+    pixels * bytes_per_pixel
+}
+
+/// Room for a decode in `DECODE_BUDGET`, while it runs.
+struct DecodeRoom(u64);
+
+impl DecodeRoom {
+    /// Waits until there's room for `cost`, or nothing else is decoding.
+    fn wait(cost: u64) -> Self {
+        let mut decoding = DECODING.lock().unwrap_or_else(|e| e.into_inner());
+        while *decoding > 0 && *decoding + cost > DECODE_BUDGET {
+            decoding = DECODE_DONE
+                .wait(decoding)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        *decoding += cost;
+        Self(cost)
+    }
+}
+
+impl Drop for DecodeRoom {
+    fn drop(&mut self) {
+        *DECODING.lock().unwrap_or_else(|e| e.into_inner()) -= self.0;
+        DECODE_DONE.notify_all();
+    }
 }
 
 /// The EXIF orientation of `path`. Raw files whose EXIF the EXIF reader
@@ -213,4 +298,40 @@ fn exif_thumbnail(path: &Path) -> Option<DynamicImage> {
     let length = field(exif::Tag::JPEGInterchangeFormatLength)?;
     let data = exif.buf().get(offset..offset.checked_add(length)?)?;
     image::load_from_memory_with_format(data, image::ImageFormat::Jpeg).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn widens_rgb_to_bgra() {
+        let rgb = image::RgbImage::from_fn(3, 2, |x, y| {
+            image::Rgb([x as u8 * 10 + y as u8, 100 + x as u8, 200 + y as u8])
+        });
+        let bgra = rgb_to_bgra(rgb.clone());
+        for (x, y, &image::Rgb([r, g, b])) in rgb.enumerate_pixels() {
+            assert_eq!(bgra.get_pixel(x, y).0, [b, g, r, u8::MAX]);
+        }
+    }
+
+    #[test]
+    fn decodes_wait_for_room() {
+        let first = DecodeRoom::wait(DECODE_BUDGET);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let waiting = std::thread::spawn(move || {
+            let _second = DecodeRoom::wait(1);
+            sender.send(()).unwrap();
+        });
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
+        drop(first);
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        waiting.join().unwrap();
+    }
 }

@@ -1,0 +1,21 @@
+[package]
+name = "openai-vision-detect"
+version = "0.1.0"
+edition = "2024"
+description = "1k Words detection plugin for OpenAI-compatible vision models"
+publish = false
+
+# Built to a WebAssembly component by the app's build script, with
+# `--target wasm32-wasip2`.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+serde_json = "1"
+wit-bindgen = "0.57"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1

@@ -1,11 +1,12 @@
-//! Builds the built-in sync plugins (`plugins/*`) into WebAssembly
-//! components, which `src/plugins` embeds.
+//! Builds the built-in plugins (`plugins/*`) into WebAssembly components,
+//! which `src/plugins` embeds.
 
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
-const PLUGINS: &[&str] = &["s3"];
+/// Each plugin's folder in `plugins`, and its crate's name.
+const PLUGINS: &[(&str, &str)] = &[("s3", "s3-sync"), ("openai-vision", "openai-vision-detect")];
 const TARGET: &str = "wasm32-wasip2";
 
 fn main() {
@@ -13,7 +14,7 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap()).join("plugins");
     println!("cargo:rerun-if-changed=wit");
 
-    for plugin in PLUGINS {
+    for (plugin, crate_name) in PLUGINS {
         let dir = root.join("plugins").join(plugin);
         println!("cargo:rerun-if-changed=plugins/{plugin}/src");
         println!("cargo:rerun-if-changed=plugins/{plugin}/Cargo.toml");
@@ -47,7 +48,7 @@ fn main() {
             );
         }
 
-        let name = plugin_crate(plugin).replace('-', "_");
+        let name = crate_name.replace('-', "_");
         let wasm = out_dir
             .join("target")
             .join(TARGET)
@@ -56,9 +57,4 @@ fn main() {
         std::fs::copy(&wasm, out_dir.join(format!("{plugin}.wasm")))
             .unwrap_or_else(|e| panic!("copying {}: {e}", wasm.display()));
     }
-}
-
-/// The crate name of the plugin in `plugins/<plugin>`.
-fn plugin_crate(plugin: &str) -> String {
-    format!("{plugin}-sync")
 }

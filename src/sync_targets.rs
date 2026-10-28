@@ -93,6 +93,8 @@ pub fn init_at(config_dir: Option<PathBuf>, cx: &mut App) {
                 }
                 Err(error) => targets.plugins_error = Some(format!("{error:#}")),
             }
+            // The chosen detection plugin may be ready to use now.
+            crate::detection_settings::plugins_loaded(cx);
             cx.refresh_windows();
         });
     })
@@ -139,22 +141,7 @@ pub fn validate(plugins: &Plugins, plugin: &str, config: Config) -> Result<Confi
     let plugin = plugins
         .get(plugin)
         .ok_or_else(|| anyhow!("there's no sync plugin \"{plugin}\""))?;
-    let mut settings: BTreeMap<String, String> = config
-        .into_iter()
-        .map(|(key, value)| (key, value.trim().to_owned()))
-        .filter(|(_, value)| !value.is_empty())
-        .collect();
-    for field in &plugin.info.config {
-        match (settings.contains_key(&field.key), &field.default) {
-            (true, _) => {}
-            (false, Some(default)) => {
-                settings.insert(field.key.clone(), default.clone());
-            }
-            (false, None) if field.required => bail!("{} is required.", field.label),
-            (false, None) => {}
-        }
-    }
-    let config: Config = settings.into_iter().collect();
+    let config = crate::plugins::complete_config(&plugin.info.config, config)?;
     if let Err(error) = plugin.session(config.clone())?.validate()? {
         bail!("{}", error.message());
     }

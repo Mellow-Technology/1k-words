@@ -10,7 +10,7 @@
 //! the pages can show them.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -18,22 +18,22 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName as LucideIcon;
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::setting::{SettingField, SettingGroup, SettingItem, SettingPage};
 use gpui_kit::component::{ActiveTheme, Disableable as _, Icon, Sizable, WindowExt as _};
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext as _, Div, Entity, Focusable as _, Global, IntoElement, ParentElement,
-    PromptLevel, SharedString, Styled, Window, div, px,
+    App, AppContext as _, Entity, Focusable as _, Global, ParentElement, PromptLevel, SharedString,
+    Styled, Window, div, px,
 };
 
+use crate::config_form::{ConfigForm, form_row};
 use crate::gallery::{show_error, show_warning};
 use crate::library::{
     self, LibraryInfo, LibraryTarget, SyncStatus, TargetSettings, UploadProgress, UploadSummary,
 };
-use crate::plugins::{Config, ConfigField, FieldKind, Plugin, Plugins};
+use crate::plugins::{Config, FieldKind, Plugin, Plugins};
+use crate::settings;
 use crate::sync_targets::{self, NewTarget, TargetInfo};
 
 /// How often the pages redraw while uploading, to show progress.
@@ -51,7 +51,8 @@ struct Upload {
     /// The size of the files done, and of all of them.
     bytes_done: AtomicU64,
     bytes_total: AtomicU64,
-    /// The file under way: its size, and `sent` when it started.
+    /// The size of the files and parts under way, and `sent` when that
+    /// was last reported.
     file_size: AtomicU64,
     file_start: AtomicU64,
     /// Bytes sent over the network.
@@ -83,7 +84,7 @@ impl Upload {
             .store(progress.bytes_done, Ordering::Relaxed);
         self.bytes_total
             .store(progress.bytes_total, Ordering::Relaxed);
-        self.file_size.store(progress.size, Ordering::Relaxed);
+        self.file_size.store(progress.under_way, Ordering::Relaxed);
         self.file_start
             .store(self.sent.load(Ordering::Relaxed), Ordering::Relaxed);
     }
@@ -104,13 +105,16 @@ impl Upload {
 
 /// A library's sync to a target: by the library's id and its id for the
 /// target.
-type LinkKey = (String, i64);
+type LinkKey = (String, library::Id);
 
 #[derive(Default)]
 struct SyncActivity {
     /// What each library syncs to, and how far along each is.
     links: HashMap<String, Vec<(LibraryTarget, SyncStatus)>>,
     uploads: HashMap<LinkKey, Arc<Upload>>,
+    /// Uploads asked for again while under way, to go again once they're
+    /// done.
+    again: HashSet<LinkKey>,
     /// How each target's last upload went.
     results: HashMap<LinkKey, String>,
     /// Bytes sent by uploads that have finished, so the total sent only
@@ -263,6 +267,26 @@ pub fn page(cx: &App) -> SettingPage {
         .description(
             "Places your libraries can sync to. Choose which libraries sync where on the \
              Libraries page.",
+        )
+        .group(
+            SettingGroup::new().item(
+                SettingItem::new(
+                    "Sync Automatically",
+                    SettingField::switch(
+                        |cx| !settings::get(cx).pause_automatic_sync,
+                        |on, cx| {
+                            settings::set_sync_automatically(on, cx);
+                            if on {
+                                sync_all_in_background(cx);
+                            }
+                        },
+                    ),
+                )
+                .description(
+                    "Upload new photos after they're imported, and check for anything not yet \
+                     uploaded every few minutes. Otherwise, libraries only sync with Sync Now.",
+                ),
+            ),
         )
         .groups(sync_targets::list(cx).iter().map(target_group))
         .group(add_group(cx))
@@ -477,12 +501,6 @@ fn delete_target(id: &str, window: &mut Window, cx: &mut App) {
         .detach();
 }
 
-/// A setting's input in the target dialog.
-enum FieldInput {
-    Text(Entity<InputState>),
-    Flag(Rc<Cell<bool>>),
-}
-
 /// The target dialog's state.
 struct TargetForm {
     plugins: Arc<Plugins>,
@@ -490,26 +508,13 @@ struct TargetForm {
     /// The target being edited, if it's not a new one.
     id: Option<String>,
     name: Entity<InputState>,
-    fields: Vec<(ConfigField, FieldInput)>,
+    fields: ConfigForm,
     /// While the plugin checks the settings.
     saving: bool,
     error: Option<String>,
 }
 
 impl TargetForm {
-    fn config(&self, cx: &App) -> Config {
-        self.fields
-            .iter()
-            .map(|(field, input)| {
-                let value = match input {
-                    FieldInput::Text(state) => state.read(cx).value().to_string(),
-                    FieldInput::Flag(checked) => checked.get().to_string(),
-                };
-                (field.key.clone(), value)
-            })
-            .collect()
-    }
-
     /// What the target's shown with besides its name: the plugin's name, and
     /// the URLs it's set to use.
     fn summary(&self, config: &Config) -> String {
@@ -538,34 +543,11 @@ fn open_target_dialog(
     window: &mut Window,
     cx: &mut App,
 ) -> Rc<RefCell<TargetForm>> {
-    let value_of = |key: &str| {
-        config
-            .iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, value)| value.clone())
-    };
     let name = existing
         .as_ref()
         .map_or_else(|| plugin.info.name.clone(), |t| t.name.clone());
     let name = cx.new(|cx| InputState::new(window, cx).default_value(name));
-    let fields = plugin
-        .info
-        .config
-        .iter()
-        .map(|field| {
-            let value = value_of(&field.key).or_else(|| field.default.clone());
-            let input = if field.kind == FieldKind::Flag {
-                FieldInput::Flag(Rc::new(Cell::new(value.as_deref() == Some("true"))))
-            } else {
-                FieldInput::Text(cx.new(|cx| {
-                    InputState::new(window, cx)
-                        .default_value(value.unwrap_or_default())
-                        .masked(field.kind == FieldKind::Secret)
-                }))
-            };
-            (field.clone(), input)
-        })
-        .collect();
+    let fields = ConfigForm::new(&plugin.info.config, &config, window, cx);
     let title = match &existing {
         Some(target) => format!("Edit “{}”", target.name),
         None => format!("Add {}", plugin.info.name),
@@ -594,34 +576,7 @@ fn open_target_dialog(
             Input::new(&state.name),
             cx,
         ));
-        for (field, input) in &state.fields {
-            let control = match input {
-                FieldInput::Text(state) => Input::new(state).into_any_element(),
-                FieldInput::Flag(checked) => {
-                    let checked = checked.clone();
-                    Checkbox::new(SharedString::from(field.key.clone()))
-                        .label(field.label.clone())
-                        .checked(checked.get())
-                        .on_click(move |value, window, _| {
-                            checked.set(*value);
-                            window.refresh();
-                        })
-                        .into_any_element()
-                }
-            };
-            let label = match field.kind {
-                FieldKind::Flag => None,
-                _ if field.required => Some(format!("{} (required)", field.label)),
-                _ => Some(field.label.clone()),
-            };
-            let row = form_row(
-                label.as_deref().unwrap_or(""),
-                field.help.as_deref(),
-                control,
-                cx,
-            );
-            body = body.child(row);
-        }
+        body = body.children(state.fields.rows(cx));
         if let Some(error) = &state.error {
             body = body.child(
                 div()
@@ -654,25 +609,6 @@ fn open_target_dialog(
     form
 }
 
-fn form_row(label: &str, help: Option<&str>, control: impl IntoElement, cx: &App) -> Div {
-    div()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .when(!label.is_empty(), |row| {
-            row.child(div().text_sm().child(label.to_owned()))
-        })
-        .child(control)
-        .when_some(help.map(str::to_owned), |row, help| {
-            row.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(help),
-            )
-        })
-}
-
 /// Has the plugin check the dialog's settings in the background, then saves
 /// the target and closes the dialog, or shows why not.
 fn save_target(form: Rc<RefCell<TargetForm>>, window: &mut Window, cx: &mut App) {
@@ -683,7 +619,7 @@ fn save_target(form: Rc<RefCell<TargetForm>>, window: &mut Window, cx: &mut App)
         (
             state.plugins.clone(),
             state.plugin.info.id.clone(),
-            state.config(cx),
+            state.fields.config(cx),
         )
     };
     window.refresh();
@@ -895,7 +831,7 @@ fn sync_now(library_id: &str, link: &LibraryTarget, window: &mut Window, cx: &mu
     let Some(plugins) = loaded_plugins(window, cx) else {
         return;
     };
-    let Some(target) = sync_targets::get(&link.target, cx) else {
+    if sync_targets::get(&link.target, cx).is_none() {
         show_warning(
             "This target has been deleted.",
             "Remove it from the library.",
@@ -903,7 +839,7 @@ fn sync_now(library_id: &str, link: &LibraryTarget, window: &mut Window, cx: &mu
             cx,
         );
         return;
-    };
+    }
     let library = match library::get(library_id, cx) {
         Ok(library) => library,
         Err(error) => {
@@ -911,10 +847,106 @@ fn sync_now(library_id: &str, link: &LibraryTarget, window: &mut Window, cx: &mu
             return;
         }
     };
-    let key: LinkKey = (library_id.to_owned(), link.id);
+    start_upload(library, link, plugins, cx);
+}
+
+/// How often libraries are synced without being asked (see
+/// `start_automatic_sync`).
+const AUTOMATIC_SYNC_INTERVAL: Duration = Duration::from_secs(15 * 60);
+/// How long after starting up the first automatic sync waits, so it doesn't
+/// slow the app down as it opens.
+const AUTOMATIC_SYNC_DELAY: Duration = Duration::from_secs(60);
+
+/// Syncs every library to its targets from time to time, while the
+/// setting's on. Call once, at startup.
+pub fn start_automatic_sync(cx: &mut App) {
+    cx.spawn(async move |cx| {
+        cx.background_executor().timer(AUTOMATIC_SYNC_DELAY).await;
+        loop {
+            cx.update(sync_all_in_background);
+            cx.background_executor()
+                .timer(AUTOMATIC_SYNC_INTERVAL)
+                .await;
+        }
+    })
+    .detach();
+}
+
+/// Syncs every library that has targets, if the setting's on. Which do is
+/// read in the background, so libraries without any aren't opened.
+fn sync_all_in_background(cx: &mut App) {
+    if settings::get(cx).pause_automatic_sync {
+        return;
+    }
+    let handles: Vec<_> = library::list(cx)
+        .iter()
+        .filter_map(|info| library::handle(&info.id, cx))
+        .collect();
+    cx.spawn(async move |cx| {
+        let with_targets = cx
+            .background_spawn(async move {
+                handles
+                    .into_iter()
+                    .filter(|handle| handle.sync_overview().is_ok_and(|links| !links.is_empty()))
+                    .map(|handle| handle.info.id)
+                    .collect::<Vec<_>>()
+            })
+            .await;
+        cx.update(|cx| {
+            for id in with_targets {
+                sync_in_background(&id, cx);
+            }
+        });
+    })
+    .detach();
+}
+
+/// Uploads what a library hasn't yet to each of its targets, if the
+/// setting's on, such as after photos are imported into it. Unlike Sync
+/// Now, nothing's shown if it can't: it's tried again later. Targets that
+/// stopped for a reason only the user can fix, such as bad credentials,
+/// wait for Sync Now.
+pub fn sync_in_background(library_id: &str, cx: &mut App) {
+    if settings::get(cx).pause_automatic_sync || crate::library_settings::is_busy(cx) {
+        return;
+    }
+    let Ok(Some(plugins)) = sync_targets::plugins(cx) else {
+        return;
+    };
+    // The library's folder may be on a drive that isn't connected.
+    let Ok(library) = library::get(library_id, cx) else {
+        return;
+    };
+    let links = match library.sync_targets() {
+        Ok(links) => links,
+        Err(error) => {
+            eprintln!("couldn't read what a library syncs to: {error:#}");
+            return;
+        }
+    };
+    for link in links {
+        if link.error.is_none() && sync_targets::get(&link.target, cx).is_some() {
+            start_upload(library.clone(), &link, plugins.clone(), cx);
+        }
+    }
+}
+
+/// Starts uploading a library to a target. If it's uploading there already,
+/// it goes through the library again afterwards, for photos added since.
+fn start_upload(
+    library: Arc<library::Library>,
+    link: &LibraryTarget,
+    plugins: Arc<Plugins>,
+    cx: &mut App,
+) {
+    let Some(target) = sync_targets::get(&link.target, cx) else {
+        return;
+    };
+    let key: LinkKey = (library.info.id.clone(), link.id);
     let upload = Arc::new(Upload::new(link.target.clone()));
     let syncing = activity(cx);
     if syncing.uploads.contains_key(&key) {
+        syncing.again.insert(key);
         return;
     }
     syncing.uploads.insert(key.clone(), upload.clone());
@@ -941,11 +973,19 @@ fn sync_now(library_id: &str, link: &LibraryTarget, window: &mut Window, cx: &mu
         let result = task.await;
         cx.update(|cx| {
             let activity = activity(cx);
-            if let Some(upload) = activity.uploads.remove(&key) {
-                activity.finished_sent += upload.sent.load(Ordering::Relaxed);
-            }
+            let cancelled = match activity.uploads.remove(&key) {
+                Some(upload) => {
+                    activity.finished_sent += upload.sent.load(Ordering::Relaxed);
+                    upload.cancel.load(Ordering::Relaxed)
+                }
+                None => false,
+            };
+            let again = activity.again.remove(&key) && !cancelled && result.is_ok();
             activity.results.insert(key.clone(), result_text(result));
             refresh_library(&key.0, cx);
+            if again {
+                sync_in_background(&key.0, cx);
+            }
         });
     })
     .detach();
@@ -1020,7 +1060,9 @@ fn format_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use gpui_kit::test::TestWindowExt as _;
-    use gpui_kit::{Bounds, Render, TestAppContext, WindowBounds, WindowOptions, point, size};
+    use gpui_kit::{
+        Bounds, IntoElement, Render, TestAppContext, WindowBounds, WindowOptions, point, size,
+    };
 
     use super::*;
     use crate::library::sync_test_support::FakeS3;
@@ -1071,15 +1113,7 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         cx.update_window(window, |_, window, cx| {
-            for (field, input) in &form.borrow().fields {
-                let FieldInput::Text(state) = input else {
-                    continue;
-                };
-                if let Some((_, value)) = values.iter().find(|(key, _)| *key == field.key) {
-                    let value = value.to_string();
-                    state.update(cx, |state, cx| state.set_value(value, window, cx));
-                }
-            }
+            form.borrow().fields.fill(values, window, cx);
             save_target(form.clone(), window, cx);
         })
         .unwrap();
@@ -1096,7 +1130,7 @@ mod tests {
             bytes_done: done,
             bytes_total: total,
             path: "",
-            size: 100,
+            under_way: 100,
         });
         upload.sent.store(under_way, Ordering::Relaxed);
         Arc::new(upload)
@@ -1114,9 +1148,10 @@ mod tests {
     fn measures_the_speed_over_a_few_seconds() {
         let mut activity = SyncActivity::default();
         let upload = upload("a", 1, 1000, 0, 0);
-        activity
-            .uploads
-            .insert(("library".into(), 1), upload.clone());
+        activity.uploads.insert(
+            ("library".into(), library::Id::from_u128(1)),
+            upload.clone(),
+        );
         let start = Instant::now();
         activity.sample(start);
         assert_eq!(activity.speed(), None);
@@ -1140,9 +1175,18 @@ mod tests {
         cx.update(|cx| {
             let uploads = &mut activity(cx).uploads;
             // One library to two targets, and another to one of them.
-            uploads.insert(("one".into(), 1), upload("a", 120, 1000, 400, 0));
-            uploads.insert(("one".into(), 2), upload("b", 100, 1000, 100, 0));
-            uploads.insert(("two".into(), 1), upload("a", 1, 2000, 0, 0));
+            uploads.insert(
+                ("one".into(), library::Id::from_u128(1)),
+                upload("a", 120, 1000, 400, 0),
+            );
+            uploads.insert(
+                ("one".into(), library::Id::from_u128(2)),
+                upload("b", 100, 1000, 100, 0),
+            );
+            uploads.insert(
+                ("two".into(), library::Id::from_u128(1)),
+                upload("a", 1, 2000, 0, 0),
+            );
         });
         let sync = cx.update(|cx| progress(cx)).unwrap();
         assert_eq!(sync.photos, 121);
@@ -1172,6 +1216,7 @@ mod tests {
         let s3 = FakeS3::start();
         cx.update(|cx| {
             gpui_kit::init(cx);
+            settings::init(cx);
             library::init_at(config_dir.clone(), library_dir, cx);
             sync_targets::test_support::init(config_dir.clone(), cx);
         });
@@ -1208,7 +1253,7 @@ mod tests {
         cx.update(|cx| {
             let state = form.borrow();
             assert_eq!(state.name.read(cx).value(), "S3-Compatible Storage");
-            let config = state.config(cx);
+            let config = state.fields.config(cx);
             assert!(config.contains(&("region".into(), "us-east-1".into())));
             assert!(config.contains(&("virtual_hosted".into(), "false".into())));
         });
@@ -1264,6 +1309,33 @@ mod tests {
         let links = cx.update(|cx| read_activity(cx).unwrap().links[&library_id].clone());
         assert_eq!(links[0].1.synced, 2);
         draw(libraries_page, cx);
+
+        // Syncing in the background, asked for again while under way, goes
+        // again once it's done.
+        let more = root.join("more");
+        std::fs::create_dir_all(&more).unwrap();
+        image::RgbImage::from_pixel(16, 16, image::Rgb([30, 90, 160]))
+            .save(more.join("IMG_0003.JPG"))
+            .unwrap();
+        cx.update(|cx| sync_in_background(&library_id, cx));
+        assert!(cx.update(|cx| is_syncing(cx)));
+        library.import(std::slice::from_ref(&more)).unwrap();
+        cx.update(|cx| sync_in_background(&library_id, cx));
+        assert!(cx.update(|cx| read_activity(cx).unwrap().again.contains(&key)));
+        cx.run_until_parked();
+        assert!(!cx.update(|cx| is_syncing(cx)));
+        assert!(cx.update(|cx| read_activity(cx).unwrap().again.is_empty()));
+        assert_eq!(s3.take().len(), 1);
+        let result = cx.update(|cx| read_activity(cx).unwrap().results[&key].clone());
+        assert_eq!(result, "Nothing new to upload.");
+
+        // Unless it's paused.
+        cx.update(|cx| {
+            settings::set_sync_automatically(false, cx);
+            sync_in_background(&library_id, cx);
+            assert!(!is_syncing(cx));
+            settings::set_sync_automatically(true, cx);
+        });
 
         // Deleting the target takes it off the library too.
         cx.update_window(window, |_, window, cx| {

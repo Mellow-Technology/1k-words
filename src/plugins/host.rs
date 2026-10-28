@@ -1,4 +1,4 @@
-//! What the app provides to plugins: the imports in `wit/sync.wit`.
+//! What the app provides to plugins: the imports in `wit/plugins.wit`.
 
 use std::fs::File;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
@@ -13,7 +13,7 @@ use wasmtime::StoreLimits;
 use wasmtime::component::{Resource, ResourceTable};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
-use super::bindings::onekwords::sync::{files, http as plugin_http, log};
+use super::bindings::onekwords::plugins::{files, http as plugin_http, log, settings};
 
 /// The most a plugin may read from a file at once.
 const MAX_READ: u32 = 4 << 20;
@@ -44,10 +44,12 @@ impl WasiView for State {
     }
 }
 
-/// A file a plugin may read.
+/// A file a plugin may read: all of it, or `size` bytes of it from
+/// `offset`.
 pub struct Source {
     path: PathBuf,
     file: File,
+    offset: u64,
     size: u64,
 }
 
@@ -58,8 +60,17 @@ impl Source {
         Ok(Self {
             path: path.to_path_buf(),
             file,
+            offset: 0,
             size,
         })
+    }
+
+    /// `len` bytes of the file from `offset`, or as many as there are.
+    pub fn open_part(path: &Path, offset: u64, len: u64) -> Result<Self> {
+        let mut source = Self::open(path)?;
+        source.offset = offset.min(source.size);
+        source.size = len.min(source.size - source.offset);
+        Ok(source)
     }
 }
 
@@ -82,6 +93,8 @@ impl log::Host for State {
 
 impl files::Host for State {}
 
+impl settings::Host for State {}
+
 impl files::HostSource for State {
     fn size(&mut self, source: Resource<Source>) -> u64 {
         self.table.get(&source).map_or(0, |source| source.size)
@@ -94,7 +107,7 @@ impl files::HostSource for State {
         let mut bytes = Vec::with_capacity(len as usize);
         source
             .file
-            .seek(SeekFrom::Start(offset))
+            .seek(SeekFrom::Start(source.offset + offset))
             .and_then(|_| (&source.file).take(len).read_to_end(&mut bytes))
             .map_err(|e| e.to_string())?;
         Ok(bytes)
@@ -224,7 +237,9 @@ impl plugin_http::Host for State {
     ) -> Result<plugin_http::Response, String> {
         let source = self.table.get(&body).map_err(|e| e.to_string())?;
         // A separate handle, so the plugin's reads don't move this one.
-        let file = File::open(&source.path).map_err(|e| e.to_string())?;
+        let mut file = File::open(&source.path).map_err(|e| e.to_string())?;
+        file.seek(SeekFrom::Start(source.offset))
+            .map_err(|e| e.to_string())?;
         let size = source.size;
         let request = self
             .http

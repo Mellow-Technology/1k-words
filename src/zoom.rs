@@ -147,6 +147,15 @@ impl ZoomState {
         (MAX_DEVICE_PIXELS_PER_IMAGE_PIXEL / (self.scale_factor * self.fit_scale())).max(1.0)
     }
 
+    /// The image's size as shown, in device pixels.
+    pub fn displayed_pixels(&self) -> Size<f32> {
+        let displayed = self.displayed_size();
+        size(
+            f32::from(displayed.width) * self.scale_factor,
+            f32::from(displayed.height) * self.scale_factor,
+        )
+    }
+
     fn displayed_size(&self) -> Size<Pixels> {
         let scale = self.scale();
         size(
@@ -169,6 +178,26 @@ impl ZoomState {
         );
     }
 
+    /// The part of the image in view, as fractions of its size.
+    pub fn visible_fraction(&self) -> Option<Bounds<f32>> {
+        let image = self.image_bounds();
+        let visible = image.intersect(&self.viewport);
+        if image.size.width <= px(0.) || image.size.height <= px(0.) || visible.is_empty() {
+            return None;
+        }
+        let fraction = |offset: Pixels, length: Pixels| offset / length;
+        Some(Bounds {
+            origin: point(
+                fraction(visible.origin.x - image.origin.x, image.size.width),
+                fraction(visible.origin.y - image.origin.y, image.size.height),
+            ),
+            size: size(
+                fraction(visible.size.width, image.size.width),
+                fraction(visible.size.height, image.size.height),
+            ),
+        })
+    }
+
     fn image_bounds(&self) -> Bounds<Pixels> {
         let displayed = self.displayed_size();
         let center = self.viewport.center() + self.pan;
@@ -188,6 +217,7 @@ pub fn zoomed_image(image: Arc<RenderImage>, state: Rc<RefCell<ZoomState>>) -> Z
     ZoomedImage {
         image,
         state,
+        tiles: Vec::new(),
         overlay: None,
     }
 }
@@ -195,10 +225,19 @@ pub fn zoomed_image(image: Arc<RenderImage>, state: Rc<RefCell<ZoomState>>) -> Z
 pub struct ZoomedImage {
     image: Arc<RenderImage>,
     state: Rc<RefCell<ZoomState>>,
+    /// Sharper parts of the image, drawn over it: each with the part it
+    /// covers, as fractions of the image's size (see `tiles`).
+    tiles: Vec<(Bounds<f32>, Arc<RenderImage>)>,
     overlay: Option<AnyElement>,
 }
 
 impl ZoomedImage {
+    /// Draws `tiles` over the image, each over the part it covers.
+    pub fn tiles(mut self, tiles: Vec<(Bounds<f32>, Arc<RenderImage>)>) -> Self {
+        self.tiles = tiles;
+        self
+    }
+
     /// Draws `overlay` over the image, zoomed and panned with it: it's laid
     /// out at the image's displayed size.
     pub fn overlay(mut self, overlay: impl IntoElement) -> Self {
@@ -217,7 +256,7 @@ impl IntoElement for ZoomedImage {
 
 impl Element for ZoomedImage {
     type RequestLayoutState = ();
-    type PrepaintState = (AnyElement, Option<AnyElement>);
+    type PrepaintState = (AnyElement, Vec<AnyElement>, Option<AnyElement>);
 
     fn id(&self) -> Option<ElementId> {
         None
@@ -272,6 +311,52 @@ impl Element for ZoomedImage {
         );
         image.prepaint_at(image_bounds.origin, window, cx);
 
+        // Tiles' edges are rounded to whole pixels the same way on both
+        // sides, so neighbours meet without a gap.
+        let edge =
+            |origin: Pixels, length: Pixels, fraction: f32| (origin + length * fraction).round();
+        let tiles = self
+            .tiles
+            .drain(..)
+            .filter_map(|(rect, tile)| {
+                let left = edge(
+                    image_bounds.origin.x,
+                    image_bounds.size.width,
+                    rect.origin.x,
+                );
+                let top = edge(
+                    image_bounds.origin.y,
+                    image_bounds.size.height,
+                    rect.origin.y,
+                );
+                let right = edge(image_bounds.origin.x, image_bounds.size.width, rect.right());
+                let bottom = edge(
+                    image_bounds.origin.y,
+                    image_bounds.size.height,
+                    rect.bottom(),
+                );
+                let tile_bounds = Bounds::from_corners(point(left, top), point(right, bottom));
+                if !tile_bounds.intersects(&bounds) {
+                    return None;
+                }
+                let mut tile = img(tile)
+                    .w(tile_bounds.size.width)
+                    .h(tile_bounds.size.height)
+                    .object_fit(ObjectFit::Fill)
+                    .into_any_element();
+                tile.layout_as_root(
+                    size(
+                        AvailableSpace::Definite(tile_bounds.size.width),
+                        AvailableSpace::Definite(tile_bounds.size.height),
+                    ),
+                    window,
+                    cx,
+                );
+                tile.prepaint_at(tile_bounds.origin, window, cx);
+                Some(tile)
+            })
+            .collect();
+
         let overlay = self.overlay.take().map(|overlay| {
             let mut overlay = div()
                 .w(image_bounds.size.width)
@@ -289,7 +374,7 @@ impl Element for ZoomedImage {
             overlay.prepaint_at(image_bounds.origin, window, cx);
             overlay
         });
-        (image, overlay)
+        (image, tiles, overlay)
     }
 
     fn paint(
@@ -298,11 +383,14 @@ impl Element for ZoomedImage {
         _inspector_id: Option<&InspectorElementId>,
         _bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
-        (image, overlay): &mut Self::PrepaintState,
+        (image, tiles, overlay): &mut Self::PrepaintState,
         window: &mut Window,
         cx: &mut App,
     ) {
         image.paint(window, cx);
+        for tile in tiles {
+            tile.paint(window, cx);
+        }
         if let Some(overlay) = overlay {
             overlay.paint(window, cx);
         }
@@ -367,6 +455,27 @@ mod tests {
         let (zoom, pan) = (state.zoom, state.pan);
         state.set_image_size(size(4000., 2000.));
         assert_eq!((state.zoom, state.pan), (zoom, pan));
+    }
+
+    #[test]
+    fn visible_fraction_follows_zoom_and_pan() {
+        let mut state = state();
+        // Fitted, all of it's in view.
+        let visible = state.visible_fraction().unwrap();
+        assert_eq!(
+            (visible.origin, visible.size),
+            (point(0., 0.), size(1., 1.))
+        );
+
+        // At 2x (1600x800 in an 800x800 viewport) half the width shows,
+        // from the middle unless panned.
+        state.zoom_by(2.0, None);
+        let visible = state.visible_fraction().unwrap();
+        assert!((visible.origin.x - 0.25).abs() < 1e-4, "{visible:?}");
+        assert!((visible.size.width - 0.5).abs() < 1e-4, "{visible:?}");
+        assert!((visible.size.height - 1.0).abs() < 1e-4, "{visible:?}");
+        state.pan_by(point(px(400.), px(0.)));
+        assert!(state.visible_fraction().unwrap().origin.x.abs() < 1e-4);
     }
 
     #[test]

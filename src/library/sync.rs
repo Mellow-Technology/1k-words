@@ -17,17 +17,20 @@
 //! Like the rest of the catalog, this blocks; call it from a background
 //! thread.
 
-use std::collections::HashMap;
-use std::path::Path;
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 
 use super::Library;
 use super::catalog::{Catalog, FileRole, LibraryFile, SyncItemRecord, SyncState};
-use crate::plugins::{Capabilities, Config, LocalItem, Plugins, Session, SyncError};
+use super::id::Id;
+use crate::plugins::{
+    Capabilities, Config, LocalItem, Multipart, Plugin, Plugins, RemoteItem, Session, SyncError,
+};
 
 /// After this many failures in a row, presumably the service or network is
 /// down, so the upload stops.
@@ -37,7 +40,7 @@ const MAX_FAILURES_IN_A_ROW: usize = 5;
 #[derive(Clone, Debug, PartialEq)]
 pub struct LibraryTarget {
     /// The library's own id for it, which its sync records refer to.
-    pub id: i64,
+    pub id: Id,
     /// The target's id in `sync_targets`.
     pub target: String,
     /// The library's folder in the target.
@@ -62,7 +65,7 @@ pub struct TargetSettings {
     pub config: Config,
 }
 
-/// Reported as each file starts uploading.
+/// Reported as each file, or part of one, starts uploading, and finishes.
 #[derive(Clone, Debug, PartialEq)]
 pub struct UploadProgress<'a> {
     /// Photos done so far, and to do in all. A photo's done once all its
@@ -70,12 +73,14 @@ pub struct UploadProgress<'a> {
     /// its derivatives.
     pub photos_done: usize,
     pub photos_total: usize,
-    /// The size of the files done so far, and of all of them.
+    /// The size of the files (and parts of them) done so far, and of all
+    /// of them.
     pub bytes_done: u64,
     pub bytes_total: u64,
-    /// The file being uploaded, and its size.
+    /// The file just started, if one has (in the target), and the size of
+    /// all the files and parts under way.
     pub path: &'a str,
-    pub size: u64,
+    pub under_way: u64,
 }
 
 #[derive(Debug, Default)]
@@ -92,7 +97,7 @@ impl Library {
         sync_targets(&self.catalog)
     }
 
-    fn sync_target(&self, id: i64) -> Result<LibraryTarget> {
+    fn sync_target(&self, id: Id) -> Result<LibraryTarget> {
         self.sync_targets()?
             .into_iter()
             .find(|target| target.id == id)
@@ -101,7 +106,7 @@ impl Library {
 
     /// Starts syncing to the target with `target` as its id in
     /// `sync_targets`, returning the library's id for it.
-    pub fn add_sync_target(&self, target: &str) -> Result<i64> {
+    pub fn add_sync_target(&self, target: &str) -> Result<Id> {
         if self.sync_targets()?.iter().any(|t| t.target == target) {
             bail!("The library already syncs there.");
         }
@@ -112,23 +117,29 @@ impl Library {
 
     /// Stops syncing to a target, forgetting what was synced. What was
     /// uploaded stays there.
-    pub fn remove_sync_target(&self, id: i64) -> Result<()> {
+    pub fn remove_sync_target(&self, id: Id) -> Result<()> {
         self.catalog.remove_sync_target(id)
     }
 
-    fn sync_items(&self, id: i64) -> Result<HashMap<String, SyncItemRecord>> {
+    fn sync_items(&self, id: Id) -> Result<HashMap<String, SyncItemRecord>> {
         sync_items(&self.catalog, id)
     }
 
     /// Uploads the files not yet on a target (`id` being the library's id
     /// for it), oldest photos first, until done or `cancel` is set. Bytes
     /// sent over the network are added to `sent` as they go.
+    ///
+    /// Several files go at once, each with its own instance of the plugin,
+    /// and big files go in parts, at once too, if the plugin can take them
+    /// that way. A big file's parts go ahead of other files, so few are
+    /// part-uploaded at a time.
+    ///
     /// Failures are recorded and retried next time; the upload stops early
     /// if the target's settings are wrong, or too many files fail in a row.
     pub fn upload(
         &self,
         plugins: &Plugins,
-        id: i64,
+        id: Id,
         settings: &TargetSettings,
         cancel: &AtomicBool,
         sent: &Arc<AtomicU64>,
@@ -141,6 +152,10 @@ impl Library {
         if !plugin.info.capabilities.contains(Capabilities::UPLOAD) {
             bail!("{} can't upload", plugin.info.name);
         }
+        let multipart = plugin
+            .info
+            .multipart
+            .filter(|_| plugin.info.capabilities.contains(Capabilities::MULTIPART));
 
         let items = self.sync_items(id)?;
         // The files that need uploading, with their photos (by index) and
@@ -164,109 +179,600 @@ impl Library {
             })
             .collect();
         pending.sort_by_key(|(photo, file, _)| (file.role == FileRole::Original, *photo));
-        let bytes_total = pending.iter().map(|(_, _, size)| size).sum();
-        // How many files each photo has left; it's done when none are.
-        let mut left: HashMap<usize, usize> = HashMap::new();
-        for (photo, _, _) in &pending {
-            *left.entry(*photo).or_default() += 1;
-        }
-        let photos_total = left.len();
 
-        let mut summary = UploadSummary::default();
-        let mut session: Option<Session> = None;
-        let mut failures_in_a_row = 0;
-        let mut bytes_done = 0;
-        let mut photos_done = 0;
-        for (photo, file, size) in &pending {
-            if cancel.load(Ordering::Relaxed) {
-                summary.stopped = Some("Stopped.".into());
-                break;
-            }
-            let path = &file.path;
-            progress(UploadProgress {
-                photos_done,
-                photos_total,
-                bytes_done,
-                bytes_total,
-                path,
-                size: *size,
-            });
-            bytes_done += size;
-            let photo_left = left.get_mut(photo).expect("counted");
-            *photo_left -= 1;
-            if *photo_left == 0 {
-                photos_done += 1;
-            }
-            let session = match &mut session {
-                Some(session) => session,
-                None => {
-                    let mut new = plugin.session(settings.config.clone())?;
-                    new.count_sent(sent.clone());
-                    session.insert(new)
-                }
-            };
-            let role = file.role;
-            let file = self.info.path.join(path);
-            let mut record = SyncItemRecord {
-                path: path.clone(),
-                state: SyncState::Failed,
-                remote_key: None,
-                remote_version: None,
-                size: None,
-                attempts: 0,
-                error: None,
-            };
-            let result = local_item(&target.folder, path, role, &file).and_then(|item| {
-                record.size = Some(item.size);
-                session.upload(&item, &file)
-            });
-            match result {
-                Ok(Ok(remote)) => {
-                    record.state = SyncState::Synced;
-                    record.remote_key = Some(remote.key);
-                    record.remote_version = remote.version;
-                    summary.uploaded += 1;
-                    failures_in_a_row = 0;
-                }
-                Ok(Err(error @ (SyncError::Config(_) | SyncError::Unsupported))) => {
-                    let message = error.message().to_owned();
-                    self.catalog.set_sync_target_error(id, Some(&message))?;
-                    summary.stopped = Some(message);
-                    return Ok(summary);
-                }
-                Ok(Err(SyncError::Rejected(message))) => {
-                    record.state = SyncState::Rejected;
-                    record.error = Some(message);
-                }
-                Ok(Err(SyncError::Transient(message))) => {
-                    record.error = Some(message);
-                    failures_in_a_row += 1;
-                }
-                Err(error) => {
-                    // The plugin crashed (or the file couldn't be read), so
-                    // start it afresh for the next file.
-                    record.error = Some(format!("{error:#}"));
-                    failures_in_a_row += 1;
-                    *session = plugin.session(settings.config.clone())?;
-                    session.count_sent(sent.clone());
-                }
-            }
-            if let Some(error) = &record.error {
-                summary.failed.push((path.clone(), error.clone()));
-            }
-            self.catalog.record_sync(id, &record)?;
-            if failures_in_a_row >= MAX_FAILURES_IN_A_ROW {
-                summary.stopped = Some(format!(
-                    "Stopped after {failures_in_a_row} files in a row failed. The last error: {}",
-                    record.error.unwrap_or_default()
-                ));
-                return Ok(summary);
-            }
+        let mut upload = Uploading {
+            library: self,
+            id,
+            folder: &target.folder,
+            multipart,
+            files: pending
+                .into_iter()
+                .map(|(photo, file, size)| FileUpload {
+                    photo,
+                    path: file.path,
+                    role: file.role,
+                    size,
+                    item: None,
+                    multipart: None,
+                    bytes_counted: 0,
+                    recorded: false,
+                })
+                .collect(),
+            next_file: 0,
+            ready: VecDeque::new(),
+            in_flight: 0,
+            bytes_done: 0,
+            bytes_under_way: 0,
+            photos_done: 0,
+            files_left: HashMap::new(),
+            failures_in_a_row: 0,
+            stopping: None,
+            summary: UploadSummary::default(),
+        };
+        for file in &upload.files {
+            *upload.files_left.entry(file.photo).or_default() += 1;
         }
-        if target.error.is_some() {
-            self.catalog.set_sync_target_error(id, None)?;
+        let photos_total = upload.files_left.len();
+        let bytes_total = upload.files.iter().map(|file| file.size).sum();
+
+        let workers = UPLOAD_WORKERS.min(upload.files.len()).max(1);
+        let (job_sender, jobs) = mpsc::channel::<Job>();
+        let jobs = Mutex::new(jobs);
+        let (done_sender, done) = mpsc::channel::<(Job, JobResult)>();
+        std::thread::scope(|scope| -> Result<()> {
+            for _ in 0..workers {
+                let done = done_sender.clone();
+                let jobs = &jobs;
+                let config = &settings.config;
+                scope.spawn(move || {
+                    let mut session: Option<Session> = None;
+                    loop {
+                        let job = jobs.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                        let Ok(job) = job else { return };
+                        let result = run_job(plugin, config, sent, &mut session, &job);
+                        if done.send((job, result)).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+            drop(done_sender);
+            // Dropped on the way out, however that is, so the workers stop.
+            let job_sender = job_sender;
+
+            loop {
+                if upload.stopping.is_none() && cancel.load(Ordering::Relaxed) {
+                    upload.stop(Stop::Other("Stopped.".into()))?;
+                }
+                // Hand out work to every idle worker.
+                while upload.in_flight < workers
+                    && let Some(job) = upload.next_job(&self.info.path)?
+                {
+                    upload.in_flight += 1;
+                    upload.bytes_under_way += job.size();
+                    progress(upload.progress(photos_total, bytes_total, job.path()));
+                    job_sender
+                        .send(job)
+                        .map_err(|_| anyhow!("the upload workers stopped"))?;
+                }
+                if upload.in_flight == 0 {
+                    return Ok(());
+                }
+                let (job, result) = done
+                    .recv()
+                    .map_err(|_| anyhow!("the upload workers stopped"))?;
+                upload.in_flight -= 1;
+                upload.bytes_under_way -= job.size();
+                upload.finished(job, result)?;
+                progress(upload.progress(photos_total, bytes_total, ""));
+            }
+        })?;
+
+        let mut summary = upload.summary;
+        match upload.stopping {
+            Some(Stop::Config(message)) => {
+                self.catalog.set_sync_target_error(id, Some(&message))?;
+                summary.stopped = Some(message);
+            }
+            Some(Stop::Other(message)) => summary.stopped = Some(message),
+            None if target.error.is_some() => self.catalog.set_sync_target_error(id, None)?,
+            None => {}
         }
         Ok(summary)
+    }
+}
+
+/// How many files, or parts of them, are uploaded at once.
+const UPLOAD_WORKERS: usize = 4;
+/// How many times a part of a file is tried before the file's upload fails.
+/// Starting a big file again is costly, so parts are retried at once,
+/// unlike whole files, which wait for the next sync.
+const PART_ATTEMPTS: u32 = 3;
+
+/// Something for an upload worker to do.
+#[derive(Clone, Debug)]
+enum Job {
+    /// Uploading a file whole.
+    File {
+        file: usize,
+        item: LocalItem,
+        path: PathBuf,
+    },
+    /// Starting a file's upload in parts.
+    Begin { file: usize, item: LocalItem },
+    Part {
+        file: usize,
+        item: LocalItem,
+        path: PathBuf,
+        upload: String,
+        /// From 1.
+        part: u32,
+        offset: u64,
+        len: u64,
+        attempt: u32,
+    },
+    Finish {
+        file: usize,
+        item: LocalItem,
+        upload: String,
+        parts: Vec<String>,
+    },
+    /// Giving up on a file's upload in parts.
+    Abort { item: LocalItem, upload: String },
+}
+
+impl Job {
+    /// The bytes it sends.
+    fn size(&self) -> u64 {
+        match self {
+            Job::File { item, .. } => item.size,
+            Job::Part { len, .. } => *len,
+            _ => 0,
+        }
+    }
+
+    /// The path of the file it's for, in the target.
+    fn path(&self) -> &str {
+        match self {
+            Job::File { item, .. }
+            | Job::Begin { item, .. }
+            | Job::Part { item, .. }
+            | Job::Finish { item, .. }
+            | Job::Abort { item, .. } => &item.path,
+        }
+    }
+}
+
+/// What a job came to: a remote item for a whole file or a finished upload
+/// in parts, an id for a started one, what a part was, or nothing. `Err`
+/// means the plugin crashed, or the file couldn't be read.
+enum JobOutcome {
+    Uploaded(RemoteItem),
+    Begun(String),
+    Part(String),
+    Aborted,
+}
+
+type JobResult = Result<Result<JobOutcome, SyncError>>;
+
+fn run_job(
+    plugin: &Plugin,
+    config: &Config,
+    sent: &Arc<AtomicU64>,
+    session: &mut Option<Session>,
+    job: &Job,
+) -> JobResult {
+    let running = match session {
+        Some(running) => running,
+        None => {
+            let mut new = plugin.session(config.clone())?;
+            new.count_sent(sent.clone());
+            session.insert(new)
+        }
+    };
+    let result = match job {
+        Job::File { item, path, .. } => running
+            .upload(item, path)
+            .map(|r| r.map(JobOutcome::Uploaded)),
+        Job::Begin { item, .. } => running.begin_upload(item).map(|r| r.map(JobOutcome::Begun)),
+        Job::Part {
+            item,
+            path,
+            upload,
+            part,
+            offset,
+            len,
+            ..
+        } => running
+            .upload_part(item, upload, *part, path, *offset, *len)
+            .map(|r| r.map(JobOutcome::Part)),
+        Job::Finish {
+            item,
+            upload,
+            parts,
+            ..
+        } => running
+            .finish_upload(item, upload, parts)
+            .map(|r| r.map(JobOutcome::Uploaded)),
+        Job::Abort { item, upload } => running
+            .abort_upload(item, upload)
+            .map(|r| r.map(|()| JobOutcome::Aborted)),
+    };
+    if result.is_err() {
+        // Crashed: start afresh for the next job.
+        *session = None;
+    }
+    result
+}
+
+/// Why an upload stopped early.
+enum Stop {
+    /// The target's settings are wrong, which is recorded until they work.
+    Config(String),
+    Other(String),
+}
+
+/// A file to upload.
+struct FileUpload {
+    photo: usize,
+    /// In the library.
+    path: String,
+    role: FileRole,
+    size: u64,
+    /// Once it's started.
+    item: Option<LocalItem>,
+    /// For an upload in parts, once it's begun.
+    multipart: Option<PartUpload>,
+    /// Of its bytes, those counted as done so far (its parts', as they go).
+    bytes_counted: u64,
+    /// Whether how it went has been recorded.
+    recorded: bool,
+}
+
+/// A file's upload in parts.
+struct PartUpload {
+    id: String,
+    /// What each part was, once it's uploaded.
+    parts: Vec<Option<String>>,
+    /// How many parts the workers have.
+    under_way: usize,
+    /// Why it failed, once it has: the parts not yet handed out are
+    /// dropped, and it's given up on once those under way are done.
+    failed: Option<(SyncState, String)>,
+}
+
+/// An upload under way (see `Library::upload`).
+struct Uploading<'a> {
+    library: &'a Library,
+    id: Id,
+    folder: &'a str,
+    multipart: Option<Multipart>,
+    files: Vec<FileUpload>,
+    /// The first file not yet started.
+    next_file: usize,
+    /// Jobs to hand out ahead of starting more files: the parts of files
+    /// under way, and finishing or giving up on them.
+    ready: VecDeque<Job>,
+    in_flight: usize,
+    bytes_done: u64,
+    bytes_under_way: u64,
+    photos_done: usize,
+    /// How many files each photo has left; it's done when none are.
+    files_left: HashMap<usize, usize>,
+    failures_in_a_row: usize,
+    /// Once it's stopping: no more files start, and their parts not yet
+    /// handed out aren't, but jobs under way finish, as do uploads in parts
+    /// whose parts are all in; the rest are given up on.
+    stopping: Option<Stop>,
+    summary: UploadSummary,
+}
+
+impl Uploading<'_> {
+    fn stop(&mut self, why: Stop) -> Result<()> {
+        if self.stopping.is_none() {
+            self.stopping = Some(why);
+        }
+        let stopped: Vec<usize> = self
+            .ready
+            .iter()
+            .filter_map(|job| match job {
+                Job::Part { file, .. } => Some(*file),
+                _ => None,
+            })
+            .collect();
+        for file in stopped {
+            self.fail_parts(file, SyncState::Failed, "Stopped.".into())?;
+        }
+        Ok(())
+    }
+
+    fn progress<'p>(
+        &self,
+        photos_total: usize,
+        bytes_total: u64,
+        path: &'p str,
+    ) -> UploadProgress<'p> {
+        UploadProgress {
+            photos_done: self.photos_done,
+            photos_total,
+            bytes_done: self.bytes_done,
+            bytes_total,
+            path,
+            under_way: self.bytes_under_way,
+        }
+    }
+
+    /// The next job to hand out, if there is one.
+    fn next_job(&mut self, root: &Path) -> Result<Option<Job>> {
+        if let Some(job) = self.ready.pop_front() {
+            if let Job::Part { file, .. } = &job
+                && let Some(upload) = &mut self.files[*file].multipart
+            {
+                upload.under_way += 1;
+            }
+            return Ok(Some(job));
+        }
+        while self.stopping.is_none() && self.next_file < self.files.len() {
+            let ix = self.next_file;
+            self.next_file += 1;
+            let file = &mut self.files[ix];
+            let path = root.join(&file.path);
+            let item = match local_item(self.folder, &file.path, file.role, &path) {
+                Ok(item) => item,
+                Err(error) => {
+                    // Such as when it's gone.
+                    self.record(ix, SyncState::Failed, None, Some(format!("{error:#}")))?;
+                    continue;
+                }
+            };
+            file.item = Some(item.clone());
+            let in_parts = self
+                .multipart
+                .is_some_and(|multipart| item.size >= multipart.threshold);
+            return Ok(Some(if in_parts {
+                Job::Begin { file: ix, item }
+            } else {
+                Job::File {
+                    file: ix,
+                    item,
+                    path,
+                }
+            }));
+        }
+        Ok(None)
+    }
+
+    /// Takes in what a job came to.
+    fn finished(&mut self, job: Job, result: JobResult) -> Result<()> {
+        if let Job::Part { file, .. } = &job
+            && let Some(upload) = &mut self.files[*file].multipart
+        {
+            upload.under_way -= 1;
+        }
+        let error = match result {
+            Ok(Ok(outcome)) => return self.succeeded(job, outcome),
+            Ok(Err(error)) => error,
+            Err(error) => SyncError::Transient(format!("{error:#}")),
+        };
+        match (job, error) {
+            // Giving up is best effort.
+            (Job::Abort { .. }, _) => Ok(()),
+            (job, error @ (SyncError::Config(_) | SyncError::Unsupported)) => {
+                let message = error.message().to_owned();
+                self.failed(&job, SyncState::Failed, message.clone())?;
+                self.stop(Stop::Config(message))
+            }
+            // A part's tried again at once, a few times.
+            (
+                Job::Part {
+                    file,
+                    item,
+                    path,
+                    upload,
+                    part,
+                    offset,
+                    len,
+                    attempt,
+                },
+                SyncError::Transient(_),
+            ) if attempt + 1 < PART_ATTEMPTS
+                && self.stopping.is_none()
+                && self.files[file]
+                    .multipart
+                    .as_ref()
+                    .is_some_and(|upload| upload.failed.is_none()) =>
+            {
+                self.ready.push_front(Job::Part {
+                    file,
+                    item,
+                    path,
+                    upload,
+                    part,
+                    offset,
+                    len,
+                    attempt: attempt + 1,
+                });
+                Ok(())
+            }
+            (job, error) => {
+                let state = match error {
+                    SyncError::Rejected(_) => SyncState::Rejected,
+                    _ => {
+                        self.failures_in_a_row += 1;
+                        SyncState::Failed
+                    }
+                };
+                let message = error.message().to_owned();
+                self.failed(&job, state, message.clone())?;
+                if self.failures_in_a_row >= MAX_FAILURES_IN_A_ROW {
+                    let failures = self.failures_in_a_row;
+                    self.stop(Stop::Other(format!(
+                        "Stopped after {failures} files in a row failed. The last error: \
+                         {message}"
+                    )))?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Records that the file a job was for failed.
+    fn failed(&mut self, job: &Job, state: SyncState, message: String) -> Result<()> {
+        match *job {
+            Job::File { file, .. } | Job::Begin { file, .. } => {
+                self.record(file, state, None, Some(message))
+            }
+            Job::Part { file, .. } | Job::Finish { file, .. } => {
+                self.fail_parts(file, state, message)
+            }
+            Job::Abort { .. } => Ok(()),
+        }
+    }
+
+    fn succeeded(&mut self, job: Job, outcome: JobOutcome) -> Result<()> {
+        match (job, outcome) {
+            (Job::File { file, .. } | Job::Finish { file, .. }, JobOutcome::Uploaded(remote)) => {
+                self.failures_in_a_row = 0;
+                self.summary.uploaded += 1;
+                self.record(file, SyncState::Synced, Some(remote), None)?;
+            }
+            (Job::Begin { file, item }, JobOutcome::Begun(upload)) => {
+                let multipart = self.multipart.expect("only begun with multipart");
+                let size = item.size;
+                // Bigger parts if need be, to keep within the plugin's most.
+                let part_size = multipart
+                    .part_size
+                    .max(size.div_ceil(u64::from(multipart.max_parts.max(1))))
+                    .max(1);
+                let count = size.div_ceil(part_size).max(1);
+                self.files[file].multipart = Some(PartUpload {
+                    id: upload.clone(),
+                    parts: vec![None; count as usize],
+                    under_way: 0,
+                    failed: None,
+                });
+                if self.stopping.is_some() {
+                    return self.fail_parts(file, SyncState::Failed, "Stopped.".into());
+                }
+                let path = self.library.info.path.join(&self.files[file].path);
+                // Ahead of other files' parts, so this file's are together.
+                let mut parts: Vec<Job> = (0..count)
+                    .map(|part| {
+                        let offset = part * part_size;
+                        Job::Part {
+                            file,
+                            item: item.clone(),
+                            path: path.clone(),
+                            upload: upload.clone(),
+                            part: part as u32 + 1,
+                            offset,
+                            len: part_size.min(size - offset),
+                            attempt: 0,
+                        }
+                    })
+                    .collect();
+                parts.reverse();
+                for part in parts {
+                    self.ready.push_front(part);
+                }
+            }
+            (
+                Job::Part {
+                    file, part, len, ..
+                },
+                JobOutcome::Part(etag),
+            ) => {
+                self.bytes_done += len;
+                let entry = &mut self.files[file];
+                entry.bytes_counted += len;
+                if let Some(upload) = &mut entry.multipart {
+                    upload.parts[part as usize - 1] = Some(etag);
+                }
+                self.finish_parts(file)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Marks a file's upload in parts as failed, dropping its parts not yet
+    /// handed out, and gives up on it once none are under way.
+    fn fail_parts(&mut self, file: usize, state: SyncState, message: String) -> Result<()> {
+        if let Some(upload) = &mut self.files[file].multipart {
+            upload.failed.get_or_insert((state, message));
+        }
+        self.ready
+            .retain(|job| !matches!(job, Job::Part { file: of, .. } if *of == file));
+        self.finish_parts(file)
+    }
+
+    /// Finishes a file's upload in parts once all its parts are in, or
+    /// gives up on it once it's failed and none of its parts are under way.
+    fn finish_parts(&mut self, file: usize) -> Result<()> {
+        let entry = &mut self.files[file];
+        let Some(upload) = &mut entry.multipart else {
+            return Ok(());
+        };
+        let item = entry.item.clone().expect("started");
+        match &upload.failed {
+            None if upload.parts.iter().all(Option::is_some) => {
+                let parts = upload.parts.iter().flatten().cloned().collect();
+                let job = Job::Finish {
+                    file,
+                    item,
+                    upload: upload.id.clone(),
+                    parts,
+                };
+                self.ready.push_front(job);
+            }
+            Some((state, message)) if upload.under_way == 0 => {
+                let (state, message) = (*state, message.clone());
+                let id = upload.id.clone();
+                // Given up on once only.
+                entry.multipart = None;
+                self.ready.push_front(Job::Abort { item, upload: id });
+                self.record(file, state, None, Some(message))?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Records how a file's upload went, and counts it done.
+    fn record(
+        &mut self,
+        file: usize,
+        state: SyncState,
+        remote: Option<RemoteItem>,
+        error: Option<String>,
+    ) -> Result<()> {
+        let entry = &mut self.files[file];
+        if entry.recorded {
+            return Ok(());
+        }
+        entry.recorded = true;
+        let record = SyncItemRecord {
+            path: entry.path.clone(),
+            state,
+            remote_key: remote.as_ref().map(|remote| remote.key.clone()),
+            remote_version: remote.and_then(|remote| remote.version),
+            size: entry.item.as_ref().map(|item| item.size),
+            attempts: 0,
+            error: error.clone(),
+        };
+        if let Some(error) = error {
+            self.summary.failed.push((entry.path.clone(), error));
+        }
+        self.bytes_done += entry.size.saturating_sub(entry.bytes_counted);
+        entry.bytes_counted = entry.size;
+        let photo = entry.photo;
+        self.library.catalog.record_sync(self.id, &record)?;
+        let left = self.files_left.get_mut(&photo).expect("counted");
+        *left -= 1;
+        if *left == 0 {
+            self.photos_done += 1;
+        }
+        Ok(())
     }
 }
 
@@ -283,7 +789,7 @@ pub(super) fn sync_targets(catalog: &Catalog) -> Result<Vec<LibraryTarget>> {
         .collect())
 }
 
-pub(super) fn sync_status(catalog: &Catalog, id: i64) -> Result<SyncStatus> {
+pub(super) fn sync_status(catalog: &Catalog, id: Id) -> Result<SyncStatus> {
     let items = sync_items(catalog, id)?;
     let mut status = SyncStatus::default();
     for file in catalog.files()? {
@@ -296,7 +802,7 @@ pub(super) fn sync_status(catalog: &Catalog, id: i64) -> Result<SyncStatus> {
     Ok(status)
 }
 
-fn sync_items(catalog: &Catalog, id: i64) -> Result<HashMap<String, SyncItemRecord>> {
+fn sync_items(catalog: &Catalog, id: Id) -> Result<HashMap<String, SyncItemRecord>> {
     Ok(catalog
         .sync_items(id)?
         .into_iter()
@@ -394,12 +900,14 @@ pub(crate) mod test_support {
         }
     }
 
-    /// A stand-in for an S3 service on localhost. Answers each request
-    /// with the next status in `statuses` (200 once they run out).
+    /// A stand-in for an S3 service on localhost, taking requests at once.
+    /// Answers each with 200 (or as S3 would to multipart uploads), unless
+    /// a failure's set up for it (see `fail_next` and `fail_matching`).
     pub struct FakeS3 {
         pub endpoint: String,
         received: Arc<Mutex<Vec<Received>>>,
-        statuses: Arc<Mutex<Vec<u16>>>,
+        /// Statuses for requests whose path and query contain the string.
+        failures: Arc<Mutex<Vec<(String, u16)>>>,
     }
 
     impl FakeS3 {
@@ -407,67 +915,19 @@ pub(crate) mod test_support {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let endpoint = format!("http://{}", listener.local_addr().unwrap());
             let received = Arc::new(Mutex::new(Vec::new()));
-            let statuses = Arc::new(Mutex::new(Vec::new()));
-            let (log, script) = (received.clone(), statuses.clone());
+            let failures = Arc::new(Mutex::new(Vec::new()));
+            let (log, script) = (received.clone(), failures.clone());
             std::thread::spawn(move || {
                 for stream in listener.incoming() {
-                    let Ok(mut stream) = stream else { return };
-                    let mut reader = BufReader::new(stream.try_clone().unwrap());
-                    let mut line = String::new();
-                    reader.read_line(&mut line).unwrap();
-                    let mut parts = line.split_whitespace();
-                    let method = parts.next().unwrap_or_default().to_owned();
-                    let path = parts.next().unwrap_or_default().to_owned();
-                    let mut headers = Vec::new();
-                    loop {
-                        let mut line = String::new();
-                        reader.read_line(&mut line).unwrap();
-                        let Some((name, value)) = line.trim_end().split_once(':') else {
-                            break;
-                        };
-                        headers.push((name.to_owned(), value.trim().to_owned()));
-                    }
-                    let length = headers
-                        .iter()
-                        .find(|(n, _)| n.eq_ignore_ascii_case("content-length"))
-                        .map_or(0, |(_, v)| v.parse().unwrap());
-                    let mut body = vec![0; length];
-                    reader.read_exact(&mut body).unwrap();
-                    let status = {
-                        let mut script = script.lock().unwrap();
-                        if script.is_empty() {
-                            200
-                        } else {
-                            script.remove(0)
-                        }
-                    };
-                    let error = match status {
-                        403 => {
-                            "<Error><Code>InvalidAccessKeyId</Code><Message>Nope</Message></Error>"
-                        }
-                        500 => "<Error><Code>InternalError</Code></Error>",
-                        _ => "",
-                    };
-                    write!(
-                        stream,
-                        "HTTP/1.1 {status} X\r\nETag: \"etag-{}\"\r\nContent-Length: {}\r\n\
-                         Connection: close\r\n\r\n{error}",
-                        body.len(),
-                        error.len()
-                    )
-                    .unwrap();
-                    log.lock().unwrap().push(Received {
-                        method,
-                        path,
-                        headers,
-                        body,
-                    });
+                    let Ok(stream) = stream else { return };
+                    let (log, script) = (log.clone(), script.clone());
+                    std::thread::spawn(move || answer(stream, &log, &script));
                 }
             });
             Self {
                 endpoint,
                 received,
-                statuses,
+                failures,
             }
         }
 
@@ -488,9 +948,99 @@ pub(crate) mod test_support {
             std::mem::take(&mut *self.received.lock().unwrap())
         }
 
+        /// Fails the next requests with `statuses`, one each.
         pub fn fail_next(&self, statuses: &[u16]) {
-            self.statuses.lock().unwrap().extend_from_slice(statuses);
+            self.fail_matching("", statuses);
         }
+
+        /// Fails the next requests whose path (with its query) contains
+        /// `pattern` with `statuses`, one each.
+        pub fn fail_matching(&self, pattern: &str, statuses: &[u16]) {
+            let mut failures = self.failures.lock().unwrap();
+            failures.extend(statuses.iter().map(|&status| (pattern.to_owned(), status)));
+        }
+    }
+
+    fn answer(
+        mut stream: std::net::TcpStream,
+        log: &Mutex<Vec<Received>>,
+        script: &Mutex<Vec<(String, u16)>>,
+    ) {
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let mut parts = line.split_whitespace();
+        let method = parts.next().unwrap_or_default().to_owned();
+        let path = parts.next().unwrap_or_default().to_owned();
+        let mut headers = Vec::new();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let Some((name, value)) = line.trim_end().split_once(':') else {
+                break;
+            };
+            headers.push((name.to_owned(), value.trim().to_owned()));
+        }
+        let length = headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case("content-length"))
+            .map_or(0, |(_, v)| v.parse().unwrap());
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
+        let status = {
+            let mut script = script.lock().unwrap();
+            match script
+                .iter()
+                .position(|(pattern, _)| path.contains(pattern.as_str()))
+            {
+                Some(ix) => script.remove(ix).1,
+                None => 200,
+            }
+        };
+        let query = path.split_once('?').map_or("", |(_, query)| query);
+        let part = query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("partNumber="));
+        let (etag, response) = match (status, method.as_str()) {
+            (403, _) => (
+                String::new(),
+                "<Error><Code>InvalidAccessKeyId</Code><Message>Nope</Message></Error>".to_owned(),
+            ),
+            (500, _) => (
+                String::new(),
+                "<Error><Code>InternalError</Code></Error>".to_owned(),
+            ),
+            (_, "POST") if query.starts_with("uploads") => (
+                String::new(),
+                "<InitiateMultipartUploadResult><UploadId>upload-1</UploadId>\
+                 </InitiateMultipartUploadResult>"
+                    .to_owned(),
+            ),
+            (_, "POST") => (
+                String::new(),
+                "<CompleteMultipartUploadResult><ETag>&quot;final&quot;</ETag>\
+                 </CompleteMultipartUploadResult>"
+                    .to_owned(),
+            ),
+            _ => match part {
+                Some(part) => (format!("part-{part}"), String::new()),
+                None => (format!("etag-{}", body.len()), String::new()),
+            },
+        };
+        // Logged first, so it's there once the client has its answer.
+        log.lock().unwrap().push(Received {
+            method,
+            path,
+            headers,
+            body,
+        });
+        write!(
+            stream,
+            "HTTP/1.1 {status} X\r\nETag: \"{etag}\"\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{response}",
+            response.len()
+        )
+        .unwrap();
     }
 }
 
@@ -500,7 +1050,7 @@ mod tests {
 
     use super::super::derivatives::DerivativeKind;
     use super::super::{LibraryInfo, test_support};
-    use super::test_support::FakeS3;
+    use super::test_support::{FakeS3, Received};
     use super::*;
 
     fn jpeg(path: &Path, shade: u8) {
@@ -602,32 +1152,37 @@ mod tests {
                         p.photos_total,
                         p.bytes_done,
                         p.bytes_total,
-                        p.size,
+                        p.under_way,
                     ))
                 },
             )
             .unwrap();
         assert_eq!(summary.uploaded, 6);
         assert!(summary.failed.is_empty() && summary.stopped.is_none());
-        // A photo's done once its thumbnail and original are.
-        let expected: Vec<_> = (0..6)
-            .map(|ix| {
-                (
-                    files[ix].clone(),
-                    ix.saturating_sub(3),
-                    3,
-                    sizes[..ix].iter().sum::<u64>(),
-                    total,
-                    sizes[ix],
-                )
-            })
+        // They start in order, several at once, and are counted as they
+        // finish; a photo's done once its thumbnail and original are.
+        let started: Vec<&str> = seen
+            .iter()
+            .map(|(path, ..)| path.as_str())
+            .filter(|path| !path.is_empty())
             .collect();
-        assert_eq!(seen, expected);
+        let in_target: Vec<String> = files.iter().map(|f| format!("Test-upload01/{f}")).collect();
+        assert_eq!(started, in_target);
+        assert_eq!(
+            seen.last().unwrap(),
+            &(String::new(), 3, 3, total, total, 0)
+        );
+        assert!(seen.iter().any(|seen| seen.5 > sizes[0]), "several at once");
         // Every byte of every file went over the network.
         assert_eq!(sent.load(Ordering::Relaxed), total);
 
-        let received = s3.take();
+        let mut received = s3.take();
         assert_eq!(received.len(), 6);
+        received.sort_by_key(|request| {
+            files
+                .iter()
+                .position(|path| request.path.ends_with(path.as_str()))
+        });
         for (request, path) in received.iter().zip(&files) {
             let contents = std::fs::read(library.info.path.join(path)).unwrap();
             assert_eq!(request.method, "PUT");
@@ -763,16 +1318,17 @@ mod tests {
         assert_eq!(sync_status(&library.catalog, id).unwrap().pending, 1);
         s3.take();
 
-        // Bad credentials stop the upload, and are noted on the target.
+        // Bad credentials stop the upload, and are noted on the target:
+        // here, for the first files, which go at once.
         library.remove_sync_target(id).unwrap();
         let id = library.add_sync_target("target").unwrap();
-        s3.fail_next(&[403]);
+        s3.fail_next(&[403; UPLOAD_WORKERS]);
         let summary = library
             .upload(&plugins, id, &settings, &cancel, &sent, |_| {})
             .unwrap();
         assert_eq!(summary.uploaded, 0);
         assert_eq!(summary.stopped.as_deref(), Some("InvalidAccessKeyId: Nope"));
-        assert_eq!(s3.take().len(), 1);
+        assert_eq!(s3.take().len(), UPLOAD_WORKERS);
         let error = library.sync_targets().unwrap()[0].error.clone();
         assert_eq!(error.as_deref(), Some("InvalidAccessKeyId: Nope"));
 
@@ -783,19 +1339,123 @@ mod tests {
         assert_eq!(summary.uploaded, 6);
         assert_eq!(library.sync_targets().unwrap()[0].error, None);
 
-        // Stopping part way finishes the file under way: here, the second
-        // original, after the three thumbnails and the first.
+        // Stopping part way finishes the files under way: here, the first
+        // ones, which started at once.
         library.remove_sync_target(id).unwrap();
         let id = library.add_sync_target("target").unwrap();
         let summary = library
-            .upload(&plugins, id, &settings, &cancel, &sent, |p| {
-                if p.photos_done == 1 {
-                    cancel.store(true, Ordering::Relaxed);
-                }
+            .upload(&plugins, id, &settings, &cancel, &sent, |_| {
+                cancel.store(true, Ordering::Relaxed);
             })
             .unwrap();
-        assert_eq!(summary.uploaded, 5);
+        assert_eq!(summary.uploaded, UPLOAD_WORKERS);
         assert_eq!(summary.stopped.as_deref(), Some("Stopped."));
+        test_support::remove(&root);
+    }
+
+    #[test]
+    fn uploads_big_files_in_parts() {
+        let (library, root) = library("parts001", 2);
+        let s3 = FakeS3::start();
+        let plugins = Plugins::load(None).unwrap();
+        let settings = settings(&plugins, &s3);
+        let cancel = AtomicBool::new(false);
+        let sent = Arc::new(AtomicU64::new(0));
+        // A thumbnail made big enough to go in parts: 16 MiB, 16 MiB, then
+        // the rest.
+        let big = library
+            .catalog
+            .files()
+            .unwrap()
+            .into_iter()
+            .find(|file| file.path.starts_with("Thumbnails/"))
+            .unwrap()
+            .path;
+        let big_file = library.info.path.join(&big);
+        let size = (40 << 20) + 123;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&big_file)
+            .unwrap()
+            .set_len(size)
+            .unwrap();
+        let contents = std::fs::read(&big_file).unwrap();
+
+        let id = library.add_sync_target("target").unwrap();
+        let summary = library
+            .upload(&plugins, id, &settings, &cancel, &sent, |_| {})
+            .unwrap();
+        assert_eq!(summary.uploaded, 4);
+        assert!(summary.failed.is_empty(), "{:?}", summary.failed);
+        let received = s3.take();
+        let key = format!("/photos/backup/Test-parts001/{big}");
+        let of_big: Vec<&Received> = received
+            .iter()
+            .filter(|r| r.path.starts_with(&key))
+            .collect();
+        // Begun, three parts, then finished.
+        assert_eq!(of_big.len(), 5);
+        assert_eq!(of_big[0].method, "POST");
+        assert!(of_big[0].path.ends_with("?uploads="));
+        let mut parts: Vec<&&Received> = of_big.iter().filter(|r| r.method == "PUT").collect();
+        assert_eq!(parts.len(), 3);
+        parts.sort_by_key(|r| r.path.clone());
+        assert!(parts[0].path.contains("partNumber=1&uploadId=upload-1"));
+        let sent_back: Vec<u8> = parts.iter().flat_map(|r| r.body.clone()).collect();
+        assert_eq!(sent_back.len(), contents.len());
+        assert!(sent_back == contents);
+        assert_eq!(parts[0].body.len(), 16 << 20);
+        let finish = of_big.last().unwrap();
+        assert_eq!(finish.method, "POST");
+        assert!(finish.path.ends_with("?uploadId=upload-1"));
+        let body = String::from_utf8_lossy(&finish.body);
+        for part in 1..=3 {
+            assert!(body.contains(&format!(
+                "<Part><PartNumber>{part}</PartNumber><ETag>&quot;part-{part}&quot;</ETag></Part>"
+            )));
+        }
+        let items = library.catalog.sync_items(id).unwrap();
+        let item = items.iter().find(|item| item.path == big).unwrap();
+        assert_eq!(item.state, SyncState::Synced);
+        assert_eq!(item.remote_version.as_deref(), Some("final"));
+        assert!(sent.load(Ordering::Relaxed) >= size);
+
+        // A part that fails is tried again at once.
+        let id = library.add_sync_target("again").unwrap();
+        s3.fail_matching("partNumber=2", &[500]);
+        let summary = library
+            .upload(&plugins, id, &settings, &cancel, &sent, |_| {})
+            .unwrap();
+        assert_eq!(summary.uploaded, 4);
+        let tries = s3
+            .take()
+            .iter()
+            .filter(|r| r.path.contains("partNumber=2"))
+            .count();
+        assert_eq!(tries, 2);
+
+        // One that keeps failing fails the file, whose upload is given up.
+        let id = library.add_sync_target("failing").unwrap();
+        s3.fail_matching("partNumber=2", &[500; PART_ATTEMPTS as usize]);
+        let summary = library
+            .upload(&plugins, id, &settings, &cancel, &sent, |_| {})
+            .unwrap();
+        assert_eq!(summary.uploaded, 3);
+        assert_eq!(summary.failed.len(), 1);
+        assert_eq!(summary.failed[0].0, big);
+        let received = s3.take();
+        let abort = format!("{key}?uploadId=upload-1");
+        assert!(
+            received
+                .iter()
+                .any(|r| r.method == "DELETE" && r.path == abort)
+        );
+        assert!(
+            !received
+                .iter()
+                .any(|r| r.method == "POST" && r.path.ends_with("?uploadId=upload-1"))
+        );
+        assert_eq!(sync_status(&library.catalog, id).unwrap().pending, 1);
         test_support::remove(&root);
     }
 }

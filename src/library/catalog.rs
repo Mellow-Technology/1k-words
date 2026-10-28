@@ -10,6 +10,21 @@
 //!
 //! Turso's API is async but does its I/O synchronously, so each call blocks
 //! on it; call these from a background thread.
+//!
+//! A catalog can be synced between one person's devices, each changing it
+//! while offline, so:
+//!
+//! - Rows have UUIDv7 ids (see `id`), never counted up from one, and rows
+//!   two devices could both make, such as a photo's place in an album, are
+//!   keyed by what they're about, so making one twice merges.
+//! - Albums and photos aren't deleted straight away but marked deleted (a
+//!   tombstone), with the device that did it and the `version` it saw. Every
+//!   change to one, including what's in an album, gives it a new `version`.
+//!   Syncing applies only the columns a change made, so a deletion on one
+//!   device and a change on another both arrive; a tombstone whose
+//!   `version` isn't the one its deletion saw was changed somewhere the
+//!   deletion hadn't, and the user is asked which they meant (see
+//!   `album_conflicts`).
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -21,6 +36,8 @@ use turso::{Connection, Database, Row, Value};
 
 use super::albums::Album;
 use super::derivatives::DerivativeKind;
+use super::device::Device;
+use super::id::{self, Id};
 use super::objects::ObjectKind;
 use crate::detect::DetectedObject;
 use crate::location::Location;
@@ -28,7 +45,7 @@ use crate::photos::CaptureMeta;
 
 /// Bumped with each change to the schema, which `migrate` brings old
 /// catalogs up to.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 8;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE photos (
@@ -173,6 +190,209 @@ CREATE TABLE album_photos (
 CREATE INDEX album_photos_photo_id ON album_photos (photo_id);
 ";
 
+/// Whether an album shows the photos of the albums in it as well as its
+/// own.
+const SCHEMA_V6: &str = "
+ALTER TABLE albums ADD COLUMN show_nested INTEGER NOT NULL DEFAULT 0;
+";
+
+/// Objects found by more than one detector (see `detect::Detector`): each
+/// one's findings are kept, so switching between them doesn't look at
+/// photos again. Some detectors don't say where objects are, so `boxed`
+/// says whether the bounds mean anything.
+const SCHEMA_V7: &str = "
+CREATE TABLE detector_scans (
+    -- The row in photos.
+    photo_id INTEGER NOT NULL,
+    -- See `detect::Detector::key`.
+    detector TEXT NOT NULL,
+    scanned_at REAL NOT NULL,
+    PRIMARY KEY (photo_id, detector)
+);
+INSERT INTO detector_scans (photo_id, detector, scanned_at)
+    SELECT photo_id, model, scanned_at FROM object_scans;
+ALTER TABLE objects ADD COLUMN detector TEXT NOT NULL DEFAULT '';
+UPDATE objects SET detector = coalesce(
+    (SELECT model FROM object_scans WHERE object_scans.photo_id = objects.photo_id), '');
+ALTER TABLE objects ADD COLUMN boxed INTEGER NOT NULL DEFAULT 1;
+CREATE INDEX objects_detector_label ON objects (detector, label);
+DROP TABLE object_scans;
+";
+
+/// Syncing between devices (see the module's description). Ids become
+/// UUIDv7s; rows that two devices could both make are keyed by what they're
+/// about; albums and photos gain versions and tombstones; and the devices
+/// that change the catalog are listed, to name them. This is the whole
+/// schema: new catalogs start here, and older ones are converted to it (see
+/// `convert_to_v8`).
+const SCHEMA_V8: &str = "
+CREATE TABLE devices (
+    id BLOB PRIMARY KEY,
+    name TEXT NOT NULL,
+    seen_at REAL NOT NULL
+);
+CREATE TABLE photos (
+    id BLOB PRIMARY KEY,
+    -- The displayed file, its raw pair (RAW+JPEG) and Live Photo video.
+    path TEXT NOT NULL UNIQUE,
+    raw_path TEXT,
+    live_video_path TEXT,
+    -- BLAKE3 of the displayed file, to skip duplicates when importing.
+    content_hash TEXT NOT NULL,
+    file_size INTEGER NOT NULL,
+    -- Where it was imported from, and when (seconds since the Unix epoch).
+    original_path TEXT NOT NULL,
+    imported_at REAL NOT NULL,
+    width INTEGER NOT NULL,
+    height INTEGER NOT NULL,
+    -- Seconds by the camera's clock, as if it were UTC.
+    captured_at REAL,
+    modified_at REAL NOT NULL,
+    camera TEXT,
+    exposure_time REAL,
+    f_number REAL,
+    iso INTEGER,
+    exposure_bias REAL,
+    auto_bracket INTEGER NOT NULL DEFAULT 0,
+    manual_exposure INTEGER NOT NULL DEFAULT 0,
+    latitude REAL,
+    longitude REAL,
+    -- A new id with each change, and the device that made it.
+    version BLOB NOT NULL,
+    changed_by BLOB,
+    -- Set when it's deleted: when, where, and the version it had there.
+    deleted_at REAL,
+    deleted_by BLOB,
+    deleted_seen BLOB
+);
+CREATE INDEX photos_content_hash ON photos (content_hash);
+CREATE INDEX photos_captured_at ON photos (captured_at);
+CREATE INDEX photos_camera ON photos (camera);
+-- The targets the library syncs to. They're listed, with their settings,
+-- in the app's `sync-targets.json`.
+CREATE TABLE sync_targets (
+    id BLOB PRIMARY KEY,
+    -- The target's id in `sync-targets.json`.
+    target TEXT NOT NULL UNIQUE,
+    -- The library's folder in the target, so libraries sharing it don't mix.
+    folder TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    -- Why syncing stopped (such as bad credentials), until it next works.
+    error TEXT
+);
+CREATE TABLE sync_items (
+    -- The row in sync_targets.
+    target_id BLOB NOT NULL,
+    -- The file in the library.
+    path TEXT NOT NULL,
+    -- 'synced'; 'failed', to try again; or 'rejected' by the service, not
+    -- retried.
+    state TEXT NOT NULL,
+    -- How the service identifies the file, and its version there.
+    remote_key TEXT,
+    remote_version TEXT,
+    size INTEGER,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    error TEXT,
+    synced_at REAL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (target_id, path)
+);
+CREATE INDEX sync_items_remote_key ON sync_items (target_id, remote_key);
+CREATE INDEX sync_items_path ON sync_items (path);
+CREATE TABLE derivatives (
+    -- The row in photos.
+    photo_id BLOB NOT NULL,
+    -- 'thumbnail'.
+    kind TEXT NOT NULL,
+    path TEXT NOT NULL,
+    width INTEGER NOT NULL,
+    height INTEGER NOT NULL,
+    file_size INTEGER NOT NULL,
+    -- How it was made (see `DerivativeKind::version`).
+    version INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (photo_id, kind)
+);
+CREATE INDEX derivatives_path ON derivatives (path);
+-- The photos each detector has looked at, so photos where nothing was
+-- found aren't looked at again.
+CREATE TABLE detector_scans (
+    -- The row in photos.
+    photo_id BLOB NOT NULL,
+    -- See `detect::Detector::key`.
+    detector TEXT NOT NULL,
+    scanned_at REAL NOT NULL,
+    PRIMARY KEY (photo_id, detector)
+);
+CREATE TABLE objects (
+    -- The row in photos.
+    photo_id BLOB NOT NULL,
+    detector TEXT NOT NULL,
+    -- Its place among what the detector found in the photo.
+    ix INTEGER NOT NULL,
+    -- The model's word for it, e.g. 'person' or 'dog'.
+    label TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    -- Its bounds, as fractions of the photo's width and height, if `boxed`.
+    x1 REAL NOT NULL,
+    y1 REAL NOT NULL,
+    x2 REAL NOT NULL,
+    y2 REAL NOT NULL,
+    boxed INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (photo_id, detector, ix)
+);
+CREATE INDEX objects_label ON objects (label);
+CREATE INDEX objects_detector_label ON objects (detector, label);
+CREATE TABLE albums (
+    id BLOB PRIMARY KEY,
+    -- The album it's in; NULL at the top level.
+    parent_id BLOB,
+    name TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    show_nested INTEGER NOT NULL DEFAULT 0,
+    -- As for photos.
+    version BLOB NOT NULL,
+    changed_by BLOB,
+    deleted_at REAL,
+    deleted_by BLOB,
+    deleted_seen BLOB
+);
+CREATE INDEX albums_parent_id ON albums (parent_id);
+CREATE TABLE album_photos (
+    -- The rows in albums and photos.
+    album_id BLOB NOT NULL,
+    photo_id BLOB NOT NULL,
+    added_at REAL NOT NULL,
+    added_by BLOB,
+    PRIMARY KEY (album_id, photo_id)
+);
+CREATE INDEX album_photos_photo_id ON album_photos (photo_id);
+";
+
+/// The tables `SCHEMA_V8` replaces, and their indexes.
+const V7_TABLES: &[&str] = &[
+    "photos",
+    "sync_targets",
+    "sync_items",
+    "derivatives",
+    "detector_scans",
+    "objects",
+    "albums",
+    "album_photos",
+];
+const V7_INDEXES: &[&str] = &[
+    "photos_content_hash",
+    "photos_captured_at",
+    "photos_camera",
+    "sync_items_remote_key",
+    "objects_photo_id",
+    "objects_label",
+    "objects_detector_label",
+    "albums_parent_id",
+    "album_photos_photo_id",
+];
+
 /// The columns `record_from_row` reads, from `photos`.
 const PHOTO_COLUMNS: &str = "photos.path, photos.raw_path, photos.live_video_path,
     photos.content_hash, photos.file_size, photos.original_path, photos.imported_at,
@@ -226,7 +446,7 @@ pub struct LibraryFile {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SyncTargetRecord {
-    pub id: i64,
+    pub id: Id,
     /// The target's id in `sync-targets.json`.
     pub target: String,
     pub folder: String,
@@ -268,14 +488,30 @@ pub struct SyncItemRecord {
     pub error: Option<String>,
 }
 
+/// An album deleted on one device but changed on another since, so it's
+/// not clear which was meant (see the module's description).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AlbumConflict {
+    pub album: Id,
+    pub name: String,
+    /// The devices it was deleted on, and changed on since.
+    pub deleted_on: String,
+    pub changed_on: String,
+    /// Photos added to it since it was deleted.
+    pub photos_added: usize,
+}
+
 pub struct Catalog {
     connection: Mutex<Connection>,
     _database: Database,
+    /// This device, which changes are recorded as made on.
+    device: Id,
 }
 
 impl Catalog {
-    /// Opens the catalog at `path`, creating it if needed.
-    pub fn open(path: &Path) -> Result<Self> {
+    /// Opens the catalog at `path`, creating it if needed, to change on
+    /// `device`.
+    pub fn open(path: &Path, device: &Device) -> Result<Self> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -284,9 +520,17 @@ impl Catalog {
             let database = turso::Builder::new_local(path_str).build().await?;
             let connection = database.connect()?;
             migrate(&connection).await?;
+            connection
+                .execute(
+                    "INSERT INTO devices (id, name, seen_at) VALUES (?1, ?2, ?3)
+                    ON CONFLICT (id) DO UPDATE SET name = excluded.name, seen_at = excluded.seen_at",
+                    turso::params![device.id, device.name.as_str(), super::now()],
+                )
+                .await?;
             Ok::<_, anyhow::Error>(Self {
                 connection: Mutex::new(connection),
                 _database: database,
+                device: device.id,
             })
         })
         .with_context(|| format!("opening catalog {}", path.display()))
@@ -301,22 +545,27 @@ impl Catalog {
         self.query_photos(
             &format!(
                 "SELECT {PHOTO_COLUMNS} FROM photos
+                WHERE photos.deleted_at IS NULL
                 ORDER BY coalesce(photos.captured_at, photos.modified_at), photos.path"
             ),
             (),
         )
     }
 
-    /// The photos in an album (not the albums in it), oldest first.
-    pub fn album_photos(&self, album: i64) -> Result<Vec<PhotoRecord>> {
+    /// The photos in any of `albums` (not the albums in them), each once,
+    /// oldest first.
+    pub fn album_photos(&self, albums: &[Id]) -> Result<Vec<PhotoRecord>> {
+        let ids = id::sql_list(albums);
         self.query_photos(
             &format!(
                 "SELECT {PHOTO_COLUMNS} FROM photos
-                JOIN album_photos ON album_photos.photo_id = photos.id
-                WHERE album_photos.album_id = ?1
+                WHERE photos.deleted_at IS NULL AND photos.id IN
+                    (SELECT album_photos.photo_id FROM album_photos
+                    JOIN albums ON albums.id = album_photos.album_id
+                    WHERE album_photos.album_id IN ({ids}) AND albums.deleted_at IS NULL)
                 ORDER BY coalesce(photos.captured_at, photos.modified_at), photos.path"
             ),
-            turso::params![album],
+            (),
         )
     }
 
@@ -332,7 +581,7 @@ impl Catalog {
         })
     }
 
-    /// Every album, by name.
+    /// Every album, by name (not those deleted).
     pub fn albums(&self) -> Result<Vec<Album>> {
         let connection = self.connection();
         block_on(async {
@@ -340,8 +589,10 @@ impl Catalog {
                 .query(
                     "SELECT albums.id, albums.parent_id, albums.name,
                         (SELECT count(*) FROM album_photos
-                            WHERE album_photos.album_id = albums.id)
+                            WHERE album_photos.album_id = albums.id),
+                        albums.show_nested
                     FROM albums
+                    WHERE albums.deleted_at IS NULL
                     ORDER BY albums.name COLLATE NOCASE, albums.id",
                     (),
                 )
@@ -349,13 +600,11 @@ impl Catalog {
             let mut albums = Vec::new();
             while let Some(row) = rows.next().await? {
                 albums.push(Album {
-                    id: row.get(0)?,
-                    parent: match row.get_value(1)? {
-                        Value::Integer(parent) => Some(parent),
-                        _ => None,
-                    },
+                    id: Id::from_value(row.get_value(0)?)?,
+                    parent: Id::optional(row.get_value(1)?)?,
                     name: row.get(2)?,
                     photos: row.get::<i64>(3)? as usize,
+                    show_nested: row.get::<i64>(4)? != 0,
                 });
             }
             Ok(albums)
@@ -363,69 +612,315 @@ impl Catalog {
     }
 
     /// Makes an album, in `parent` if given, returning its id.
-    pub fn create_album(&self, name: &str, parent: Option<i64>) -> Result<i64> {
+    pub fn create_album(&self, name: &str, parent: Option<Id>) -> Result<Id> {
         let connection = self.connection();
         block_on(async {
-            if let Some(parent) = parent {
-                let mut rows = connection
-                    .query("SELECT 1 FROM albums WHERE id = ?1", turso::params![parent])
-                    .await?;
-                if rows.next().await?.is_none() {
-                    bail!("there's no album {parent} to put it in");
-                }
+            if let Some(parent) = parent
+                && !album_exists(&connection, parent).await?
+            {
+                bail!("there's no album {parent} to put it in");
             }
+            let id = Id::new();
             connection
                 .execute(
-                    "INSERT INTO albums (parent_id, name, created_at) VALUES (?1, ?2, ?3)",
-                    turso::params![parent, name, super::now()],
+                    "INSERT INTO albums (id, parent_id, name, created_at, version, changed_by)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    turso::params![id, parent, name, super::now(), Id::new(), self.device],
                 )
                 .await?;
-            Ok(connection.last_insert_rowid())
+            // What's in the parent has changed.
+            self.changed_albums(&connection, parent.as_slice()).await?;
+            Ok(id)
         })
     }
 
-    pub fn rename_album(&self, album: i64, name: &str) -> Result<()> {
+    pub fn rename_album(&self, album: Id, name: &str) -> Result<()> {
+        let connection = self.connection();
+        block_on(async {
+            connection
+                .execute(
+                    "UPDATE albums SET name = ?2 WHERE id = ?1",
+                    turso::params![album, name],
+                )
+                .await?;
+            self.changed_albums(&connection, &[album]).await
+        })
+    }
+
+    /// Puts an album in `parent`, or at the top level. The caller checks
+    /// it isn't being put in itself.
+    pub fn move_album(&self, album: Id, parent: Option<Id>) -> Result<()> {
+        let connection = self.connection();
+        block_on(async {
+            let mut rows = connection
+                .query(
+                    "SELECT parent_id FROM albums WHERE id = ?1",
+                    turso::params![album],
+                )
+                .await?;
+            let old_parent = match rows.next().await? {
+                Some(row) => Id::optional(row.get_value(0)?)?,
+                None => bail!("the album isn't there any more"),
+            };
+            drop(rows);
+            connection
+                .execute(
+                    "UPDATE albums SET parent_id = ?2 WHERE id = ?1",
+                    turso::params![album, parent],
+                )
+                .await?;
+            // It's changed, and so has what's in the albums it left and
+            // joined.
+            let changed: Vec<Id> = [Some(album), old_parent, parent]
+                .into_iter()
+                .flatten()
+                .collect();
+            self.changed_albums(&connection, &changed).await
+        })
+    }
+
+    pub fn set_album_show_nested(&self, album: Id, show: bool) -> Result<()> {
+        let connection = self.connection();
+        block_on(async {
+            connection
+                .execute(
+                    "UPDATE albums SET show_nested = ?2 WHERE id = ?1",
+                    turso::params![album, show as i64],
+                )
+                .await?;
+            self.changed_albums(&connection, &[album]).await
+        })
+    }
+
+    /// Every photo, by its displayed file, in each album.
+    pub fn album_memberships(&self) -> Result<Vec<(Id, String)>> {
+        let connection = self.connection();
+        block_on(async {
+            let mut rows = connection
+                .query(
+                    "SELECT album_photos.album_id, photos.path FROM album_photos
+                    JOIN photos ON photos.id = album_photos.photo_id
+                    JOIN albums ON albums.id = album_photos.album_id
+                    WHERE albums.deleted_at IS NULL
+                    ORDER BY album_photos.album_id, album_photos.added_at, album_photos.photo_id",
+                    (),
+                )
+                .await?;
+            let mut memberships = Vec::new();
+            while let Some(row) = rows.next().await? {
+                memberships.push((Id::from_value(row.get_value(0)?)?, row.get(1)?));
+            }
+            Ok(memberships)
+        })
+    }
+
+    /// Deletes albums, given with every album in them. Their photos stay in
+    /// the library. They're marked deleted rather than removed, keeping
+    /// what was in them, in case another device has changed them since (see
+    /// `album_conflicts`); `purge_deleted_albums` removes them later.
+    pub fn delete_albums(&self, albums: &[Id]) -> Result<()> {
+        if albums.is_empty() {
+            return Ok(());
+        }
+        let ids = id::sql_list(albums);
         let connection = self.connection();
         block_on(connection.execute(
-            "UPDATE albums SET name = ?2 WHERE id = ?1",
-            turso::params![album, name],
+            &format!(
+                "UPDATE albums SET deleted_at = ?1, deleted_by = ?2, deleted_seen = version
+                WHERE id IN ({ids}) AND deleted_at IS NULL"
+            ),
+            turso::params![super::now(), self.device],
         ))?;
         Ok(())
     }
 
-    /// Deletes albums, given with every album in them. Their photos stay in
-    /// the library.
-    pub fn delete_albums(&self, albums: &[i64]) -> Result<()> {
-        if albums.is_empty() {
-            return Ok(());
-        }
-        let ids = albums
-            .iter()
-            .map(i64::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
+    /// Albums deleted on one device but changed on another since, by name.
+    pub fn album_conflicts(&self) -> Result<Vec<AlbumConflict>> {
         let connection = self.connection();
-        block_on(connection.execute_batch(&format!(
-            "BEGIN;
-            DELETE FROM album_photos WHERE album_id IN ({ids});
-            DELETE FROM albums WHERE id IN ({ids});
-            COMMIT;"
-        )))?;
+        block_on(async {
+            let mut rows = connection
+                .query(
+                    "SELECT albums.id, albums.name, deleted.name, changed.name,
+                        (SELECT count(*) FROM album_photos
+                            WHERE album_photos.album_id = albums.id
+                            AND album_photos.added_at >= albums.deleted_at)
+                    FROM albums
+                    LEFT JOIN devices AS deleted ON deleted.id = albums.deleted_by
+                    LEFT JOIN devices AS changed ON changed.id = albums.changed_by
+                    WHERE albums.deleted_at IS NOT NULL
+                        AND albums.deleted_seen IS NOT albums.version
+                    ORDER BY albums.name COLLATE NOCASE, albums.id",
+                    (),
+                )
+                .await?;
+            let device = |name: Option<String>| name.unwrap_or_else(|| "another device".into());
+            let mut conflicts = Vec::new();
+            while let Some(row) = rows.next().await? {
+                conflicts.push(AlbumConflict {
+                    album: Id::from_value(row.get_value(0)?)?,
+                    name: row.get(1)?,
+                    deleted_on: device(optional_text(&row, 2)?),
+                    changed_on: device(optional_text(&row, 3)?),
+                    photos_added: row.get::<i64>(4)? as usize,
+                });
+            }
+            Ok(conflicts)
+        })
+    }
+
+    /// Settles a conflict: keeping the album undeletes it, the albums it's
+    /// in, and the albums in it deleted along with it; otherwise it stays
+    /// deleted, as the deleting device saw it.
+    pub fn resolve_album_conflict(&self, album: Id, keep: bool) -> Result<()> {
+        let connection = self.connection();
+        block_on(async {
+            if !keep {
+                connection
+                    .execute(
+                        "UPDATE albums SET deleted_seen = version WHERE id = ?1",
+                        turso::params![album],
+                    )
+                    .await?;
+                return Ok(());
+            }
+            // Every album, deleted or not: id, parent, and its deletion.
+            let mut rows = connection
+                .query(
+                    "SELECT id, parent_id, deleted_at, deleted_by FROM albums",
+                    (),
+                )
+                .await?;
+            let mut albums = HashMap::new();
+            while let Some(row) = rows.next().await? {
+                let deletion = match row.get_value(2)? {
+                    Value::Real(at) => Some((at, Id::optional(row.get_value(3)?)?)),
+                    _ => None,
+                };
+                albums.insert(
+                    Id::from_value(row.get_value(0)?)?,
+                    (Id::optional(row.get_value(1)?)?, deletion),
+                );
+            }
+            drop(rows);
+            let Some((_, Some(deletion))) = albums.get(&album).copied() else {
+                return Ok(());
+            };
+            let mut restore = vec![album];
+            // The albums it's in.
+            let mut next = albums[&album].0;
+            while let Some(parent) = next
+                && let Some((grandparent, parent_deletion)) = albums.get(&parent)
+                && !restore.contains(&parent)
+            {
+                if parent_deletion.is_some() {
+                    restore.push(parent);
+                }
+                next = *grandparent;
+            }
+            // Those in it that went with it.
+            let mut ix = 0;
+            let mut nested = vec![album];
+            while let Some(&parent) = nested.get(ix) {
+                for (id, (album_parent, album_deletion)) in &albums {
+                    if *album_parent == Some(parent) && !nested.contains(id) {
+                        nested.push(*id);
+                        if *album_deletion == Some(deletion) {
+                            restore.push(*id);
+                        }
+                    }
+                }
+                ix += 1;
+            }
+            let ids = id::sql_list(&restore);
+            connection
+                .execute(
+                    &format!(
+                        "UPDATE albums SET deleted_at = NULL, deleted_by = NULL,
+                            deleted_seen = NULL
+                        WHERE id IN ({ids})"
+                    ),
+                    (),
+                )
+                .await?;
+            self.changed_albums(&connection, &restore).await
+        })
+    }
+
+    /// Removes albums deleted before `before` (seconds since the Unix epoch)
+    /// that aren't in conflict, and what was in them, and the record of
+    /// photos in albums that are gone.
+    pub fn purge_deleted_albums(&self, before: f64) -> Result<()> {
+        let connection = self.connection();
+        block_on(async {
+            connection
+                .execute(
+                    "DELETE FROM album_photos WHERE album_id IN
+                        (SELECT id FROM albums WHERE deleted_at < ?1
+                            AND deleted_seen IS version)",
+                    turso::params![before],
+                )
+                .await?;
+            connection
+                .execute(
+                    "DELETE FROM albums WHERE deleted_at < ?1 AND deleted_seen IS version",
+                    turso::params![before],
+                )
+                .await?;
+            connection
+                .execute(
+                    "DELETE FROM album_photos WHERE album_id NOT IN (SELECT id FROM albums)",
+                    (),
+                )
+                .await?;
+            Ok(())
+        })
+    }
+
+    /// Changes an album as if on `device`, called `name`, and synced here:
+    /// only the columns the change made.
+    #[cfg(test)]
+    pub fn change_album_elsewhere(&self, album: Id, device: Id, name: &str) {
+        let connection = self.connection();
+        block_on(async {
+            connection
+                .execute(
+                    "INSERT INTO devices (id, name, seen_at) VALUES (?1, ?2, 0)
+                    ON CONFLICT (id) DO NOTHING",
+                    turso::params![device, name],
+                )
+                .await?;
+            connection
+                .execute(
+                    "UPDATE albums SET version = ?2, changed_by = ?3 WHERE id = ?1",
+                    turso::params![album, Id::new(), device],
+                )
+                .await
+        })
+        .unwrap();
+    }
+
+    /// Records that albums have changed here: what's in them, or anything
+    /// about them.
+    async fn changed_albums(&self, connection: &Connection, albums: &[Id]) -> Result<()> {
+        for album in albums {
+            connection
+                .execute(
+                    "UPDATE albums SET version = ?2, changed_by = ?3 WHERE id = ?1",
+                    turso::params![*album, Id::new(), self.device],
+                )
+                .await?;
+        }
         Ok(())
     }
 
     /// Adds photos, by their displayed files, to an album, returning how
     /// many weren't in it already.
-    pub fn add_paths_to_album(&self, album: i64, paths: &[String]) -> Result<usize> {
+    pub fn add_paths_to_album(&self, album: Id, paths: &[String]) -> Result<usize> {
         let connection = self.connection();
         block_on(async {
-            let mut rows = connection
-                .query("SELECT 1 FROM albums WHERE id = ?1", turso::params![album])
-                .await?;
-            if rows.next().await?.is_none() {
+            if !album_exists(&connection, album).await? {
                 bail!("the album isn't there any more");
             }
-            drop(rows);
             let mut added = 0;
             for path in paths {
                 let mut rows = connection
@@ -434,54 +929,68 @@ impl Catalog {
                         turso::params![path.as_str()],
                     )
                     .await?;
-                let photo: i64 = match rows.next().await? {
-                    Some(row) => row.get(0)?,
+                let photo = match rows.next().await? {
+                    Some(row) => Id::from_value(row.get_value(0)?)?,
                     None => bail!("{path} isn't in the catalog"),
                 };
                 drop(rows);
-                if insert_album_photo(&connection, album, photo).await? {
+                if self.insert_album_photo(&connection, album, photo).await? {
                     added += 1;
                 }
+            }
+            if added > 0 {
+                self.changed_albums(&connection, &[album]).await?;
             }
             Ok(added)
         })
     }
 
-    /// Takes photos, by their displayed files, out of an album (not out of
-    /// the library), returning how many were in it.
-    pub fn remove_paths_from_album(&self, album: i64, paths: &[String]) -> Result<usize> {
+    /// Takes photos, by their displayed files, out of albums (not out of
+    /// the library), returning how many were in any of them.
+    pub fn remove_paths_from_albums(&self, albums: &[Id], paths: &[String]) -> Result<usize> {
         let connection = self.connection();
         block_on(async {
-            let mut removed = 0;
-            for path in paths {
-                removed += connection
-                    .execute(
-                        "DELETE FROM album_photos WHERE album_id = ?1
-                            AND photo_id IN (SELECT id FROM photos WHERE path = ?2)",
-                        turso::params![album, path.as_str()],
-                    )
-                    .await? as usize;
+            let mut removed = HashSet::new();
+            let mut changed = Vec::new();
+            for &album in albums {
+                for path in paths {
+                    let deleted = connection
+                        .execute(
+                            "DELETE FROM album_photos WHERE album_id = ?1
+                                AND photo_id IN (SELECT id FROM photos WHERE path = ?2)",
+                            turso::params![album, path.as_str()],
+                        )
+                        .await?;
+                    if deleted > 0 {
+                        removed.insert(path);
+                        if !changed.contains(&album) {
+                            changed.push(album);
+                        }
+                    }
+                }
             }
-            Ok(removed)
+            self.changed_albums(&connection, &changed).await?;
+            Ok(removed.len())
         })
     }
 
-    /// The albums a photo, by its displayed file, is in.
-    pub fn albums_with(&self, path: &str) -> Result<Vec<i64>> {
+    /// The albums a photo, by its displayed file, is in, oldest first.
+    pub fn albums_with(&self, path: &str) -> Result<Vec<Id>> {
         let connection = self.connection();
         block_on(async {
             let mut rows = connection
                 .query(
                     "SELECT album_photos.album_id FROM album_photos
                     JOIN photos ON photos.id = album_photos.photo_id
-                    WHERE photos.path = ?1
+                    JOIN albums ON albums.id = album_photos.album_id
+                    WHERE photos.path = ?1 AND albums.deleted_at IS NULL
                     ORDER BY album_photos.album_id",
                     turso::params![path],
                 )
                 .await?;
             let mut albums = Vec::new();
             while let Some(row) = rows.next().await? {
-                albums.push(row.get(0)?);
+                albums.push(Id::from_value(row.get_value(0)?)?);
             }
             Ok(albums)
         })
@@ -489,7 +998,7 @@ impl Catalog {
 
     /// Adds the photo whose displayed file has this content to an album,
     /// unless it's there already. Returns whether there was such a photo.
-    pub fn add_to_album(&self, album: i64, content_hash: &str, file_size: u64) -> Result<bool> {
+    pub fn add_to_album(&self, album: Id, content_hash: &str, file_size: u64) -> Result<bool> {
         let connection = self.connection();
         block_on(async {
             let mut rows = connection
@@ -498,21 +1007,53 @@ impl Catalog {
                     turso::params![content_hash, file_size as i64],
                 )
                 .await?;
-            let photo: i64 = match rows.next().await? {
-                Some(row) => row.get(0)?,
+            let photo = match rows.next().await? {
+                Some(row) => Id::from_value(row.get_value(0)?)?,
                 None => return Ok(false),
             };
             drop(rows);
-            insert_album_photo(&connection, album, photo).await?;
+            if self.insert_album_photo(&connection, album, photo).await? {
+                self.changed_albums(&connection, &[album]).await?;
+            }
             Ok(true)
         })
+    }
+
+    /// Puts a photo in an album, unless it's there already. Returns whether
+    /// it wasn't.
+    async fn insert_album_photo(
+        &self,
+        connection: &Connection,
+        album: Id,
+        photo: Id,
+    ) -> Result<bool> {
+        let mut rows = connection
+            .query(
+                "SELECT 1 FROM album_photos WHERE album_id = ?1 AND photo_id = ?2",
+                turso::params![album, photo],
+            )
+            .await?;
+        if rows.next().await?.is_some() {
+            return Ok(false);
+        }
+        drop(rows);
+        connection
+            .execute(
+                "INSERT INTO album_photos (album_id, photo_id, added_at, added_by)
+                VALUES (?1, ?2, ?3, ?4)",
+                turso::params![album, photo, super::now(), self.device],
+            )
+            .await?;
+        Ok(true)
     }
 
     /// How many photos there are (counting a raw pair or Live Photo as one).
     pub fn photo_count(&self) -> Result<usize> {
         let connection = self.connection();
         block_on(async {
-            let mut rows = connection.query("SELECT count(*) FROM photos", ()).await?;
+            let mut rows = connection
+                .query("SELECT count(*) FROM photos WHERE deleted_at IS NULL", ())
+                .await?;
             let row = rows.next().await?.context("no count")?;
             Ok(row.get::<i64>(0)? as usize)
         })
@@ -541,9 +1082,9 @@ impl Catalog {
                 original_path, imported_at, width, height, captured_at,
                 modified_at, camera, exposure_time, f_number, iso,
                 exposure_bias, auto_bracket, manual_exposure, latitude,
-                longitude
+                longitude, id, version, changed_by
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
             turso::params![
                 record.path.as_str(),
                 record.raw_path.as_deref(),
@@ -565,6 +1106,9 @@ impl Catalog {
                 meta.manual_exposure as i64,
                 record.location.map(|l| l.latitude),
                 record.location.map(|l| l.longitude),
+                Id::new(),
+                Id::new(),
+                self.device,
             ],
         ))?;
         Ok(())
@@ -579,12 +1123,12 @@ impl Catalog {
     /// Each photo's files, in the order they were taken: its originals
     /// (displayed, raw and video), then its derivatives.
     pub fn photo_files(&self) -> Result<Vec<Vec<LibraryFile>>> {
-        let mut derivatives: HashMap<i64, Vec<LibraryFile>> = HashMap::new();
+        let mut derivatives: HashMap<Id, Vec<LibraryFile>> = HashMap::new();
         let connection = self.connection();
         block_on(async {
             let mut rows = connection
                 .query(
-                    "SELECT photo_id, kind, path FROM derivatives ORDER BY id",
+                    "SELECT photo_id, kind, path FROM derivatives ORDER BY created_at, kind",
                     (),
                 )
                 .await?;
@@ -595,7 +1139,7 @@ impl Catalog {
                     continue;
                 };
                 derivatives
-                    .entry(row.get(0)?)
+                    .entry(Id::from_value(row.get_value(0)?)?)
                     .or_default()
                     .push(LibraryFile {
                         path: row.get(2)?,
@@ -605,6 +1149,7 @@ impl Catalog {
             let mut rows = connection
                 .query(
                     "SELECT id, path, raw_path, live_video_path FROM photos
+                    WHERE deleted_at IS NULL
                     ORDER BY coalesce(captured_at, modified_at), path",
                     (),
                 )
@@ -620,7 +1165,8 @@ impl Catalog {
                         });
                     }
                 }
-                files.extend(derivatives.remove(&row.get::<i64>(0)?).unwrap_or_default());
+                let id = Id::from_value(row.get_value(0)?)?;
+                files.extend(derivatives.remove(&id).unwrap_or_default());
                 photos.push(files);
             }
             Ok(photos)
@@ -672,8 +1218,8 @@ impl Catalog {
                     turso::params![record.photo_path.as_str()],
                 )
                 .await?;
-            let photo_id: i64 = match rows.next().await? {
-                Some(row) => row.get(0)?,
+            let photo_id = match rows.next().await? {
+                Some(row) => Id::from_value(row.get_value(0)?)?,
                 None => bail!("{} isn't in the catalog", record.photo_path),
             };
             drop(rows);
@@ -722,16 +1268,16 @@ impl Catalog {
         })
     }
 
-    /// The photos that `model` has looked at for objects.
-    pub fn object_scans(&self, model: &str) -> Result<HashSet<String>> {
+    /// The photos that `detector` has looked at for objects.
+    pub fn object_scans(&self, detector: &str) -> Result<HashSet<String>> {
         let connection = self.connection();
         block_on(async {
             let mut rows = connection
                 .query(
-                    "SELECT photos.path FROM object_scans
-                    JOIN photos ON photos.id = object_scans.photo_id
-                    WHERE object_scans.model = ?1",
-                    turso::params![model],
+                    "SELECT photos.path FROM detector_scans
+                    JOIN photos ON photos.id = detector_scans.photo_id
+                    WHERE detector_scans.detector = ?1",
+                    turso::params![detector],
                 )
                 .await?;
             let mut paths = HashSet::new();
@@ -742,61 +1288,60 @@ impl Catalog {
         })
     }
 
-    /// The objects `model` found in a photo, most certain first. None if it
-    /// hasn't looked at the photo.
-    pub fn objects(&self, photo_path: &str, model: &str) -> Result<Option<Vec<DetectedObject>>> {
+    /// The objects `detector` found in a photo, most certain first. None if
+    /// it hasn't looked at the photo.
+    pub fn objects(&self, photo_path: &str, detector: &str) -> Result<Option<Vec<DetectedObject>>> {
         let connection = self.connection();
         block_on(async {
             let mut rows = connection
                 .query(
-                    "SELECT object_scans.model FROM object_scans
-                    JOIN photos ON photos.id = object_scans.photo_id
-                    WHERE photos.path = ?1",
-                    turso::params![photo_path],
+                    "SELECT 1 FROM detector_scans
+                    JOIN photos ON photos.id = detector_scans.photo_id
+                    WHERE photos.path = ?1 AND detector_scans.detector = ?2",
+                    turso::params![photo_path, detector],
                 )
                 .await?;
-            match rows.next().await? {
-                Some(row) if row.get::<String>(0)? == model => {}
-                _ => return Ok(None),
+            if rows.next().await?.is_none() {
+                return Ok(None);
             }
             drop(rows);
             let mut rows = connection
                 .query(
                     "SELECT objects.label, objects.confidence, objects.x1, objects.y1,
-                        objects.x2, objects.y2
+                        objects.x2, objects.y2, objects.boxed
                     FROM objects JOIN photos ON photos.id = objects.photo_id
-                    WHERE photos.path = ?1
+                    WHERE photos.path = ?1 AND objects.detector = ?2
                     ORDER BY objects.confidence DESC",
-                    turso::params![photo_path],
+                    turso::params![photo_path, detector],
                 )
                 .await?;
             let mut objects = Vec::new();
             while let Some(row) = rows.next().await? {
                 let real = |ix| row.get::<f64>(ix).map(|value| value as f32);
+                let bounds = [real(2)?, real(3)?, real(4)?, real(5)?];
                 objects.push(DetectedObject {
                     label: row.get(0)?,
                     confidence: real(1)?,
-                    bounds: [real(2)?, real(3)?, real(4)?, real(5)?],
+                    bounds: (row.get::<i64>(6)? != 0).then_some(bounds),
                 });
             }
             Ok(Some(objects))
         })
     }
 
-    /// Every kind of object `model` has found in the library, those in the
-    /// most photos first.
-    pub fn object_kinds(&self, model: &str) -> Result<Vec<ObjectKind>> {
+    /// Every kind of object `detector` has found in the library, those in
+    /// the most photos first.
+    pub fn object_kinds(&self, detector: &str) -> Result<Vec<ObjectKind>> {
         let connection = self.connection();
         block_on(async {
             let mut rows = connection
                 .query(
                     "SELECT objects.label, count(DISTINCT objects.photo_id) AS photos
                     FROM objects
-                    JOIN object_scans ON object_scans.photo_id = objects.photo_id
-                    WHERE object_scans.model = ?1
+                    WHERE objects.detector = ?1
                     GROUP BY objects.label
                     ORDER BY photos DESC, objects.label",
-                    turso::params![model],
+                    turso::params![detector],
                 )
                 .await?;
             let mut kinds = Vec::new();
@@ -810,8 +1355,12 @@ impl Catalog {
         })
     }
 
-    /// The photos in which `model` found an object with one of `labels`.
-    pub fn photos_with_objects(&self, labels: &[String], model: &str) -> Result<HashSet<String>> {
+    /// The photos in which `detector` found an object with one of `labels`.
+    pub fn photos_with_objects(
+        &self,
+        labels: &[String],
+        detector: &str,
+    ) -> Result<HashSet<String>> {
         let connection = self.connection();
         block_on(async {
             let mut paths = HashSet::new();
@@ -820,9 +1369,8 @@ impl Catalog {
                     .query(
                         "SELECT DISTINCT photos.path FROM objects
                         JOIN photos ON photos.id = objects.photo_id
-                        JOIN object_scans ON object_scans.photo_id = objects.photo_id
-                        WHERE objects.label = ?1 AND object_scans.model = ?2",
-                        turso::params![label.as_str(), model],
+                        WHERE objects.label = ?1 AND objects.detector = ?2",
+                        turso::params![label.as_str(), detector],
                     )
                     .await?;
                 while let Some(row) = rows.next().await? {
@@ -833,12 +1381,12 @@ impl Catalog {
         })
     }
 
-    /// Records the objects `model` found in a photo (perhaps none),
-    /// replacing what was found before.
+    /// Records the objects `detector` found in a photo (perhaps none),
+    /// replacing what it found before.
     pub fn set_objects(
         &self,
         photo_path: &str,
-        model: &str,
+        detector: &str,
         objects: &[DetectedObject],
     ) -> Result<()> {
         let connection = self.connection();
@@ -849,8 +1397,8 @@ impl Catalog {
                     turso::params![photo_path],
                 )
                 .await?;
-            let photo_id: i64 = match rows.next().await? {
-                Some(row) => row.get(0)?,
+            let photo_id = match rows.next().await? {
+                Some(row) => Id::from_value(row.get_value(0)?)?,
                 None => bail!("{photo_path} isn't in the catalog"),
             };
             drop(rows);
@@ -858,37 +1406,41 @@ impl Catalog {
             let result = async {
                 connection
                     .execute(
-                        "DELETE FROM objects WHERE photo_id = ?1",
-                        turso::params![photo_id],
+                        "DELETE FROM objects WHERE photo_id = ?1 AND detector = ?2",
+                        turso::params![photo_id, detector],
                     )
                     .await?;
                 connection
                     .execute(
-                        "DELETE FROM object_scans WHERE photo_id = ?1",
-                        turso::params![photo_id],
+                        "DELETE FROM detector_scans WHERE photo_id = ?1 AND detector = ?2",
+                        turso::params![photo_id, detector],
                     )
                     .await?;
                 connection
                     .execute(
-                        "INSERT INTO object_scans (photo_id, model, scanned_at)
+                        "INSERT INTO detector_scans (photo_id, detector, scanned_at)
                         VALUES (?1, ?2, ?3)",
-                        turso::params![photo_id, model, super::now()],
+                        turso::params![photo_id, detector, super::now()],
                     )
                     .await?;
-                for object in objects {
-                    let [x1, y1, x2, y2] = object.bounds.map(f64::from);
+                for (ix, object) in objects.iter().enumerate() {
+                    let [x1, y1, x2, y2] = object.bounds.unwrap_or_default().map(f64::from);
                     connection
                         .execute(
-                            "INSERT INTO objects (photo_id, label, confidence, x1, y1, x2, y2)
-                            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                            "INSERT INTO objects
+                                (photo_id, detector, ix, label, confidence, x1, y1, x2, y2, boxed)
+                            VALUES (?1, ?2, ?10, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                             turso::params![
                                 photo_id,
+                                detector,
                                 object.label.as_str(),
                                 f64::from(object.confidence),
                                 x1,
                                 y1,
                                 x2,
                                 y2,
+                                object.bounds.is_some() as i64,
+                                ix as i64,
                             ],
                         )
                         .await?;
@@ -919,7 +1471,7 @@ impl Catalog {
             let mut targets = Vec::new();
             while let Some(row) = rows.next().await? {
                 targets.push(SyncTargetRecord {
-                    id: row.get(0)?,
+                    id: Id::from_value(row.get_value(0)?)?,
                     target: row.get(1)?,
                     folder: row.get(2)?,
                     error: optional_text(&row, 3)?,
@@ -930,16 +1482,17 @@ impl Catalog {
     }
 
     /// Adds a target, returning the catalog's id for it.
-    pub fn add_sync_target(&self, target: &str, folder: &str) -> Result<i64> {
+    pub fn add_sync_target(&self, target: &str, folder: &str) -> Result<Id> {
         let connection = self.connection();
+        let id = Id::new();
         block_on(connection.execute(
-            "INSERT INTO sync_targets (target, folder, created_at) VALUES (?1, ?2, ?3)",
-            turso::params![target, folder, super::now()],
+            "INSERT INTO sync_targets (id, target, folder, created_at) VALUES (?1, ?2, ?3, ?4)",
+            turso::params![id, target, folder, super::now()],
         ))?;
-        Ok(connection.last_insert_rowid())
+        Ok(id)
     }
 
-    pub fn set_sync_target_error(&self, id: i64, error: Option<&str>) -> Result<()> {
+    pub fn set_sync_target_error(&self, id: Id, error: Option<&str>) -> Result<()> {
         let connection = self.connection();
         block_on(connection.execute(
             "UPDATE sync_targets SET error = ?2 WHERE id = ?1",
@@ -949,7 +1502,8 @@ impl Catalog {
     }
 
     /// Removes a target, and the record of what was synced to it.
-    pub fn remove_sync_target(&self, id: i64) -> Result<()> {
+    pub fn remove_sync_target(&self, id: Id) -> Result<()> {
+        let id = id.sql();
         let connection = self.connection();
         block_on(connection.execute_batch(&format!(
             "BEGIN;
@@ -961,13 +1515,13 @@ impl Catalog {
     }
 
     /// The library's files' syncs to a target.
-    pub fn sync_items(&self, target_id: i64) -> Result<Vec<SyncItemRecord>> {
+    pub fn sync_items(&self, target_id: Id) -> Result<Vec<SyncItemRecord>> {
         let connection = self.connection();
         block_on(async {
             let mut rows = connection
                 .query(
                     "SELECT path, state, remote_key, remote_version, size, attempts, error
-                    FROM sync_items WHERE target_id = ?1 AND path IS NOT NULL",
+                    FROM sync_items WHERE target_id = ?1",
                     turso::params![target_id],
                 )
                 .await?;
@@ -994,7 +1548,7 @@ impl Catalog {
 
     /// Records an attempt to sync a file. Failed attempts are counted;
     /// success resets the count.
-    pub fn record_sync(&self, target_id: i64, item: &SyncItemRecord) -> Result<()> {
+    pub fn record_sync(&self, target_id: Id, item: &SyncItemRecord) -> Result<()> {
         let connection = self.connection();
         let now = super::now();
         let synced_at = (item.state == SyncState::Synced).then_some(now);
@@ -1045,26 +1599,15 @@ impl Catalog {
     }
 }
 
-/// Puts a photo in an album, unless it's there already. Returns whether it
-/// wasn't.
-async fn insert_album_photo(connection: &Connection, album: i64, photo: i64) -> Result<bool> {
+/// Whether there's an album `album`, not deleted.
+async fn album_exists(connection: &Connection, album: Id) -> Result<bool> {
     let mut rows = connection
         .query(
-            "SELECT 1 FROM album_photos WHERE album_id = ?1 AND photo_id = ?2",
-            turso::params![album, photo],
+            "SELECT 1 FROM albums WHERE id = ?1 AND deleted_at IS NULL",
+            turso::params![album],
         )
         .await?;
-    if rows.next().await?.is_some() {
-        return Ok(false);
-    }
-    drop(rows);
-    connection
-        .execute(
-            "INSERT INTO album_photos (album_id, photo_id, added_at) VALUES (?1, ?2, ?3)",
-            turso::params![album, photo, super::now()],
-        )
-        .await?;
-    Ok(true)
+    Ok(rows.next().await?.is_some())
 }
 
 fn optional_text(row: &Row, ix: usize) -> Result<Option<String>> {
@@ -1084,12 +1627,22 @@ async fn migrate(connection: &Connection) -> Result<()> {
     if version > SCHEMA_VERSION {
         bail!("the catalog is from a newer version of 1k Words (schema {version})");
     }
+    if version == 0 {
+        connection
+            .execute_batch(&format!(
+                "BEGIN; {SCHEMA_V8} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"
+            ))
+            .await?;
+        return Ok(());
+    }
     for (to, schema) in [
         (1, SCHEMA_V1),
         (2, SCHEMA_V2),
         (3, SCHEMA_V3),
         (4, SCHEMA_V4),
         (5, SCHEMA_V5),
+        (6, SCHEMA_V6),
+        (7, SCHEMA_V7),
     ] {
         if version < to {
             connection
@@ -1099,6 +1652,138 @@ async fn migrate(connection: &Connection) -> Result<()> {
                 .await?;
         }
     }
+    if version < 8 {
+        connection.execute("BEGIN", ()).await?;
+        match convert_to_v8(connection).await {
+            Ok(()) => connection.execute("COMMIT", ()).await?,
+            Err(error) => {
+                connection.execute("ROLLBACK", ()).await.ok();
+                return Err(error.context("converting the catalog to schema 8"));
+            }
+        };
+    }
+    Ok(())
+}
+
+/// Converts a version 7 catalog to `SCHEMA_V8`, in the transaction under
+/// way. Rows get ids made from when they were made, so they keep their
+/// order; the old ids are mapped to them in a table of their own, which
+/// the copying joins.
+async fn convert_to_v8(connection: &Connection) -> Result<()> {
+    for index in V7_INDEXES {
+        connection
+            .execute(&format!("DROP INDEX IF EXISTS {index}"), ())
+            .await?;
+    }
+    for table in V7_TABLES {
+        connection
+            .execute(&format!("ALTER TABLE {table} RENAME TO v7_{table}"), ())
+            .await?;
+    }
+    connection.execute_batch(SCHEMA_V8).await?;
+    connection
+        .execute(
+            "CREATE TABLE v8_ids (
+                tbl TEXT NOT NULL,
+                old INTEGER NOT NULL,
+                new BLOB NOT NULL,
+                PRIMARY KEY (tbl, old)
+            )",
+            (),
+        )
+        .await?;
+    for (table, time) in [
+        ("photos", "imported_at"),
+        ("albums", "created_at"),
+        ("sync_targets", "created_at"),
+    ] {
+        let mut rows = connection
+            .query(&format!("SELECT id, {time} FROM v7_{table}"), ())
+            .await?;
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let at = match row.get_value(1)? {
+                Value::Real(at) => at,
+                Value::Integer(at) => at as f64,
+                _ => 0.0,
+            };
+            ids.push((row.get::<i64>(0)?, Id::at(at)));
+        }
+        drop(rows);
+        for (old, new) in ids {
+            connection
+                .execute(
+                    "INSERT INTO v8_ids (tbl, old, new) VALUES (?1, ?2, ?3)",
+                    turso::params![table, old, new],
+                )
+                .await?;
+        }
+    }
+    connection
+        .execute_batch(
+            "INSERT INTO photos (id, path, raw_path, live_video_path, content_hash, file_size,
+                original_path, imported_at, width, height, captured_at, modified_at, camera,
+                exposure_time, f_number, iso, exposure_bias, auto_bracket, manual_exposure,
+                latitude, longitude, version)
+            SELECT m.new, p.path, p.raw_path, p.live_video_path, p.content_hash, p.file_size,
+                p.original_path, p.imported_at, p.width, p.height, p.captured_at, p.modified_at,
+                p.camera, p.exposure_time, p.f_number, p.iso, p.exposure_bias, p.auto_bracket,
+                p.manual_exposure, p.latitude, p.longitude, m.new
+            FROM v7_photos AS p JOIN v8_ids AS m ON m.tbl = 'photos' AND m.old = p.id;
+
+            INSERT INTO albums (id, parent_id, name, created_at, show_nested, version)
+            SELECT m.new, parent.new, a.name, a.created_at, a.show_nested, m.new
+            FROM v7_albums AS a
+            JOIN v8_ids AS m ON m.tbl = 'albums' AND m.old = a.id
+            LEFT JOIN v8_ids AS parent ON parent.tbl = 'albums' AND parent.old = a.parent_id;
+
+            INSERT INTO album_photos (album_id, photo_id, added_at)
+            SELECT album.new, photo.new, ap.added_at
+            FROM v7_album_photos AS ap
+            JOIN v8_ids AS album ON album.tbl = 'albums' AND album.old = ap.album_id
+            JOIN v8_ids AS photo ON photo.tbl = 'photos' AND photo.old = ap.photo_id;
+
+            INSERT INTO derivatives (photo_id, kind, path, width, height, file_size, version,
+                created_at)
+            SELECT photo.new, d.kind, d.path, d.width, d.height, d.file_size, d.version,
+                d.created_at
+            FROM v7_derivatives AS d
+            JOIN v8_ids AS photo ON photo.tbl = 'photos' AND photo.old = d.photo_id;
+
+            INSERT INTO detector_scans (photo_id, detector, scanned_at)
+            SELECT photo.new, s.detector, s.scanned_at
+            FROM v7_detector_scans AS s
+            JOIN v8_ids AS photo ON photo.tbl = 'photos' AND photo.old = s.photo_id;
+
+            INSERT INTO objects (photo_id, detector, ix, label, confidence, x1, y1, x2, y2,
+                boxed)
+            SELECT photo.new, o.detector, o.id, o.label, o.confidence, o.x1, o.y1, o.x2, o.y2,
+                o.boxed
+            FROM v7_objects AS o
+            JOIN v8_ids AS photo ON photo.tbl = 'photos' AND photo.old = o.photo_id;
+
+            INSERT INTO sync_targets (id, target, folder, created_at, error)
+            SELECT m.new, t.target, t.folder, t.created_at, t.error
+            FROM v7_sync_targets AS t JOIN v8_ids AS m ON m.tbl = 'sync_targets' AND m.old = t.id;
+
+            INSERT INTO sync_items (target_id, path, state, remote_key, remote_version, size,
+                attempts, error, synced_at, updated_at)
+            SELECT target.new, i.path, i.state, i.remote_key, i.remote_version, i.size,
+                i.attempts, i.error, i.synced_at, i.updated_at
+            FROM v7_sync_items AS i
+            JOIN v8_ids AS target ON target.tbl = 'sync_targets' AND target.old = i.target_id
+            WHERE i.path IS NOT NULL;",
+        )
+        .await?;
+    for table in V7_TABLES {
+        connection
+            .execute(&format!("DROP TABLE v7_{table}"), ())
+            .await?;
+    }
+    connection.execute("DROP TABLE v8_ids", ()).await?;
+    connection
+        .execute(&format!("PRAGMA user_version = {SCHEMA_VERSION}"), ())
+        .await?;
     Ok(())
 }
 
@@ -1160,6 +1845,13 @@ fn record_from_row(row: &Row) -> Result<PhotoRecord> {
 mod tests {
     use super::*;
 
+    fn test_device() -> Device {
+        Device {
+            id: Id::from_u128(1),
+            name: "Test".into(),
+        }
+    }
+
     #[test]
     fn stores_and_reads_back_photos() {
         let path = std::env::temp_dir().join(format!("1k-words-catalog-{}.db", std::process::id()));
@@ -1203,7 +1895,7 @@ mod tests {
             ..Default::default()
         };
 
-        let catalog = Catalog::open(&path).unwrap();
+        let catalog = Catalog::open(&path, &test_device()).unwrap();
         catalog.insert(&record).unwrap();
         catalog.insert(&older).unwrap();
         // Paths are unique.
@@ -1214,7 +1906,7 @@ mod tests {
         drop(catalog);
 
         // Reopening keeps the photos, oldest first.
-        let catalog = Catalog::open(&path).unwrap();
+        let catalog = Catalog::open(&path, &test_device()).unwrap();
         let photos = catalog.photos().unwrap();
         assert_eq!(photos, [older, record.clone()]);
         let original = |path: &str| LibraryFile {
@@ -1298,7 +1990,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::remove_file(&path).ok();
-        let catalog = Catalog::open(&path).unwrap();
+        let catalog = Catalog::open(&path, &test_device()).unwrap();
         let photo = PhotoRecord {
             path: "Originals/2026/10/15/IMG_0001.JPG".into(),
             ..Default::default()
@@ -1310,12 +2002,12 @@ mod tests {
         let dog = DetectedObject {
             label: "dog".into(),
             confidence: 0.5,
-            bounds: [0.5, 0.5, 1.0, 0.75],
+            bounds: Some([0.5, 0.5, 1.0, 0.75]),
         };
         let person = DetectedObject {
             label: "person".into(),
             confidence: 0.875,
-            bounds: [0.0, 0.25, 0.5, 1.0],
+            bounds: Some([0.0, 0.25, 0.5, 1.0]),
         };
         catalog
             .set_objects(&photo.path, "model", &[dog.clone(), person.clone()])
@@ -1333,13 +2025,30 @@ mod tests {
         assert_eq!(catalog.objects(&photo.path, "newer").unwrap(), None);
         assert!(catalog.object_scans("newer").unwrap().is_empty());
 
-        // Looking again replaces what was found, even with nothing.
+        // Each model's findings are kept apart: another finding nothing
+        // leaves the first's. Some don't say where things are.
+        let cat = DetectedObject {
+            label: "cat".into(),
+            confidence: 0.75,
+            bounds: None,
+        };
+        catalog
+            .set_objects(&photo.path, "newer", &[cat.clone()])
+            .unwrap();
+        assert_eq!(
+            catalog.objects(&photo.path, "newer").unwrap(),
+            Some(vec![cat])
+        );
         catalog.set_objects(&photo.path, "newer", &[]).unwrap();
         assert_eq!(
             catalog.objects(&photo.path, "newer").unwrap(),
             Some(Vec::new())
         );
-        assert!(catalog.object_scans("model").unwrap().is_empty());
+        assert_eq!(
+            catalog.objects(&photo.path, "model").unwrap(),
+            Some(vec![person.clone(), dog.clone()])
+        );
+        assert_eq!(catalog.object_scans("model").unwrap().len(), 1);
         assert!(
             catalog
                 .set_objects("Originals/nope.jpg", "model", &[])
@@ -1392,7 +2101,7 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("1k-words-catalog-albums-{}.db", std::process::id()));
         std::fs::remove_file(&path).ok();
-        let catalog = Catalog::open(&path).unwrap();
+        let catalog = Catalog::open(&path, &test_device()).unwrap();
         let photo = |path: &str, hash: &str, captured_at| PhotoRecord {
             path: path.into(),
             content_hash: hash.into(),
@@ -1411,12 +2120,13 @@ mod tests {
         let trips = catalog.create_album("Trips", None).unwrap();
         let japan = catalog.create_album("Japan", Some(trips)).unwrap();
         let family = catalog.create_album("family", None).unwrap();
-        assert!(catalog.create_album("Lost", Some(999)).is_err());
+        assert!(catalog.create_album("Lost", Some(Id::new())).is_err());
         let album = |id, parent, name: &str, photos| Album {
             id,
             parent,
             name: name.into(),
             photos,
+            show_nested: false,
         };
 
         // Added by content, once each; oldest first.
@@ -1426,10 +2136,10 @@ mod tests {
         assert!(!catalog.add_to_album(japan, "nope", 10).unwrap());
         assert!(catalog.add_to_album(family, "a", 10).unwrap());
         assert_eq!(
-            catalog.album_photos(japan).unwrap(),
+            catalog.album_photos(&[japan]).unwrap(),
             [earlier.clone(), later.clone()]
         );
-        assert!(catalog.album_photos(trips).unwrap().is_empty());
+        assert!(catalog.album_photos(&[trips]).unwrap().is_empty());
         // By name, ignoring case.
         assert_eq!(
             catalog.albums().unwrap(),
@@ -1444,30 +2154,50 @@ mod tests {
         let paths = [earlier.path.clone(), later.path.clone()];
         assert_eq!(catalog.add_paths_to_album(family, &paths).unwrap(), 1);
         assert_eq!(catalog.add_paths_to_album(family, &paths).unwrap(), 0);
-        assert!(catalog.add_paths_to_album(999, &paths).is_err());
+        assert!(catalog.add_paths_to_album(Id::new(), &paths).is_err());
         assert!(
             catalog
                 .add_paths_to_album(family, &["Originals/nope.jpg".into()])
                 .is_err()
         );
-        assert_eq!(catalog.album_photos(family).unwrap().len(), 2);
+        assert_eq!(catalog.album_photos(&[family]).unwrap().len(), 2);
         assert_eq!(catalog.albums_with(&earlier.path).unwrap(), [japan, family]);
 
         // Taking them out again.
         assert_eq!(
             catalog
-                .remove_paths_from_album(family, &paths[..1])
+                .remove_paths_from_albums(&[family], &paths[..1])
                 .unwrap(),
             1
         );
         assert_eq!(
             catalog
-                .remove_paths_from_album(family, &paths[..1])
+                .remove_paths_from_albums(&[family], &paths[..1])
                 .unwrap(),
             0
         );
         assert_eq!(catalog.albums_with(&earlier.path).unwrap(), [japan]);
         assert_eq!(catalog.add_paths_to_album(family, &paths).unwrap(), 1);
+
+        // From several albums at once, each photo once.
+        assert_eq!(catalog.album_photos(&[japan, family]).unwrap().len(), 2);
+        assert_eq!(
+            catalog.album_memberships().unwrap(),
+            [
+                (japan, later.path.clone()),
+                (japan, earlier.path.clone()),
+                (family, later.path.clone()),
+                (family, earlier.path.clone()),
+            ]
+        );
+
+        // Moved, and shown with the albums in it.
+        catalog.move_album(japan, None).unwrap();
+        catalog.set_album_show_nested(trips, true).unwrap();
+        let albums = catalog.albums().unwrap();
+        assert_eq!(albums[1].parent, None);
+        assert!(albums[2].show_nested);
+        catalog.move_album(japan, Some(trips)).unwrap();
 
         catalog.rename_album(family, "Family").unwrap();
         catalog.delete_albums(&[trips, japan]).unwrap();
@@ -1477,8 +2207,287 @@ mod tests {
         );
         // The photos stay in the library.
         assert_eq!(catalog.photo_count().unwrap(), 2);
-        assert!(catalog.album_photos(japan).unwrap().is_empty());
+        assert!(catalog.album_photos(&[japan]).unwrap().is_empty());
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn keeps_objects_found_before_detectors_were_kept_apart() {
+        let path =
+            std::env::temp_dir().join(format!("1k-words-catalog-v6-{}.db", std::process::id()));
+        std::fs::remove_file(&path).ok();
+        // A catalog as version 6 left it, with a photo the built-in model
+        // looked at.
+        block_on(async {
+            let database = turso::Builder::new_local(path.to_str().unwrap())
+                .build()
+                .await
+                .unwrap();
+            let connection = database.connect().unwrap();
+            let schemas = [
+                SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6,
+            ];
+            connection
+                .execute_batch(&format!(
+                    "BEGIN; {} PRAGMA user_version = 6; COMMIT;",
+                    schemas.concat()
+                ))
+                .await
+                .unwrap();
+            connection
+                .execute_batch(
+                    "INSERT INTO photos (id, path, content_hash, file_size, original_path,
+                        imported_at, width, height, modified_at)
+                        VALUES (7, 'Originals/a.jpg', 'h', 1, 'a.jpg', 0, 1, 1, 0);
+                    INSERT INTO object_scans (photo_id, model, scanned_at)
+                        VALUES (7, 'yolo11x', 0);
+                    INSERT INTO objects (photo_id, label, confidence, x1, y1, x2, y2)
+                        VALUES (7, 'dog', 0.5, 0.1, 0.2, 0.3, 0.4);",
+                )
+                .await
+                .unwrap();
+        });
+        let catalog = Catalog::open(&path, &test_device()).unwrap();
+        assert_eq!(
+            catalog.objects("Originals/a.jpg", "yolo11x").unwrap(),
+            Some(vec![DetectedObject {
+                label: "dog".into(),
+                confidence: 0.5,
+                bounds: Some([0.1, 0.2, 0.3, 0.4]),
+            }])
+        );
+        assert_eq!(catalog.object_kinds("yolo11x").unwrap().len(), 1);
+        assert!(catalog.object_scans("plugin:other").unwrap().is_empty());
+        drop(catalog);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn converts_version_7_catalogs_keeping_everything() {
+        let path =
+            std::env::temp_dir().join(format!("1k-words-catalog-v7-{}.db", std::process::id()));
+        std::fs::remove_file(&path).ok();
+        // A catalog as version 7 left it: two photos, Kyoto inside Japan
+        // with both in it, a thumbnail, an object, and a synced file.
+        block_on(async {
+            let database = turso::Builder::new_local(path.to_str().unwrap())
+                .build()
+                .await
+                .unwrap();
+            let connection = database.connect().unwrap();
+            let schemas = [
+                SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+            ];
+            connection
+                .execute_batch(&format!(
+                    "BEGIN; {} PRAGMA user_version = 7; COMMIT;",
+                    schemas.concat()
+                ))
+                .await
+                .unwrap();
+            connection
+                .execute_batch(
+                    "INSERT INTO photos (id, path, content_hash, file_size, original_path,
+                        imported_at, width, height, modified_at, captured_at)
+                        VALUES (3, 'Originals/b.jpg', 'hb', 1, 'b.jpg', 200, 1, 1, 0, 20),
+                            (5, 'Originals/a.jpg', 'ha', 1, 'a.jpg', 100, 1, 1, 0, 10);
+                    INSERT INTO albums (id, parent_id, name, created_at, show_nested)
+                        VALUES (1, NULL, 'Japan', 50, 1), (2, 1, 'Kyoto', 60, 0);
+                    INSERT INTO album_photos (album_id, photo_id, added_at)
+                        VALUES (2, 3, 70), (2, 5, 71);
+                    INSERT INTO derivatives (photo_id, kind, path, width, height, file_size,
+                        version, created_at)
+                        VALUES (5, 'thumbnail', 'Thumbnails/a.jpg', 560, 400, 99, 1, 80);
+                    INSERT INTO detector_scans (photo_id, detector, scanned_at)
+                        VALUES (5, 'yolo', 90);
+                    INSERT INTO objects (photo_id, detector, label, confidence, x1, y1, x2, y2)
+                        VALUES (5, 'yolo', 'dog', 0.5, 0.1, 0.2, 0.3, 0.4);
+                    INSERT INTO sync_targets (id, target, folder, created_at)
+                        VALUES (4, 'target-a', 'Photos', 95);
+                    INSERT INTO sync_items (target_id, path, state, size, updated_at)
+                        VALUES (4, 'Originals/a.jpg', 'synced', 1, 96);",
+                )
+                .await
+                .unwrap();
+        });
+
+        let catalog = Catalog::open(&path, &test_device()).unwrap();
+        let albums = catalog.albums().unwrap();
+        let names: Vec<_> = albums.iter().map(|a| (a.name.as_str(), a.photos)).collect();
+        assert_eq!(names, [("Japan", 0), ("Kyoto", 2)]);
+        let (japan, kyoto) = (&albums[0], &albums[1]);
+        assert_eq!(kyoto.parent, Some(japan.id));
+        assert!(japan.show_nested);
+        // Made from when they were made: Japan first.
+        assert!(japan.id < kyoto.id);
+        let paths =
+            |photos: Vec<PhotoRecord>| photos.into_iter().map(|p| p.path).collect::<Vec<_>>();
+        assert_eq!(
+            paths(catalog.album_photos(&[kyoto.id]).unwrap()),
+            ["Originals/a.jpg", "Originals/b.jpg"]
+        );
+        assert_eq!(catalog.albums_with("Originals/b.jpg").unwrap(), [kyoto.id]);
+        assert_eq!(catalog.derivatives().unwrap()[0].path, "Thumbnails/a.jpg");
+        assert_eq!(
+            catalog.objects("Originals/a.jpg", "yolo").unwrap().unwrap()[0].label,
+            "dog"
+        );
+        let targets = catalog.sync_targets().unwrap();
+        assert_eq!(targets[0].target, "target-a");
+        assert_eq!(catalog.sync_items(targets[0].id).unwrap().len(), 1);
+        // It goes on working: albums can change, and objects be found again.
+        catalog
+            .add_paths_to_album(japan.id, &["Originals/a.jpg".into()])
+            .unwrap();
+        catalog.set_objects("Originals/a.jpg", "yolo", &[]).unwrap();
+        drop(catalog);
+        // And opens again without converting twice.
+        let catalog = Catalog::open(&path, &test_device()).unwrap();
+        assert_eq!(catalog.albums().unwrap()[0].photos, 1);
+        drop(catalog);
+        std::fs::remove_file(&path).ok();
+    }
+
+    fn changed_elsewhere(catalog: &Catalog, album: Id, device: Id) {
+        catalog.change_album_elsewhere(album, device, "Studio");
+    }
+
+    #[test]
+    fn finds_albums_deleted_here_but_changed_elsewhere() {
+        let path = std::env::temp_dir().join(format!(
+            "1k-words-catalog-conflicts-{}.db",
+            std::process::id()
+        ));
+        std::fs::remove_file(&path).ok();
+        let catalog = Catalog::open(&path, &test_device()).unwrap();
+        let studio = Id::from_u128(2);
+        let photo = PhotoRecord {
+            path: "Originals/a.jpg".into(),
+            ..Default::default()
+        };
+        catalog.insert(&photo).unwrap();
+        let trips = catalog.create_album("Trips", None).unwrap();
+        let japan = catalog.create_album("Japan", Some(trips)).unwrap();
+        let kyoto = catalog.create_album("Kyoto", Some(japan)).unwrap();
+        let peru = catalog.create_album("Peru", Some(trips)).unwrap();
+        catalog
+            .add_paths_to_album(kyoto, &[photo.path.clone()])
+            .unwrap();
+
+        // A change seen before deleting isn't a conflict.
+        changed_elsewhere(&catalog, peru, studio);
+        catalog.delete_albums(&[peru]).unwrap();
+        assert!(catalog.album_conflicts().unwrap().is_empty());
+
+        // Deleting Trips deletes what's in it. Studio, not having seen
+        // that, adds a photo to Japan.
+        catalog.delete_albums(&[trips, japan, kyoto]).unwrap();
+        assert!(catalog.albums().unwrap().is_empty());
+        assert!(catalog.album_photos(&[kyoto]).unwrap().is_empty());
+        changed_elsewhere(&catalog, japan, studio);
+        let conflicts = catalog.album_conflicts().unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].album, japan);
+        assert_eq!(conflicts[0].name, "Japan");
+        assert_eq!(conflicts[0].deleted_on, "Test");
+        assert_eq!(conflicts[0].changed_on, "Studio");
+
+        // Keeping it brings back the album it's in, and the album in it
+        // that went with it, with its photo; not Peru, deleted before.
+        catalog.resolve_album_conflict(japan, true).unwrap();
+        let names: Vec<_> = catalog
+            .albums()
+            .unwrap()
+            .into_iter()
+            .map(|a| a.name)
+            .collect();
+        assert_eq!(names, ["Japan", "Kyoto", "Trips"]);
+        assert_eq!(catalog.album_photos(&[kyoto]).unwrap().len(), 1);
+        assert!(catalog.album_conflicts().unwrap().is_empty());
+
+        // Deleted again, then changed elsewhere, and this time let go.
+        catalog.delete_albums(&[trips, japan, kyoto]).unwrap();
+        changed_elsewhere(&catalog, kyoto, studio);
+        assert_eq!(catalog.album_conflicts().unwrap()[0].album, kyoto);
+        catalog.resolve_album_conflict(kyoto, false).unwrap();
+        assert!(catalog.album_conflicts().unwrap().is_empty());
+        assert!(catalog.albums().unwrap().is_empty());
+
+        // Once they're old enough, deleted albums go for good, with the
+        // record of what was in them; one in conflict would stay.
+        changed_elsewhere(&catalog, trips, studio);
+        catalog
+            .purge_deleted_albums(super::super::now() + 1.0)
+            .unwrap();
+        let remaining = |sql: &str| {
+            block_on(async {
+                let connection = catalog.connection();
+                let mut rows = connection.query(sql, ()).await.unwrap();
+                rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+            })
+        };
+        assert_eq!(remaining("SELECT count(*) FROM albums"), 1);
+        assert_eq!(remaining("SELECT count(*) FROM album_photos"), 0);
+        assert_eq!(catalog.album_conflicts().unwrap()[0].album, trips);
+        drop(catalog);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Converts a copy of a real catalog, checking nothing's lost. Set
+    /// `CATALOG_COPY` to the copy's path (it's converted in place).
+    #[test]
+    fn converts_a_real_catalog() {
+        let Some(path) = std::env::var_os("CATALOG_COPY") else {
+            eprintln!("skipping: CATALOG_COPY not set");
+            return;
+        };
+        let path = std::path::PathBuf::from(path);
+        let tables = [
+            "photos",
+            "albums",
+            "album_photos",
+            "derivatives",
+            "detector_scans",
+            "objects",
+            "sync_targets",
+            "sync_items",
+        ];
+        let counts = || {
+            block_on(async {
+                let database = turso::Builder::new_local(path.to_str().unwrap())
+                    .build()
+                    .await
+                    .unwrap();
+                let connection = database.connect().unwrap();
+                let mut counts = Vec::new();
+                for table in tables {
+                    let mut rows = connection
+                        .query(&format!("SELECT count(*) FROM {table}"), ())
+                        .await
+                        .unwrap();
+                    let row = rows.next().await.unwrap().unwrap();
+                    counts.push((table, row.get::<i64>(0).unwrap()));
+                }
+                counts
+            })
+        };
+        let before = counts();
+        eprintln!("before: {before:?}");
+        let catalog = Catalog::open(&path, &test_device()).unwrap();
+        eprintln!(
+            "photos: {}, albums: {}",
+            catalog.photo_count().unwrap(),
+            catalog.albums().unwrap().len()
+        );
+        drop(catalog);
+        let after = counts();
+        eprintln!("after:  {after:?}");
+        for ((table, was), (_, now)) in before.iter().zip(&after) {
+            // Files only on a service, without a path, aren't kept.
+            if *table != "sync_items" {
+                assert_eq!(was, now, "{table}");
+            }
+        }
     }
 
     #[test]
@@ -1486,7 +2495,7 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("1k-words-catalog-sync-{}.db", std::process::id()));
         std::fs::remove_file(&path).ok();
-        let catalog = Catalog::open(&path).unwrap();
+        let catalog = Catalog::open(&path, &test_device()).unwrap();
         let id = catalog.add_sync_target("target-a", "Photos-1234").unwrap();
         let other = catalog.add_sync_target("target-b", "Photos-1234").unwrap();
         // A target's added once.

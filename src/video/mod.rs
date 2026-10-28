@@ -2,6 +2,7 @@
 //!
 //! A background thread decodes the video and paces frames to their
 //! timestamps; a [`VideoPlayer`] entity holds the latest one for rendering.
+//! The sound, if wanted, starts with the first frame (see `audio`).
 //!
 //! - **macOS:** frames are hardware decoded (VideoToolbox) and stay on the
 //!   GPU: GPUI draws them with its `surface` element.
@@ -10,6 +11,7 @@
 //!   cross-platform surface (D3D11 textures, DMA-BUF) would let Windows and
 //!   Linux keep hardware frames on the GPU too.
 
+mod audio;
 #[cfg(target_os = "macos")]
 mod macos;
 
@@ -31,6 +33,8 @@ use gpui_kit::{
     prelude::*,
 };
 use image::{Frame, RgbaImage};
+
+use crate::decode;
 
 /// One decoded frame, ready to draw.
 #[derive(Clone)]
@@ -60,7 +64,7 @@ pub enum PlaybackState {
     Failed(SharedString),
 }
 
-/// Plays a video once, from the start, without sound.
+/// Plays a video once, from the start.
 pub struct VideoPlayer {
     frame: Option<VideoFrame>,
     state: PlaybackState,
@@ -69,7 +73,8 @@ pub struct VideoPlayer {
 }
 
 impl VideoPlayer {
-    pub fn new(path: PathBuf, cx: &mut Context<Self>) -> Self {
+    /// Plays `path`, with its sound if `with_sound`.
+    pub fn new(path: PathBuf, with_sound: bool, cx: &mut Context<Self>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         // A small buffer: the decode thread paces frames itself.
         let (mut sender, mut receiver) = mpsc::channel(2);
@@ -78,7 +83,12 @@ impl VideoPlayer {
         let spawned = std::thread::Builder::new()
             .name("video-decode".into())
             .spawn(move || {
-                let message = match decode(&path, &thread_stop, &mut sender, true) {
+                let sound = with_sound.then(|| load_sound(&path)).flatten();
+                let result = decode(&path, &thread_stop, &mut sender, true, sound.as_ref());
+                if let Some(sound) = &sound {
+                    finish_sound(sound, &thread_stop);
+                }
+                let message = match result {
                     Ok(()) => Message::Finished,
                     Err(error) => Message::Failed(format!("{error:#}")),
                 };
@@ -137,7 +147,7 @@ impl VideoPlayer {
     pub fn stop(&mut self, cx: &mut App) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(VideoFrame::Image(image)) = self.frame.take() {
-            cx.drop_image(image, None);
+            decode::release(image, cx);
         }
     }
 
@@ -146,7 +156,7 @@ impl VideoPlayer {
             Message::Frame(frame) => {
                 // Copied frames are new images each time; free the last one.
                 if let Some(VideoFrame::Image(old)) = self.frame.replace(frame) {
-                    cx.drop_image(old, None);
+                    decode::release(old, cx);
                 }
             }
             Message::Finished => self.state = PlaybackState::Finished,
@@ -162,13 +172,34 @@ impl Drop for VideoPlayer {
     }
 }
 
-/// Decodes the video's frames and sends them at their presentation times.
-/// `hardware` enables hardware decoding where supported.
+/// The video's sound, if it has any and there's something to play it on.
+fn load_sound(path: &Path) -> Option<audio::Sound> {
+    audio::Sound::load(path)
+        .inspect_err(|error| eprintln!("couldn't load the Live Photo's sound: {error:#}"))
+        .ok()
+        .flatten()
+}
+
+/// The longest the sound plays on after the last frame.
+const MAX_SOUND_TAIL: Duration = Duration::from_secs(2);
+
+/// Lets the sound play to its end, unless playback's stopped.
+fn finish_sound(sound: &audio::Sound, stop: &AtomicBool) {
+    let give_up = Instant::now() + MAX_SOUND_TAIL;
+    while !sound.is_finished() && !stop.load(Ordering::Relaxed) && Instant::now() < give_up {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Decodes the video's frames and sends them at their presentation times,
+/// starting `sound` with the first. `hardware` enables hardware decoding
+/// where supported.
 fn decode(
     path: &Path,
     stop: &AtomicBool,
     sender: &mut mpsc::Sender<Message>,
     hardware: bool,
+    sound: Option<&audio::Sound>,
 ) -> Result<()> {
     init_ffmpeg()?;
     let mut input =
@@ -201,7 +232,12 @@ fn decode(
 
         // Wait until the frame is due.
         let time = frame.timestamp().map_or(0.0, |pts| pts as f64 * time_base);
-        let (start, first_time) = *clock.get_or_insert((Instant::now(), time));
+        let (start, first_time) = *clock.get_or_insert_with(|| {
+            if let Some(sound) = sound {
+                sound.play();
+            }
+            (Instant::now(), time)
+        });
         let due = start + Duration::from_secs_f64((time - first_time).max(0.0));
         if let Some(wait) = due.checked_duration_since(Instant::now()) {
             std::thread::sleep(wait);
@@ -408,7 +444,7 @@ mod tests {
         let (mut sender, receiver) = mpsc::channel(2);
         let path = path.to_path_buf();
         let thread = std::thread::spawn(move || {
-            let result = decode(&path, &AtomicBool::new(false), &mut sender, hardware);
+            let result = decode(&path, &AtomicBool::new(false), &mut sender, hardware, None);
             drop(sender);
             result
         });
@@ -446,7 +482,7 @@ mod tests {
         let (mut sender, receiver) = mpsc::channel(2);
         let path = path.to_path_buf();
         let thread = std::thread::spawn(move || {
-            decode(&path, &AtomicBool::new(false), &mut sender, hardware).unwrap();
+            decode(&path, &AtomicBool::new(false), &mut sender, hardware, None).unwrap();
         });
         let mut messages = futures::executor::block_on_stream(receiver);
         let Some(Message::Frame(frame)) = messages.next() else {

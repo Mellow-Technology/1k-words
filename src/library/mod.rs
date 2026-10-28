@@ -20,16 +20,25 @@
 mod albums;
 mod catalog;
 mod derivatives;
+mod device;
+mod id;
 mod import;
 mod manage;
 mod objects;
 mod protect;
 mod sync;
 
-pub use albums::{Album, AlbumId, album_path, child_albums, tree_order};
+pub use albums::{
+    Album, AlbumId, album_path, child_albums, nested_albums, shown_albums, tree_order,
+};
+pub use catalog::AlbumConflict;
+pub use device::Device;
+pub use id::Id;
 pub use import::{ImportSession, ImportSummary, Imported, PreparedImport, prepare, source_drive};
 pub use manage::{LibraryHandle, LibraryStats, MoveProgress};
-pub use objects::{ObjectKind, suggestions};
+#[cfg(test)]
+pub(crate) use objects::test_support as detect_test_support;
+pub use objects::{DetectionStatus, ObjectKind, suggestions};
 #[cfg(test)]
 pub(crate) use sync::test_support as sync_test_support;
 pub use sync::{LibraryTarget, SyncStatus, TargetSettings, UploadProgress, UploadSummary};
@@ -63,6 +72,9 @@ The photos are read-only so they aren't changed by accident.
 
 Thumbnails holds smaller copies of the photos, which the app makes from
 the originals as it needs them.
+
+Catalog holds a copy of the library's albums, which the app restores
+them from if its own catalog of the library is lost.
 ";
 
 /// A library as listed in `libraries.json`.
@@ -92,8 +104,13 @@ pub struct Library {
     /// Held while changing the originals, so imports running at the same
     /// time take turns (see `ImportSession`).
     placing: Mutex<()>,
+    /// Held while writing the copy of the albums (see `albums`).
+    saving_albums: Mutex<()>,
     derivatives: Activity,
     detecting: Activity,
+    /// What finds objects in its photos (see `set_detector`).
+    detector: Mutex<objects::DetectorSlot>,
+    detection_progress: objects::DetectionProgress,
 }
 
 /// Work done in the background, such as making derivatives (see
@@ -153,14 +170,25 @@ impl Library {
                 protect::set_writable(&originals, false)?;
             }
         }
-        let catalog = Catalog::open(&catalog_path(config_dir, &info.id))?;
-        Ok(Self {
+        let device = Device::load(config_dir)?;
+        let catalog = Catalog::open(&catalog_path(config_dir, &info.id), &device)?;
+        let library = Self {
             info,
             catalog,
             placing: Mutex::new(()),
+            saving_albums: Mutex::new(()),
             derivatives: Activity::default(),
             detecting: Activity::default(),
-        })
+            detector: Mutex::default(),
+            detection_progress: Default::default(),
+        };
+        if let Err(error) = library.restore_albums() {
+            eprintln!("couldn't restore the albums: {error:#}");
+        }
+        if let Err(error) = library.purge_deleted_albums() {
+            eprintln!("couldn't remove deleted albums: {error:#}");
+        }
+        Ok(library)
     }
 
     fn placing(&self) -> MutexGuard<'_, ()> {

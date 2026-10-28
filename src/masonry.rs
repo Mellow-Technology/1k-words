@@ -65,18 +65,27 @@ impl MasonryLayout {
         let column_width =
             ((width - gap * (column_count - 1) as f32) / column_count as f32).max(1.0);
 
+        // Each item goes in the shortest column, judged in column widths,
+        // with gaps as at the target width, so which column that is doesn't
+        // depend on the width: resizing the grid without changing its
+        // number of columns scales it, rather than moving items between
+        // columns as rounding tips near ties one way or the other.
+        let gap_units = gap / options.target_column_width;
+        let mut column_units = vec![0.0f64; column_count];
         let mut column_heights = vec![0.0f32; column_count];
         let mut columns = vec![Vec::new(); column_count];
         let mut rects = Vec::with_capacity(aspect_ratios.len());
         let mut item_columns = Vec::with_capacity(aspect_ratios.len());
 
         for (ix, &aspect) in aspect_ratios.iter().enumerate() {
-            let (column, &y) = column_heights
+            let aspect = aspect.clamp(0.1, 10.0);
+            let column = column_units
                 .iter()
                 .enumerate()
                 .min_by(|a, b| a.1.total_cmp(b.1))
-                .unwrap();
-            let height = (column_width / aspect.clamp(0.1, 10.0)).round();
+                .map_or(0, |(column, _)| column);
+            let y = column_heights[column];
+            let height = (column_width / aspect).round();
             let x = column as f32 * (column_width + gap);
             rects.push(Bounds {
                 origin: point(x, y),
@@ -84,6 +93,7 @@ impl MasonryLayout {
             });
             columns[column].push(ix);
             item_columns.push(column);
+            column_units[column] += f64::from(1. / aspect + gap_units);
             column_heights[column] = y + height + gap;
         }
 
@@ -339,6 +349,19 @@ mod tests {
         assert_eq!(layout.rects[2].origin, point(0.0, 110.0));
         assert_eq!(layout.rects[3].origin, point(0.0, 170.0));
         assert_eq!(layout.height(), 270.0);
+    }
+
+    #[test]
+    fn resizing_keeps_items_in_their_columns() {
+        let options = MasonryOptions::default();
+        let shapes = [1.5, 1.5, 2. / 3., 4. / 3., 0.75, 1., 16. / 9., 1.5];
+        let aspects: Vec<f32> = (0..300).map(|ix| shapes[(ix * 7 + ix / 3) % 8]).collect();
+        let columns = |width: f32| MasonryLayout::compute(&aspects, width, &options).item_columns;
+        // Four columns all the way, at every half pixel.
+        let first = columns(1000.);
+        for step in 0..200 {
+            assert_eq!(columns(1000. + step as f32 / 2.), first, "at {step}");
+        }
     }
 
     #[test]

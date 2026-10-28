@@ -270,10 +270,20 @@ struct ShotFiles {
     live_video: Option<PathBuf>,
 }
 
-/// Groups files that belong to the same shot, which cameras save with the
-/// same name apart from the extension: a raw file and the JPEG saved next to
-/// it (RAW+JPEG), and a photo and its Live Photo video.
+/// Groups files that belong to the same shot: a raw file and the JPEG saved
+/// next to it (RAW+JPEG), and a photo and its Live Photo video. Cameras
+/// save these with the same name apart from the extension; Live Photos
+/// whose names don't match (e.g. renamed or exported) are paired by Apple's
+/// content identifier.
 fn group_shot_files(paths: Vec<PathBuf>) -> Vec<ShotFiles> {
+    let (mut shots, videos) = group_by_name(paths);
+    pair_by_content_id(&mut shots, videos, photo_content_id, video_content_id);
+    shots
+}
+
+/// Groups files by name, returning the shots and the videos left without a
+/// photo.
+fn group_by_name(paths: Vec<PathBuf>) -> (Vec<ShotFiles>, Vec<PathBuf>) {
     let mut by_stem: BTreeMap<(Option<PathBuf>, String), Vec<PathBuf>> = BTreeMap::new();
     for path in paths {
         let stem = path
@@ -292,6 +302,7 @@ fn group_shot_files(paths: Vec<PathBuf>) -> Vec<ShotFiles> {
         live_video: None,
     };
     let mut shots = Vec::new();
+    let mut unpaired_videos = Vec::new();
     for (_, files) in by_stem {
         let (mut videos, files): (Vec<_>, Vec<_>) =
             files.into_iter().partition(|p| is_live_video(p));
@@ -308,15 +319,117 @@ fn group_shot_files(paths: Vec<PathBuf>) -> Vec<ShotFiles> {
                 live_video: (videos.len() == 1).then(|| videos.remove(0)),
             });
         }
-        // Anything left over stands alone; videos without a photo are
-        // skipped.
+        // Anything left over stands alone.
         shots.extend(
             raws.into_iter()
                 .chain(images)
                 .map(|path| single(vec![path])),
         );
+        unpaired_videos.extend(videos);
     }
-    shots
+    (shots, unpaired_videos)
+}
+
+/// Gives each of `videos` to the photo with the same content identifier, if
+/// it has no video yet. Videos that match no photo are skipped. Photos are
+/// only read when there are videos to pair, which there usually aren't.
+fn pair_by_content_id(
+    shots: &mut [ShotFiles],
+    videos: Vec<PathBuf>,
+    photo_id: impl Fn(&Path) -> Option<String> + Sync,
+    video_id: impl Fn(&Path) -> Option<String> + Sync,
+) {
+    let mut videos: BTreeMap<String, PathBuf> = videos
+        .into_par_iter()
+        .filter_map(|video| Some((video_id(&video)?, video)))
+        .collect();
+    if videos.is_empty() {
+        return;
+    }
+    let ids: Vec<Option<String>> = shots
+        .par_iter()
+        .map(|shot| {
+            let can_pair = shot.live_video.is_none() && !is_raw(&shot.display);
+            can_pair.then(|| photo_id(&shot.display)).flatten()
+        })
+        .collect();
+    for (shot, id) in shots.iter_mut().zip(ids) {
+        if let Some(video) = id.and_then(|id| videos.remove(&id)) {
+            shot.live_video = Some(video);
+        }
+    }
+}
+
+/// The content identifier that ties a Live Photo's image to its video:
+/// `ContentIdentifier` (tag 0x11) in the image's Apple maker note.
+fn photo_content_id(path: &Path) -> Option<String> {
+    let exif = read_exif(path)?;
+    let Value::Undefined(note, _) = &exif.get_field(Tag::MakerNote, In::PRIMARY)?.value else {
+        return None;
+    };
+    apple_maker_note_string(note, 0x11)
+}
+
+/// The video's half of the identifier, in its QuickTime metadata.
+fn video_content_id(path: &Path) -> Option<String> {
+    crate::video::metadata(path)
+        .ok()?
+        .into_iter()
+        .find(|(key, _)| key == "com.apple.quicktime.content.identifier")
+        .map(|(_, value)| value)
+}
+
+/// Reads an ASCII entry from an Apple maker note: the header `Apple iOS\0`,
+/// a version, a byte order, then an IFD whose offsets count from the start
+/// of the note.
+fn apple_maker_note_string(note: &[u8], tag: u16) -> Option<String> {
+    const HEADER: &[u8] = b"Apple iOS\0";
+    const IFD_START: usize = 14;
+    if !note.starts_with(HEADER) {
+        return None;
+    }
+    let big_endian = match note.get(12..14)? {
+        b"MM" => true,
+        b"II" => false,
+        _ => return None,
+    };
+    let u16_at = |at: usize| {
+        let bytes = note.get(at..at + 2)?.try_into().ok()?;
+        Some(if big_endian {
+            u16::from_be_bytes(bytes)
+        } else {
+            u16::from_le_bytes(bytes)
+        })
+    };
+    let u32_at = |at: usize| {
+        let bytes = note.get(at..at + 4)?.try_into().ok()?;
+        Some(if big_endian {
+            u32::from_be_bytes(bytes)
+        } else {
+            u32::from_le_bytes(bytes)
+        })
+    };
+    const ASCII: u16 = 2;
+    let count = u16_at(IFD_START)? as usize;
+    let entry = (0..count)
+        .map(|i| IFD_START + 2 + i * 12)
+        .find(|&at| u16_at(at) == Some(tag))?;
+    if u16_at(entry + 2)? != ASCII {
+        return None;
+    }
+    let len = u32_at(entry + 4)? as usize;
+    // Values of four bytes or fewer are stored in the entry itself.
+    let start = if len <= 4 {
+        entry + 8
+    } else {
+        u32_at(entry + 8)? as usize
+    };
+    let value = note.get(start..start.checked_add(len)?)?;
+    let text = std::str::from_utf8(value)
+        .ok()?
+        .trim_end_matches('\0')
+        .trim();
+    (!text.is_empty()).then(|| text.to_string())
 }
 
 fn read_photo(files: ShotFiles) -> Result<Photo> {
@@ -833,6 +946,70 @@ mod tests {
                 ("d/IMG_2.jpg".into(), None, None),
             ]
         );
+    }
+
+    #[test]
+    fn pairs_renamed_live_photo_videos_by_content_id() {
+        let paths = [
+            "d/IMG_1.HEIC",
+            "d/IMG_1.MOV",
+            "d/renamed.HEIC",
+            "d/other.mov",
+            "d/x.mov",
+        ];
+        let (mut shots, videos) = group_by_name(paths.iter().map(PathBuf::from).collect());
+        let id = |path: &Path| match path.file_name()?.to_str()? {
+            "renamed.HEIC" | "other.mov" => Some("A".to_string()),
+            // Already paired by name, so not paired again.
+            "IMG_1.HEIC" | "x.mov" => Some("B".to_string()),
+            _ => None,
+        };
+        pair_by_content_id(&mut shots, videos, id, id);
+        shots.sort();
+        let live = |shot: &ShotFiles| shot.live_video.clone().map(|p| p.display().to_string());
+        assert_eq!(
+            shots.iter().map(live).collect::<Vec<_>>(),
+            [Some("d/IMG_1.MOV".into()), Some("d/other.mov".into())]
+        );
+    }
+
+    #[test]
+    fn reads_apple_maker_note_strings() {
+        let id = b"5E2C4F0A-1B2C-4D3E-8F90-0A1B2C3D4E5F\0";
+        let mut note = b"Apple iOS\0\0\x01MM".to_vec();
+        // Two entries: a short value in the entry, and the identifier.
+        note.extend(2u16.to_be_bytes());
+        note.extend([0x00, 0x01, 0x00, 0x02, 0, 0, 0, 3, b'h', b'i', 0, 0]);
+        let offset = 14 + 2 + 2 * 12;
+        note.extend([0x00, 0x11, 0x00, 0x02]);
+        note.extend((id.len() as u32).to_be_bytes());
+        note.extend((offset as u32).to_be_bytes());
+        note.extend(id);
+
+        assert_eq!(apple_maker_note_string(&note, 0x01).as_deref(), Some("hi"));
+        assert_eq!(
+            apple_maker_note_string(&note, 0x11).as_deref(),
+            Some("5E2C4F0A-1B2C-4D3E-8F90-0A1B2C3D4E5F")
+        );
+        assert_eq!(apple_maker_note_string(&note, 0x0b), None);
+        assert_eq!(apple_maker_note_string(&note[..30], 0x11), None);
+        assert_eq!(apple_maker_note_string(b"Canon", 0x11), None);
+    }
+
+    /// Reads a real Live Photo's identifiers: set `LIVE_PHOTO_IMAGE` and
+    /// `LIVE_PHOTO_VIDEO` to its two halves.
+    #[test]
+    fn reads_live_photo_content_ids() {
+        let (Some(image), Some(video)) = (
+            std::env::var_os("LIVE_PHOTO_IMAGE"),
+            std::env::var_os("LIVE_PHOTO_VIDEO"),
+        ) else {
+            eprintln!("skipping: LIVE_PHOTO_IMAGE and LIVE_PHOTO_VIDEO not set");
+            return;
+        };
+        let image_id = photo_content_id(Path::new(&image));
+        assert!(image_id.is_some());
+        assert_eq!(image_id, video_content_id(Path::new(&video)));
     }
 
     #[test]

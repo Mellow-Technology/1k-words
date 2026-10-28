@@ -10,6 +10,8 @@ use gpui_kit::component::{IconName, Theme, ThemeMode, ThemeSet};
 use gpui_kit::{App, Global, IntoElement, SharedString, Subscription, Window};
 use serde::{Deserialize, Serialize};
 
+use crate::acknowledgements;
+use crate::detection_settings;
 use crate::library_settings::{self, LibraryActions};
 use crate::sync_settings;
 
@@ -63,6 +65,12 @@ pub struct AppSettings {
     pub grid_layout: GridLayout,
     /// Whether the viewer draws boxes around the objects found in photos.
     pub show_object_boxes: bool,
+    /// The detection plugin that finds objects in photos, by id; none for
+    /// the built-in model (see `detection_settings`).
+    pub detection_plugin: Option<String>,
+    /// Whether libraries only sync with Sync Now, rather than after imports
+    /// and from time to time as well (see `sync_settings`).
+    pub pause_automatic_sync: bool,
 }
 
 impl Global for AppSettings {}
@@ -91,6 +99,14 @@ pub fn set_grid_layout(layout: GridLayout, cx: &mut App) {
 
 pub fn set_show_object_boxes(show: bool, cx: &mut App) {
     update(cx, |settings| settings.show_object_boxes = show);
+}
+
+pub fn set_detection_plugin(plugin: Option<String>, cx: &mut App) {
+    update(cx, |settings| settings.detection_plugin = plugin);
+}
+
+pub fn set_sync_automatically(on: bool, cx: &mut App) {
+    update(cx, |settings| settings.pause_automatic_sync = !on);
 }
 
 /// Applies the appearance setting, reading the system appearance from
@@ -145,6 +161,8 @@ pub fn settings_view(libraries: LibraryActions, cx: &App) -> impl IntoElement {
         )
         .page(library_settings::page(libraries, cx))
         .page(sync_settings::page(cx))
+        .page(detection_settings::page(cx))
+        .page(acknowledgements::page())
 }
 
 /// Registers the app's light and dark themes with GPUI Kit.

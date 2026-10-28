@@ -1,15 +1,21 @@
-/// Sync plugins: WebAssembly components that copy a library's files to and
-/// from an external service (S3, Dropbox, a NAS, ...).
+/// Plugins: WebAssembly components that extend the app. There are two kinds,
+/// each a world below:
 ///
-/// A plugin only talks to its service. The app decides what to sync and keeps
-/// the canonical record of what's where in the library's catalog, so a plugin
-/// keeps no state between calls: each call gets the target's configuration.
+/// - Sync plugins copy a library's files to and from an external service
+///   (S3, Dropbox, a NAS, ...).
+/// - Detection plugins find objects in photos, such as with a vision model
+///   on a service.
+///
+/// A plugin only talks to its service. The app decides what to do and keeps
+/// the canonical record of it (what's synced where, what's in each photo) in
+/// the library's catalog, so a plugin keeps no state between calls: each call
+/// gets the plugin's configuration.
 ///
 /// Plugins run sandboxed. They can't touch the file system or the network
 /// directly: they read and write files through handles the app gives them, and
 /// make HTTP requests through the app, only to hosts named in their
-/// configuration (or in `plugin-info.hosts`).
-package onekwords:sync@0.1.0;
+/// configuration (or in their info's `hosts`).
+package onekwords:plugins@0.2.0;
 
 interface log {
     enum level {
@@ -24,12 +30,13 @@ interface log {
 }
 
 interface files {
-    /// A file in the library, opened for a plugin to read.
+    /// A file in the library, opened for a plugin to read: all of it, or a
+    /// part of it (see `sync.upload-part`).
     resource source {
-        /// The file's size in bytes.
+        /// The size in bytes.
         size: func() -> u64;
         /// Reads up to `len` bytes at `offset`, which is fewer only at the
-        /// end of the file. The app may cap `len`; read in a loop.
+        /// end. The app may cap `len`; read in a loop.
         read: func(offset: u64, len: u32) -> result<list<u8>, string>;
     }
 
@@ -64,8 +71,8 @@ interface http {
     /// Sends a request with `body`, which may be empty.
     send: func(request: request, body: list<u8>) -> result<response, error>;
 
-    /// Sends a request with a file as its body, streamed by the app. The app
-    /// sets `content-length`.
+    /// Sends a request with a file (or the part of one the source is) as its
+    /// body, streamed by the app. The app sets `content-length`.
     send-file: func(request: request, body: borrow<source>) -> result<response, error>;
 
     /// Sends a request and, if the response is successful (2xx), streams its
@@ -74,18 +81,8 @@ interface http {
     receive-file: func(request: request, into: borrow<sink>) -> result<response, error>;
 }
 
-interface plugin {
-    use files.{source, sink};
-
-    flags capabilities {
-        upload,
-        download,
-        /// Listing what's on the service. Optional: the app tracks what it
-        /// has synced, so it doesn't rely on this.
-        %list,
-        delete,
-    }
-
+/// What every kind of plugin is set up with.
+interface settings {
     enum field-kind {
         text,
         /// Stored like text, but hidden as it's typed.
@@ -96,7 +93,7 @@ interface plugin {
         %flag,
     }
 
-    /// A setting the user fills in when adding a target, e.g. a bucket name.
+    /// A setting the user fills in, e.g. a bucket name.
     record config-field {
         key: string,
         label: string,
@@ -104,6 +101,35 @@ interface plugin {
         required: bool,
         default: option<string>,
         help: option<string>,
+    }
+
+    /// The settings, by `config-field.key`.
+    type config = list<tuple<string, string>>;
+}
+
+interface sync {
+    use files.{source, sink};
+    use settings.{config-field, config};
+
+    flags capabilities {
+        upload,
+        download,
+        /// Listing what's on the service. Optional: the app tracks what it
+        /// has synced, so it doesn't rely on this.
+        %list,
+        delete,
+        /// Uploading big files in parts (see `multipart`).
+        multipart,
+    }
+
+    /// How a plugin with the `multipart` capability takes big files.
+    record multipart {
+        /// Files at least this big are uploaded in parts.
+        threshold: u64,
+        /// The size of each part but the last. The app makes parts bigger if
+        /// need be to keep within `max-parts`.
+        part-size: u64,
+        max-parts: u32,
     }
 
     record plugin-info {
@@ -116,10 +142,9 @@ interface plugin {
         /// Hosts the plugin may always reach (and their subdomains), e.g. a
         /// service's fixed API host. URL fields' hosts are added to these.
         hosts: list<string>,
+        /// With the `multipart` capability.
+        multipart: option<multipart>,
     }
-
-    /// A target's settings, by `config-field.key`.
-    type config = list<tuple<string, string>>;
 
     variant sync-error {
         /// The settings are wrong (bad credentials, no such bucket...).
@@ -178,7 +203,26 @@ interface plugin {
     /// work and the bucket exists.
     validate: func(config: config) -> result<_, sync-error>;
 
+    /// Uploads a file whole.
     upload: func(config: config, item: local-item, data: borrow<source>) -> result<remote-item, sync-error>;
+
+    /// Starts uploading a file in parts (with the `multipart` capability),
+    /// returning the upload's id on the service, which the app passes back.
+    begin-upload: func(config: config, item: local-item) -> result<string, sync-error>;
+
+    /// Uploads part `part` (numbered from 1) of a file, whose data is
+    /// `data`, returning what `finish-upload` needs to know of it, such as
+    /// an ETag. Parts may be uploaded in any order, and at once by separate
+    /// instances of the plugin.
+    upload-part: func(config: config, item: local-item, upload: string, part: u32, data: borrow<source>) -> result<string, sync-error>;
+
+    /// Finishes uploading a file in parts, given what `upload-part` returned
+    /// for each, in order.
+    finish-upload: func(config: config, item: local-item, upload: string, parts: list<string>) -> result<remote-item, sync-error>;
+
+    /// Gives up on uploading a file in parts, so the service can discard
+    /// them.
+    abort-upload: func(config: config, item: local-item, upload: string) -> result<_, sync-error>;
 
     download: func(config: config, item: remote-item, into: borrow<sink>) -> result<_, sync-error>;
 
@@ -187,10 +231,81 @@ interface plugin {
     delete: func(config: config, item: remote-item) -> result<_, sync-error>;
 }
 
+interface detect {
+    use settings.{config-field, config};
+
+    record provider-info {
+        /// Stable and unique, e.g. "openai-vision".
+        id: string,
+        name: string,
+        version: string,
+        /// What it is and where photos go, shown when choosing a provider.
+        description: string,
+        config: list<config-field>,
+        /// Hosts the plugin may always reach (and their subdomains). URL
+        /// fields' hosts are added to these.
+        hosts: list<string>,
+    }
+
+    /// Where an object is in a photo, as fractions of its width and height
+    /// from its top left.
+    record bounds {
+        left: f32,
+        top: f32,
+        right: f32,
+        bottom: f32,
+    }
+
+    record detected-object {
+        /// What it is: a short, common, lowercase noun in the singular, such
+        /// as "dog" or "traffic light", as people search for it.
+        label: string,
+        /// How sure the provider is, from 0 to 1.
+        confidence: f32,
+        /// Where it is, if the provider knows.
+        bounds: option<bounds>,
+    }
+
+    /// A photo to look at, scaled down.
+    record image {
+        width: u32,
+        height: u32,
+        /// JPEG data.
+        jpeg: list<u8>,
+    }
+
+    variant detect-error {
+        /// The settings are wrong (bad credentials, no such model...).
+        /// Looking at photos stops until they're changed.
+        config(string),
+        /// Worth trying again later: network trouble, throttling, server
+        /// errors.
+        transient(string),
+        /// The provider won't look at this photo. It isn't retried.
+        rejected(string),
+    }
+
+    info: func() -> provider-info;
+
+    /// Checks settings before they're saved, e.g. that the credentials work.
+    validate: func(config: config) -> result<_, detect-error>;
+
+    /// Finds the objects in a photo, most certain first.
+    detect: func(config: config, image: image) -> result<list<detected-object>, detect-error>;
+}
+
 world sync-plugin {
     import log;
     import files;
     import http;
 
-    export plugin;
+    export sync;
+}
+
+world detect-plugin {
+    import log;
+    import files;
+    import http;
+
+    export detect;
 }
