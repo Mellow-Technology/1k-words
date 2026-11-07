@@ -84,6 +84,20 @@ impl LibraryHandle {
         Ok(overview.unwrap_or_default())
     }
 
+    /// Fails if `forget_sync_target` would lose track of originals that
+    /// are only on that target.
+    pub fn check_sync_target_forgettable(&self, target: &str) -> Result<()> {
+        self.with_catalog(|catalog| {
+            for link in sync::sync_targets(catalog)? {
+                if link.target == target {
+                    sync::check_not_stranded(catalog, &self.info.path, link.id)?;
+                }
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+
     /// Stops syncing to a target (by its id in `sync_targets`), as when
     /// it's deleted.
     pub fn forget_sync_target(&self, target: &str) -> Result<()> {

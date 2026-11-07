@@ -262,6 +262,12 @@ impl Library {
         if !self.synced_paths()?.contains(path) {
             bail!("{path} isn't safely synced");
         }
+        self.remove_original_file(path)
+    }
+
+    /// Removes an original's file and its record. It's for the caller to
+    /// be sure it can go.
+    pub(super) fn remove_original_file(&self, path: &str) -> Result<()> {
         library_path(path)?;
         let file = self.info.path.join(path);
         let dir = file.parent().context("no folder")?;
@@ -350,11 +356,7 @@ impl Library {
         let transient = |error: anyhow::Error| Failure::Transient(format!("{error:#}"));
         let running = match session {
             Some(running) => running,
-            None => session.insert(
-                plugin
-                    .session(settings.config.clone())
-                    .map_err(transient)?,
-            ),
+            None => session.insert(plugin.session(settings.config.clone()).map_err(transient)?),
         };
         let result = running.download(&file.remote, partial);
         if result.is_err() {
@@ -533,7 +535,7 @@ fn library_path(path: &str) -> Result<Vec<String>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
 
@@ -543,16 +545,16 @@ mod tests {
 
     /// A library of `count` photos with thumbnails, all uploaded to a fake
     /// S3, the plugins, and the library's id and settings for the target.
-    struct Synced {
-        library: Arc<Library>,
-        root: PathBuf,
-        s3: FakeS3,
-        plugins: Plugins,
-        id: Id,
-        settings: TargetSettings,
+    pub(in super::super) struct Synced {
+        pub library: Arc<Library>,
+        pub root: PathBuf,
+        pub s3: FakeS3,
+        pub plugins: Plugins,
+        pub id: Id,
+        pub settings: TargetSettings,
     }
 
-    fn synced(name: &str, count: u8) -> Synced {
+    pub(in super::super) fn synced(name: &str, count: u8) -> Synced {
         let (config_dir, library_dir) = test_support::temp_dirs(name);
         let root = config_dir.parent().unwrap().to_path_buf();
         let source = root.join("card");
@@ -817,7 +819,9 @@ mod tests {
         library.touch(&photos[0]).unwrap();
         library.pin_photo(&photos[2]).unwrap();
         let size = |photo: &Photo| std::fs::metadata(&photo.path).unwrap().len();
-        library.trim_fetched(size(&photos[0]), &HashSet::new()).unwrap();
+        library
+            .trim_fetched(size(&photos[0]), &HashSet::new())
+            .unwrap();
         assert!(photos[0].path.is_file());
         assert!(!photos[1].path.exists());
         assert!(photos[2].path.is_file());
@@ -954,7 +958,10 @@ mod tests {
 
         // The only target with it can't be forgotten until it's back.
         let error = library.remove_sync_target(synced.id).unwrap_err();
-        assert!(error.to_string().contains("only on this target"), "{error:#}");
+        assert!(
+            error.to_string().contains("only on this target"),
+            "{error:#}"
+        );
         synced.fetch(&photos[0]).unwrap();
         library.remove_sync_target(synced.id).unwrap();
 

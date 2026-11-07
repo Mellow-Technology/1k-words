@@ -23,6 +23,7 @@ mod catalog;
 mod derivatives;
 mod device;
 mod download;
+mod free_space;
 mod id;
 mod import;
 mod manage;
@@ -37,6 +38,9 @@ pub use albums::{
 pub use catalog::AlbumConflict;
 pub use device::Device;
 pub use download::{DownloadSource, DownloadSummary};
+#[cfg(test)]
+pub use free_space::Volume;
+pub use free_space::{FreeUpSummary, SpaceBudget, SpaceOverview};
 pub use id::Id;
 pub use import::{ImportSession, ImportSummary, Imported, PreparedImport, prepare, source_drive};
 pub use manage::{LibraryHandle, LibraryStats, MoveProgress};
@@ -116,6 +120,8 @@ pub struct Library {
     saving_albums: Mutex<()>,
     derivatives: Activity,
     detecting: Activity,
+    /// Removing originals to stay within budget (see `free_space`).
+    freeing: Activity,
     /// What finds objects in its photos (see `set_detector`).
     detector: Mutex<objects::DetectorSlot>,
     detection_progress: objects::DetectionProgress,
@@ -190,6 +196,7 @@ impl Library {
             saving_albums: Mutex::new(()),
             derivatives: Activity::default(),
             detecting: Activity::default(),
+            freeing: Activity::default(),
             detector: Mutex::default(),
             detection_progress: Default::default(),
         };
