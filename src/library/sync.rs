@@ -10,14 +10,13 @@
 //! last attempt failed; files the service rejected aren't retried.
 //!
 //! Derivatives such as thumbnails (see `derivatives`) are synced too, ahead
-//! of the originals. Only uploading is done for now; the intent is that a
-//! device short on space can download a library's thumbnails, and its
-//! originals only as they're wanted.
+//! of the originals, so a device short on space can download a library's
+//! thumbnails, and its originals only as they're wanted (see `download`).
 //!
 //! Like the rest of the catalog, this blocks; call it from a background
 //! thread.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -34,7 +33,7 @@ use crate::plugins::{
 
 /// After this many failures in a row, presumably the service or network is
 /// down, so the upload stops.
-const MAX_FAILURES_IN_A_ROW: usize = 5;
+pub(super) const MAX_FAILURES_IN_A_ROW: usize = 5;
 
 /// A target the library syncs to.
 #[derive(Clone, Debug, PartialEq)]
@@ -97,7 +96,7 @@ impl Library {
         sync_targets(&self.catalog)
     }
 
-    fn sync_target(&self, id: Id) -> Result<LibraryTarget> {
+    pub(super) fn sync_target(&self, id: Id) -> Result<LibraryTarget> {
         self.sync_targets()?
             .into_iter()
             .find(|target| target.id == id)
@@ -116,12 +115,50 @@ impl Library {
     }
 
     /// Stops syncing to a target, forgetting what was synced. What was
-    /// uploaded stays there.
+    /// uploaded stays there. Refused if that would lose track of the only
+    /// copy of originals that have been evicted from this device.
     pub fn remove_sync_target(&self, id: Id) -> Result<()> {
+        let mut elsewhere = HashSet::new();
+        for target in self.sync_targets()? {
+            if target.id != id {
+                elsewhere.extend(self.synced_items(target.id)?);
+            }
+        }
+        let stranded = self
+            .synced_items(id)?
+            .into_iter()
+            .filter(|path| !elsewhere.contains(path))
+            .filter(|path| !self.info.path.join(path).is_file())
+            .count();
+        if stranded > 0 {
+            bail!(
+                "{stranded} files are only on this target, not on this device. Pin their photos \
+                 to download them first."
+            );
+        }
         self.catalog.remove_sync_target(id)
     }
 
-    fn sync_items(&self, id: Id) -> Result<HashMap<String, SyncItemRecord>> {
+    /// The files safely on a target.
+    fn synced_items(&self, id: Id) -> Result<Vec<String>> {
+        Ok(self
+            .sync_items(id)?
+            .into_values()
+            .filter(|item| item.state == SyncState::Synced)
+            .map(|item| item.path)
+            .collect())
+    }
+
+    /// The files safely on any target.
+    pub(super) fn synced_paths(&self) -> Result<HashSet<String>> {
+        let mut paths = HashSet::new();
+        for target in self.sync_targets()? {
+            paths.extend(self.synced_items(target.id)?);
+        }
+        Ok(paths)
+    }
+
+    pub(super) fn sync_items(&self, id: Id) -> Result<HashMap<String, SyncItemRecord>> {
         sync_items(&self.catalog, id)
     }
 
@@ -158,6 +195,7 @@ impl Library {
             .filter(|_| plugin.info.capabilities.contains(Capabilities::MULTIPART));
 
         let items = self.sync_items(id)?;
+        let synced = self.synced_paths()?;
         // The files that need uploading, with their photos (by index) and
         // sizes: derivatives first, so a library's thumbnails get there well
         // ahead of its originals, then originals, oldest photos first.
@@ -171,6 +209,10 @@ impl Library {
                 items
                     .get(&file.path)
                     .is_none_or(|item| item.state == SyncState::Failed)
+            })
+            // Evicted from this device, so it can't go from here.
+            .filter(|(_, file)| {
+                !synced.contains(&file.path) || self.info.path.join(&file.path).is_file()
             })
             .map(|(photo, file)| {
                 let size = std::fs::metadata(self.info.path.join(&file.path))
@@ -876,6 +918,7 @@ fn media_type(path: &str) -> &'static str {
 
 #[cfg(test)]
 pub(crate) mod test_support {
+    use std::collections::HashMap;
     use std::io::{BufRead as _, BufReader, Read as _, Write as _};
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
@@ -908,7 +951,11 @@ pub(crate) mod test_support {
         received: Arc<Mutex<Vec<Received>>>,
         /// Statuses for requests whose path and query contain the string.
         failures: Arc<Mutex<Vec<(String, u16)>>>,
+        /// What's been uploaded whole, by path, for GETs to return.
+        objects: Objects,
     }
+
+    type Objects = Arc<Mutex<HashMap<String, Vec<u8>>>>;
 
     impl FakeS3 {
         pub fn start() -> Self {
@@ -916,18 +963,20 @@ pub(crate) mod test_support {
             let endpoint = format!("http://{}", listener.local_addr().unwrap());
             let received = Arc::new(Mutex::new(Vec::new()));
             let failures = Arc::new(Mutex::new(Vec::new()));
-            let (log, script) = (received.clone(), failures.clone());
+            let objects = Objects::default();
+            let (log, script, stored) = (received.clone(), failures.clone(), objects.clone());
             std::thread::spawn(move || {
                 for stream in listener.incoming() {
                     let Ok(stream) = stream else { return };
-                    let (log, script) = (log.clone(), script.clone());
-                    std::thread::spawn(move || answer(stream, &log, &script));
+                    let (log, script, stored) = (log.clone(), script.clone(), stored.clone());
+                    std::thread::spawn(move || answer(stream, &log, &script, &stored));
                 }
             });
             Self {
                 endpoint,
                 received,
                 failures,
+                objects,
             }
         }
 
@@ -942,6 +991,21 @@ pub(crate) mod test_support {
             .into_iter()
             .map(|(k, v)| (k.to_owned(), v.to_owned()))
             .collect()
+        }
+
+        /// Changes what's stored at every path containing `pattern`.
+        pub fn corrupt(&self, pattern: &str) {
+            for (path, object) in self.objects.lock().unwrap().iter_mut() {
+                if path.contains(pattern) {
+                    object[0] ^= 0xff;
+                }
+            }
+        }
+
+        /// Removes what's stored at every path containing `pattern`.
+        pub fn lose(&self, pattern: &str) {
+            let mut objects = self.objects.lock().unwrap();
+            objects.retain(|path, _| !path.contains(pattern));
         }
 
         pub fn take(&self) -> Vec<Received> {
@@ -965,6 +1029,7 @@ pub(crate) mod test_support {
         mut stream: std::net::TcpStream,
         log: &Mutex<Vec<Received>>,
         script: &Mutex<Vec<(String, u16)>>,
+        objects: &Objects,
     ) {
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut line = String::new();
@@ -997,11 +1062,22 @@ pub(crate) mod test_support {
                 None => 200,
             }
         };
-        let query = path.split_once('?').map_or("", |(_, query)| query);
+        let (object, query) = path.split_once('?').unwrap_or((&path, ""));
+        if status == 200 && method == "PUT" {
+            let mut objects = objects.lock().unwrap();
+            objects.insert(object.to_owned(), body.clone());
+        }
+        let stored = (status == 200 && method == "GET")
+            .then(|| objects.lock().unwrap().get(object).cloned());
         let part = query
             .split('&')
             .find_map(|pair| pair.strip_prefix("partNumber="));
+        let status = if stored == Some(None) { 404 } else { status };
         let (etag, response) = match (status, method.as_str()) {
+            (404, _) => (
+                String::new(),
+                "<Error><Code>NoSuchKey</Code></Error>".to_owned(),
+            ),
             (403, _) => (
                 String::new(),
                 "<Error><Code>InvalidAccessKeyId</Code><Message>Nope</Message></Error>".to_owned(),
@@ -1034,13 +1110,15 @@ pub(crate) mod test_support {
             headers,
             body,
         });
+        let response = stored.flatten().unwrap_or(response.into_bytes());
         write!(
             stream,
             "HTTP/1.1 {status} X\r\nETag: \"{etag}\"\r\nContent-Length: {}\r\n\
-             Connection: close\r\n\r\n{response}",
+             Connection: close\r\n\r\n",
             response.len()
         )
         .unwrap();
+        stream.write_all(&response).unwrap();
     }
 }
 

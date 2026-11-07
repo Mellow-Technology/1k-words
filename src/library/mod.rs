@@ -21,6 +21,7 @@ mod albums;
 mod catalog;
 mod derivatives;
 mod device;
+mod download;
 mod id;
 mod import;
 mod manage;
@@ -33,6 +34,7 @@ pub use albums::{
 };
 pub use catalog::AlbumConflict;
 pub use device::Device;
+pub use download::{DownloadSource, DownloadSummary};
 pub use id::Id;
 pub use import::{ImportSession, ImportSummary, Imported, PreparedImport, prepare, source_drive};
 pub use manage::{LibraryHandle, LibraryStats, MoveProgress};

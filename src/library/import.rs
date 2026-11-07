@@ -20,7 +20,7 @@ use super::{Library, ORIGINALS_DIR, now};
 use crate::location::Location;
 use crate::photos::{self, Photo};
 
-const STAGING_DIR: &str = ".import";
+pub(super) const STAGING_DIR: &str = ".import";
 const COPY_BUFFER_SIZE: usize = 1 << 20;
 
 /// The shots found for an import, ready to queue.
