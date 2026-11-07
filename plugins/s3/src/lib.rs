@@ -1,5 +1,5 @@
-//! A sync plugin that uploads to S3 and S3-compatible storage (AWS, Cloudflare
-//! R2, Backblaze B2, MinIO, Wasabi...).
+//! A sync plugin that uploads to and downloads from S3 and S3-compatible
+//! storage (AWS, Cloudflare R2, Backblaze B2, MinIO, Wasabi...).
 //!
 //! Each file is stored under the target's prefix by the path the app gives
 //! it (the library's folder, then the file's path in the library), e.g.
@@ -50,7 +50,7 @@ impl Guest for S3 {
             id: "s3".into(),
             name: "S3-Compatible Storage".into(),
             version: env!("CARGO_PKG_VERSION").into(),
-            capabilities: Capabilities::UPLOAD | Capabilities::MULTIPART,
+            capabilities: Capabilities::UPLOAD | Capabilities::DOWNLOAD | Capabilities::MULTIPART,
             config: vec![
                 field(
                     "endpoint",
@@ -253,8 +253,22 @@ impl Guest for S3 {
         }
     }
 
-    fn download(_: Config, _: RemoteItem, _: &Sink) -> Result<(), SyncError> {
-        Err(SyncError::Unsupported)
+    fn download(config: Config, item: RemoteItem, into: &Sink) -> Result<(), SyncError> {
+        let target = Target::new(&config)?;
+        // The key `upload` returned, which has the prefix in it, so a file
+        // can still be found after the target's folder setting changes.
+        let response = target.send(
+            "GET",
+            &item.key,
+            &[],
+            &[],
+            &sigv4::sha256_hex(b""),
+            |request| http::receive_file(&request, into),
+        )?;
+        match response.status {
+            200..=299 => Ok(()),
+            _ => Err(error_from(&response)),
+        }
     }
 
     fn list(_: Config, _: Option<String>) -> Result<Listing, SyncError> {

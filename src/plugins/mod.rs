@@ -369,6 +369,26 @@ impl Session {
         result.map_err(|e| anyhow!("{e:?}"))
     }
 
+    /// Downloads `item` to the file at `path`, replacing any that's there.
+    /// What's written is only whole if this returns `Ok(Ok(()))`, so write
+    /// to somewhere that's not yet in use.
+    pub fn download(&mut self, item: &RemoteItem, path: &Path) -> Result<Result<(), SyncError>> {
+        let sink = host::Sink::create(path)?;
+        let sink = self.store.data_mut().table.push(sink)?;
+        let result = self.instance.onekwords_plugins_sync().call_download(
+            &mut self.store,
+            &self.config,
+            item,
+            Resource::new_borrow(sink.rep()),
+        );
+        let sink = self.store.data_mut().table.delete(sink);
+        let result = result.map_err(|e| anyhow!("{e:?}"))?;
+        if result.is_ok() {
+            sink?.finish()?;
+        }
+        Ok(result)
+    }
+
     pub fn finish_upload(
         &mut self,
         item: &LocalItem,

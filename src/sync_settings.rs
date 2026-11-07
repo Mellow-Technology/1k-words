@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use anyhow::{Context as _, Result, anyhow, bail};
 use gpui_kit::assets::IconName as LucideIcon;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::dialog::DialogFooter;
@@ -24,14 +25,16 @@ use gpui_kit::component::setting::{SettingField, SettingGroup, SettingItem, Sett
 use gpui_kit::component::{ActiveTheme, Disableable as _, Icon, Sizable, WindowExt as _};
 use gpui_kit::{
     App, AppContext as _, Entity, Focusable as _, Global, ParentElement, PromptLevel, SharedString,
-    Styled, Window, div, px,
+    Styled, Task, Window, div, px,
 };
 
 use crate::config_form::{ConfigForm, form_row};
 use crate::gallery::{show_error, show_warning};
 use crate::library::{
-    self, LibraryInfo, LibraryTarget, SyncStatus, TargetSettings, UploadProgress, UploadSummary,
+    self, DownloadSource, DownloadSummary, Library, LibraryInfo, LibraryTarget, SyncStatus,
+    TargetSettings, UploadProgress, UploadSummary,
 };
+use crate::photos::Photo;
 use crate::plugins::{Config, FieldKind, Plugin, Plugins};
 use crate::settings;
 use crate::sync_targets::{self, NewTarget, TargetInfo};
@@ -960,14 +963,28 @@ fn start_upload(
             config: sync_targets::config(&target)?,
             plugin: target.plugin,
         };
-        library.upload(
+        let uploaded = library.upload(
             &plugins,
             link_id,
             &settings,
             &progress.cancel,
             &progress.sent,
             |p| progress.update(&p),
-        )
+        )?;
+        let mut downloaded = DownloadSummary::default();
+        if uploaded.stopped.is_none() {
+            // Thumbnails this device lacks, such as those of originals it's
+            // let go of, and what pinned albums have gained since. Other
+            // originals only come when they're asked for.
+            let cancel = &progress.cancel;
+            downloaded = library.download_derivatives(&plugins, link_id, &settings, cancel)?;
+            let source = DownloadSource {
+                id: link_id,
+                settings,
+            };
+            downloaded.add(library.download_pinned(&plugins, &[source], cancel)?);
+        }
+        anyhow::Ok((uploaded, downloaded))
     });
     cx.spawn(async move |cx| {
         let result = task.await;
@@ -991,11 +1008,67 @@ fn start_upload(
     .detach();
 }
 
-/// How an upload went, for after the target's status.
-fn result_text(result: anyhow::Result<UploadSummary>) -> String {
+/// What's needed to download from a library's targets, in the background.
+/// Fails if it can't be done now.
+fn download_setup(cx: &App) -> Result<(Arc<Plugins>, Vec<TargetInfo>)> {
+    if crate::library_settings::is_busy(cx) {
+        bail!("A library is being moved or deleted.");
+    }
+    let plugins = sync_targets::plugins(cx)
+        .map_err(|error| anyhow!(error))?
+        .context("The sync plugins are still loading.")?;
+    Ok((plugins, sync_targets::list(cx).to_vec()))
+}
+
+/// The targets of `library` that are set up on this device. Blocks on the
+/// keychain.
+fn download_sources(library: &Library, targets: &[TargetInfo]) -> Result<Vec<DownloadSource>> {
+    let mut sources = Vec::new();
+    for link in library.sync_targets()? {
+        let Some(target) = targets.iter().find(|target| target.id == link.target) else {
+            continue;
+        };
+        match sync_targets::config(target) {
+            Ok(config) => sources.push(DownloadSource {
+                id: link.id,
+                settings: TargetSettings {
+                    plugin: target.plugin.clone(),
+                    config,
+                },
+            }),
+            Err(error) => eprintln!("couldn't read a target's settings: {error:#}"),
+        }
+    }
+    Ok(sources)
+}
+
+/// Fetches what a photo's missing of its originals, from whichever of its
+/// library's targets has them. Unlike syncing, this is done even while
+/// automatic sync is paused: the user's asked for it.
+pub fn fetch_original(library: Arc<Library>, photo: Photo, cx: &App) -> Task<Result<()>> {
+    let setup = download_setup(cx);
+    cx.background_spawn(async move {
+        let (plugins, targets) = setup?;
+        let sources = download_sources(&library, &targets)?;
+        library.fetch_original(&plugins, &sources, &photo, &AtomicBool::new(false))
+    })
+}
+
+/// Downloads what a library's pinned photos and albums need.
+pub fn download_pinned(library: Arc<Library>, cx: &App) -> Task<Result<DownloadSummary>> {
+    let setup = download_setup(cx);
+    cx.background_spawn(async move {
+        let (plugins, targets) = setup?;
+        let sources = download_sources(&library, &targets)?;
+        library.download_pinned(&plugins, &sources, &AtomicBool::new(false))
+    })
+}
+
+/// How a sync went, for after the target's status.
+fn result_text(result: anyhow::Result<(UploadSummary, DownloadSummary)>) -> String {
     match result {
         Err(error) => format!("The last sync failed: {error:#}"),
-        Ok(summary) => {
+        Ok((summary, downloaded)) => {
             let mut text = match summary.uploaded {
                 0 => "Nothing new to upload.".to_owned(),
                 1 => "Uploaded 1 file.".to_owned(),
@@ -1011,6 +1084,23 @@ fn result_text(result: anyhow::Result<UploadSummary>) -> String {
                 )),
             }
             if let Some(stopped) = summary.stopped {
+                text.push_str(&format!(" {stopped}"));
+            }
+            match downloaded.downloaded {
+                0 => {}
+                1 => text.push_str(" Downloaded 1 file."),
+                n => text.push_str(&format!(" Downloaded {} files.", format_count(n))),
+            }
+            match downloaded.failed.len() {
+                0 => {}
+                1 => text.push_str(&format!(" 1 download failed: {}", downloaded.failed[0].1)),
+                n => text.push_str(&format!(
+                    " {} downloads failed, the last with: {}",
+                    format_count(n),
+                    downloaded.failed[n - 1].1
+                )),
+            }
+            if let Some(stopped) = downloaded.stopped {
                 text.push_str(&format!(" {stopped}"));
             }
             text

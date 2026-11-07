@@ -79,6 +79,20 @@ pub struct Sink {
     file: File,
 }
 
+impl Sink {
+    /// Creates the file at `path`, replacing any that's there.
+    pub fn create(path: &Path) -> Result<Self> {
+        Ok(Self {
+            file: File::create(path)?,
+        })
+    }
+
+    /// Flushes what's been written to disk.
+    pub fn finish(&self) -> Result<()> {
+        Ok(self.file.sync_all()?)
+    }
+}
+
 impl log::Host for State {
     fn write(&mut self, level: log::Level, message: String) {
         let level = match level {

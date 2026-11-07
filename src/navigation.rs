@@ -115,6 +115,9 @@ pub struct NavigationContext {
     pub move_album: MoveAlbumCallback,
     /// Turns showing the photos of the albums in an album on or off.
     pub toggle_show_nested: AlbumCallback,
+    /// The albums pinned to stay on this device.
+    pub pinned_albums: Arc<Vec<AlbumId>>,
+    pub toggle_album_pin: AlbumCallback,
 }
 
 /// The gallery's selected photos, being dragged onto an album.
@@ -432,6 +435,8 @@ fn album_item(
     let rename_album = context.rename_album.clone();
     let delete_album = context.delete_album.clone();
     let toggle_show_nested = context.toggle_show_nested.clone();
+    let toggle_album_pin = context.toggle_album_pin.clone();
+    let pinned = context.pinned_albums.contains(&id);
     let (show_nested, nested) = (album.show_nested, album.parent.is_some());
     let row = row.context_menu(move |menu, _, _| {
         let new_album = new_album.clone();
@@ -439,6 +444,7 @@ fn album_item(
         let delete_album = delete_album.clone();
         let move_album = move_album.clone();
         let toggle_show_nested = toggle_show_nested.clone();
+        let toggle_album_pin = toggle_album_pin.clone();
         menu.item(
             PopupMenuItem::new("New Album Inside…")
                 .on_click(move |_, window, cx| new_album(Some(id), window, cx)),
@@ -460,6 +466,11 @@ fn album_item(
                     .on_click(move |_, window, cx| move_album(id, None, window, cx)),
             )
         })
+        .item(
+            PopupMenuItem::new("Keep on This Device")
+                .checked(pinned)
+                .on_click(move |_, window, cx| toggle_album_pin(id, window, cx)),
+        )
         .separator()
         .item(
             PopupMenuItem::new("Delete Album…")

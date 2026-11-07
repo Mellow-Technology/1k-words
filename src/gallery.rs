@@ -280,6 +280,10 @@ pub struct Gallery {
     status: Status,
     /// The open library's albums, for the sidebar.
     albums: Arc<Vec<Album>>,
+    /// What's pinned to stay on this device: the albums, and every file of
+    /// the photos pinned, themselves or by an album.
+    pinned_albums: Arc<Vec<AlbumId>>,
+    pinned_files: Arc<HashSet<PathBuf>>,
     _albums_task: Option<Task<()>>,
     /// Albums deleted on one device but changed on another since, to ask
     /// about one at a time, and whether one's being asked about.
@@ -386,6 +390,8 @@ impl Gallery {
             source: Source::Library,
             status: Status::Loading,
             albums: Arc::default(),
+            pinned_albums: Arc::default(),
+            pinned_files: Arc::default(),
             _albums_task: None,
             album_conflicts: VecDeque::new(),
             asking_about_conflict: false,
@@ -476,13 +482,29 @@ impl Gallery {
             return;
         };
         self._albums_task = Some(cx.spawn(async move |this, cx| {
-            let (albums, conflicts) = cx
-                .background_spawn(async move { (library.albums(), library.album_conflicts()) })
+            let (albums, conflicts, pins) = cx
+                .background_spawn(async move {
+                    let pins = library.pinned_albums().and_then(|albums| {
+                        let files = library.pinned_originals()?;
+                        let root = &library.info.path;
+                        let files: HashSet<PathBuf> =
+                            files.iter().map(|file| root.join(file)).collect();
+                        Ok((albums, files))
+                    });
+                    (library.albums(), library.album_conflicts(), pins)
+                })
                 .await;
             this.update(cx, |this, cx| {
                 match albums {
                     Ok(albums) => this.albums = Arc::new(albums),
                     Err(error) => eprintln!("couldn't read the albums: {error:#}"),
+                }
+                match pins {
+                    Ok((albums, files)) => {
+                        this.pinned_albums = Arc::new(albums);
+                        this.pinned_files = Arc::new(files);
+                    }
+                    Err(error) => eprintln!("couldn't read what's pinned: {error:#}"),
                 }
                 match conflicts {
                     Ok(conflicts) => this.album_conflicts = conflicts.into(),
@@ -661,6 +683,87 @@ impl Gallery {
                     show_error("The album couldn't be changed.", &error, window, cx);
                 }
                 this.albums_rearranged(affects_shown, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Pins an album to stay on this device, downloading what it needs, or
+    /// takes the pin off.
+    fn toggle_album_pin(&mut self, album: AlbumId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(library) = library::current(cx) else {
+            return;
+        };
+        let pin = !self.pinned_albums.contains(&album);
+        self.change_pins(pin, window, cx, {
+            let library = library.clone();
+            move || match pin {
+                true => library.pin_album(album),
+                false => library.unpin_album(album),
+            }
+        });
+    }
+
+    /// Pins the selected photos to stay on this device, downloading what
+    /// they need; or if they're all pinned, takes their pins off.
+    fn toggle_selection_pin(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(library) = library::current(cx) else {
+            return;
+        };
+        let photos = self.selected_photos();
+        let pin = !self.selection_pinned();
+        self.change_pins(pin, window, cx, {
+            let library = library.clone();
+            move || {
+                for photo in &photos {
+                    match pin {
+                        true => library.pin_photo(photo)?,
+                        false => library.unpin_photo(photo)?,
+                    }
+                }
+                Ok(())
+            }
+        });
+    }
+
+    /// Whether every selected photo is pinned, itself or by an album.
+    fn selection_pinned(&self) -> bool {
+        let photos = self.selected_photos();
+        !photos.is_empty() && photos.iter().all(|p| self.pinned_files.contains(&p.path))
+    }
+
+    /// Changes what's pinned with `change`, in the background, then, if
+    /// `pinned`, downloads what that needs.
+    fn change_pins(
+        &mut self,
+        pinned: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        change: impl FnOnce() -> anyhow::Result<()> + Send + 'static,
+    ) {
+        let Some(library) = library::current(cx) else {
+            return;
+        };
+        let change = cx.background_spawn(async move { change() });
+        cx.spawn_in(window, async move |this, cx| {
+            let changed = change.await;
+            let download = this.update_in(cx, |this, window, cx| {
+                this.load_albums(cx);
+                if let Err(error) = &changed {
+                    show_error("What's kept couldn't be changed.", error, window, cx);
+                }
+                (pinned && changed.is_ok()).then(|| {
+                    this.notice = Some("Downloading what's needed…".into());
+                    cx.notify();
+                    crate::sync_settings::download_pinned(library, cx)
+                })
+            });
+            let Ok(Some(download)) = download else { return };
+            let downloaded = download.await;
+            this.update(cx, |this, cx| {
+                this.notice = Some(pin_result_text(downloaded).into());
+                cx.notify();
             })
             .ok();
         })
@@ -2299,6 +2402,8 @@ impl Gallery {
                         .ok();
                 }),
                 toggle_show_nested: album_callback(&albums_gallery, Self::toggle_show_nested),
+                pinned_albums: self.pinned_albums.clone(),
+                toggle_album_pin: album_callback(&albums_gallery, Self::toggle_album_pin),
             },
             cx,
         )
@@ -2443,6 +2548,8 @@ impl Gallery {
             .stacks
             .get(ix)
             .and_then(|stack| stack.cover().live_video.clone())
+            // It may have been evicted, and isn't fetched just for a hover.
+            .filter(|video| video.is_file())
         else {
             return;
         };
@@ -2502,6 +2609,19 @@ impl Gallery {
         };
         tile.context_menu(move |menu, window, cx| {
             let (gallery, albums) = (gallery.clone(), albums.clone());
+            let pinned = gallery
+                .read_with(cx, |gallery, _| gallery.selection_pinned())
+                .unwrap_or(false);
+            let keep = {
+                let gallery = gallery.clone();
+                PopupMenuItem::new("Keep on This Device")
+                    .checked(pinned)
+                    .on_click(move |_, window, cx| {
+                        gallery
+                            .update(cx, |gallery, cx| gallery.toggle_selection_pin(window, cx))
+                            .ok();
+                    })
+            };
             let remove = shown_album.map(|_| {
                 let gallery = gallery.clone();
                 PopupMenuItem::new("Remove from Album").on_click(move |_, window, cx| {
@@ -2539,10 +2659,11 @@ impl Gallery {
                     }),
                 )
             });
-            match remove {
+            let menu = match remove {
                 Some(remove) => menu.item(remove),
                 None => menu,
-            }
+            };
+            menu.item(keep)
         })
         .into_any_element()
     }
@@ -3493,6 +3614,26 @@ impl Render for Gallery {
                             .children(self.render_quick_preview(cx)),
                     }),
             )
+    }
+}
+
+/// How downloading what pinned photos need went.
+fn pin_result_text(result: anyhow::Result<library::DownloadSummary>) -> String {
+    match result {
+        Err(error) => format!("Couldn't download what's kept: {error:#}"),
+        Ok(summary) => match (summary.failed.last(), summary.stopped) {
+            (Some((_, error)), _) => format!(
+                "Downloaded {}, but {} failed: {error}",
+                summary.downloaded,
+                summary.failed.len()
+            ),
+            (None, Some(stopped)) => stopped,
+            (None, None) if summary.unavailable > 0 => format!(
+                "Kept, but {} files aren't on a sync target that can download them.",
+                summary.unavailable
+            ),
+            (None, None) => "Kept on this device.".into(),
+        },
     }
 }
 
@@ -5003,6 +5144,113 @@ mod tests {
         );
         assert_eq!(selection(cx), [5]);
 
+        std::fs::remove_dir_all(folder).ok();
+    }
+
+    #[gpui_kit::test]
+    fn fetches_evicted_photos_when_opened_or_pinned(cx: &mut TestAppContext) {
+        use crate::library::sync_test_support::FakeS3;
+        use crate::library::{DownloadSource, TargetSettings};
+        use crate::sync_targets;
+
+        let folder = photo_folder(19);
+        let (window, gallery) = open_gallery(folder.clone(), cx);
+        let frame = |cx: &mut TestAppContext| {
+            cx.run_until_parked();
+            cx.update_window(window, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+            cx.run_until_parked();
+        };
+        let library = cx.update(|cx| library::current(cx)).unwrap();
+
+        // Everything's uploaded, then the originals are evicted.
+        let s3 = FakeS3::start();
+        let root = std::env::temp_dir().join(format!("1k-words-kw27-{}", std::process::id()));
+        cx.update(|cx| sync_targets::test_support::init(root.clone(), cx));
+        let plugins = cx.update(|cx| sync_targets::plugins(cx)).unwrap().unwrap();
+        let config = sync_targets::validate(&plugins, "s3", s3.config()).unwrap();
+        let target = cx
+            .update(|cx| {
+                sync_targets::save(
+                    None,
+                    sync_targets::NewTarget {
+                        name: "Bucket".into(),
+                        plugin: "s3".into(),
+                        summary: String::new(),
+                        config: config.clone(),
+                    },
+                    cx,
+                )
+            })
+            .unwrap();
+        let source = DownloadSource {
+            id: library.add_sync_target(&target).unwrap(),
+            settings: TargetSettings {
+                plugin: "s3".into(),
+                config,
+            },
+        };
+        let summary = library
+            .upload(
+                &plugins,
+                source.id,
+                &source.settings,
+                &AtomicBool::new(false),
+                &Default::default(),
+                |_| {},
+            )
+            .unwrap();
+        assert!(summary.failed.is_empty(), "{:?}", summary.failed);
+        let photos = library.photos().unwrap();
+        for photo in &photos {
+            let path = photo.path.strip_prefix(&library.info.path).unwrap();
+            library.evict_original(path.to_str().unwrap()).unwrap();
+        }
+
+        // Opening one fetches it, and only it, then shows it.
+        cx.update_window(window, |_, window, cx| {
+            gallery.update(cx, |gallery, cx| {
+                gallery.open_viewer(0, StartFrame::Cover, window, cx)
+            })
+        })
+        .unwrap();
+        frame(cx);
+        let shown = gallery.read_with(cx, |gallery, cx| {
+            let viewer = gallery.viewer.as_ref().unwrap().read(cx);
+            viewer.load_result()
+        });
+        assert_eq!(shown, Ok(true));
+        assert_eq!(photos.iter().filter(|p| p.path.is_file()).count(), 1);
+        assert_eq!(library.fetched_originals().unwrap().len(), 1);
+        cx.update_window(window, |_, window, cx| {
+            gallery.update(cx, |gallery, cx| gallery.close_viewer(window, cx))
+        })
+        .unwrap();
+        frame(cx);
+
+        // Pinning from the menu downloads what the selection needs.
+        cx.update_window(window, |_, window, cx| {
+            window.right_click(("tile", 1usize), cx)
+        })
+        .unwrap();
+        frame(cx);
+        cx.update_window(window, |_, window, cx| {
+            window
+                .within(("tile", 1usize))
+                .within("popup-menu")
+                .click(1usize, cx);
+        })
+        .unwrap();
+        frame(cx);
+        assert_eq!(photos.iter().filter(|p| p.path.is_file()).count(), 2);
+        assert_eq!(library.pinned_originals().unwrap().len(), 1);
+        assert_eq!(
+            gallery.read_with(cx, |gallery, _| gallery.notice.clone()),
+            Some("Kept on this device.".into())
+        );
+
+        cx.update(|cx| sync_targets::delete(&target, cx)).unwrap();
+        library::test_support::remove(&root);
         std::fs::remove_dir_all(folder).ok();
     }
 

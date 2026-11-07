@@ -53,6 +53,17 @@ pub struct Photo {
 }
 
 impl Photo {
+    /// Its files: the one displayed, its raw pair and Live Photo video.
+    pub fn files(&self) -> impl Iterator<Item = &PathBuf> {
+        [
+            Some(&self.path),
+            self.raw_pair.as_ref(),
+            self.live_video.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+    }
+
     pub fn aspect_ratio(&self) -> f32 {
         if self.width == 0 || self.height == 0 {
             1.0
