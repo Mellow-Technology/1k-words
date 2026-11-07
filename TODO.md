@@ -89,8 +89,6 @@ its targets on the Libraries page (`src/sync_settings.rs`).
   - record which originals are on the device (say, a column on `photos`),
     and show and open photos whose originals aren't;
   - free up space by removing originals that are safely synced.
-- **More derivatives**, such as viewer-sized previews and video posters.
-  Each is a `DerivativeKind`, with its own folder.
 
 ## Object detection
 

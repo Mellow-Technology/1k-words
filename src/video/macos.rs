@@ -11,16 +11,20 @@ use std::ptr::{NonNull, null_mut};
 
 use ffmpeg_next as ffmpeg;
 use ffmpeg_next::ffi;
+use image::{Rgb, RgbImage};
 use objc2_core_foundation::{CFBoolean, CFDictionary, CFRetained, CFString, CFType, Type as _};
 use objc2_core_video::{
-    CVPixelBuffer, CVPixelBufferCreate, CVPixelBufferGetHeight, CVPixelBufferGetPixelFormatType,
-    CVPixelBufferGetWidth, kCVImageBufferColorPrimaries_ITU_R_2020,
-    kCVImageBufferColorPrimaries_P3_D65, kCVImageBufferColorPrimariesKey,
-    kCVImageBufferTransferFunction_ITU_R_709_2, kCVImageBufferTransferFunction_ITU_R_2100_HLG,
-    kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ, kCVImageBufferTransferFunctionKey,
-    kCVImageBufferYCbCrMatrix_ITU_R_601_4, kCVImageBufferYCbCrMatrixKey,
-    kCVPixelBufferIOSurfacePropertiesKey, kCVPixelBufferMetalCompatibilityKey,
-    kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, kCVReturnSuccess,
+    CVPixelBuffer, CVPixelBufferCreate, CVPixelBufferGetBaseAddressOfPlane,
+    CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetHeight, CVPixelBufferGetHeightOfPlane,
+    CVPixelBufferGetPixelFormatType, CVPixelBufferGetWidth, CVPixelBufferGetWidthOfPlane,
+    CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
+    kCVImageBufferColorPrimaries_ITU_R_2020, kCVImageBufferColorPrimaries_P3_D65,
+    kCVImageBufferColorPrimariesKey, kCVImageBufferTransferFunction_ITU_R_709_2,
+    kCVImageBufferTransferFunction_ITU_R_2100_HLG, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ,
+    kCVImageBufferTransferFunctionKey, kCVImageBufferYCbCrMatrix_ITU_R_601_4,
+    kCVImageBufferYCbCrMatrixKey, kCVPixelBufferIOSurfacePropertiesKey,
+    kCVPixelBufferMetalCompatibilityKey, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+    kCVReturnSuccess,
 };
 use objc2_video_toolbox::{
     VTPixelRotationSession, VTPixelTransferSession, VTSessionSetProperty,
@@ -275,14 +279,44 @@ fn create_pixel_buffer(width: usize, height: usize) -> Option<CFRetained<CVPixel
 
 /// The colour GPUI's surface shader draws at the centre of `buffer`, using
 /// the same YCbCr-to-RGB conversion (BT.601, full range).
+/// The surface's pixels, as GPUI's `surface_fragment` shader draws them.
+pub fn surface_image(buffer: &CVPixelBuffer) -> RgbImage {
+    unsafe { CVPixelBufferLockBaseAddress(buffer, CVPixelBufferLockFlags::ReadOnly) };
+    let plane = |plane: usize| unsafe {
+        let row = CVPixelBufferGetBytesPerRowOfPlane(buffer, plane);
+        let height = CVPixelBufferGetHeightOfPlane(buffer, plane);
+        let base = CVPixelBufferGetBaseAddressOfPlane(buffer, plane) as *const u8;
+        (std::slice::from_raw_parts(base, row * height), row)
+    };
+    let ((luma, luma_row), (chroma_plane, chroma_row)) = (plane(0), plane(1));
+    let width = CVPixelBufferGetWidthOfPlane(buffer, 0) as u32;
+    let height = CVPixelBufferGetHeightOfPlane(buffer, 0) as u32;
+    let image = RgbImage::from_fn(width, height, |x, y| {
+        let (x, y) = (x as usize, y as usize);
+        let chroma = (y / 2) * chroma_row + (x / 2) * 2;
+        Rgb(surface_rgb(
+            luma[y * luma_row + x],
+            chroma_plane[chroma],
+            chroma_plane[chroma + 1],
+        ))
+    });
+    unsafe { CVPixelBufferUnlockBaseAddress(buffer, CVPixelBufferLockFlags::ReadOnly) };
+    image
+}
+
+/// From GPUI's `surface_fragment` shader.
+fn surface_rgb(y: u8, cb: u8, cr: u8) -> [u8; 3] {
+    let [y, cb, cr] = [y, cb, cr].map(|v| f32::from(v) / 255.);
+    [
+        y + 1.402 * (cr - 0.5),
+        y - 0.3441 * (cb - 0.5) - 0.7141 * (cr - 0.5),
+        y + 1.772 * (cb - 0.5),
+    ]
+    .map(|v| (v.clamp(0., 1.) * 255.).round() as u8)
+}
+
 #[cfg(test)]
 pub fn surface_centre_colour(buffer: &CVPixelBuffer) -> [u8; 3] {
-    use objc2_core_video::{
-        CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRowOfPlane,
-        CVPixelBufferGetHeightOfPlane, CVPixelBufferGetWidthOfPlane, CVPixelBufferLockBaseAddress,
-        CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
-    };
-
     let sample = |plane: usize, bytes_per_pixel: usize| unsafe {
         let (width, height) = (
             CVPixelBufferGetWidthOfPlane(buffer, plane),
@@ -297,12 +331,5 @@ pub fn surface_centre_colour(buffer: &CVPixelBuffer) -> [u8; 3] {
     let (y, cb_cr) = (sample(0, 1), sample(1, 2));
     unsafe { CVPixelBufferUnlockBaseAddress(buffer, CVPixelBufferLockFlags::ReadOnly) };
 
-    // From GPUI's `surface_fragment` shader.
-    let [y, cb, cr] = [y[0], cb_cr[0], cb_cr[1]].map(|v| f32::from(v) / 255.);
-    [
-        y + 1.402 * (cr - 0.5),
-        y - 0.3441 * (cb - 0.5) - 0.7141 * (cr - 0.5),
-        y + 1.772 * (cb - 0.5),
-    ]
-    .map(|v| (v.clamp(0., 1.) * 255.).round() as u8)
+    surface_rgb(y[0], cb_cr[0], cb_cr[1])
 }

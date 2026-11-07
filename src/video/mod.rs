@@ -32,7 +32,7 @@ use gpui_kit::{
     AnyElement, App, Context, ObjectFit, RenderImage, SharedString, StyledImage, Task, img,
     prelude::*,
 };
-use image::{Frame, RgbaImage};
+use image::{DynamicImage, Frame, RgbaImage};
 
 use crate::decode;
 
@@ -44,6 +44,32 @@ enum VideoFrame {
     Surface(objc2_core_foundation::CFRetained<objc2_core_video::CVPixelBuffer>),
     /// A frame copied into a regular image.
     Image(Arc<RenderImage>),
+}
+
+impl VideoFrame {
+    /// The frame's pixels, as shown.
+    fn to_image(&self) -> Result<DynamicImage> {
+        match self {
+            #[cfg(target_os = "macos")]
+            VideoFrame::Surface(buffer) => {
+                Ok(DynamicImage::ImageRgb8(macos::surface_image(buffer)))
+            }
+            VideoFrame::Image(image) => {
+                let size = image.size(0);
+                let bytes = image
+                    .as_bytes(0)
+                    .ok_or_else(|| anyhow!("frame has no pixels"))?;
+                // BGRA, as `FrameOutput::copy` left it.
+                let mut buffer =
+                    RgbaImage::from_raw(size.width.0 as u32, size.height.0 as u32, bytes.to_vec())
+                        .ok_or_else(|| anyhow!("unexpected frame size"))?;
+                for pixel in buffer.pixels_mut() {
+                    pixel.0.swap(0, 2);
+                }
+                Ok(DynamicImage::ImageRgba8(buffer))
+            }
+        }
+    }
 }
 
 /// Sent from the decode thread.
@@ -189,6 +215,26 @@ fn finish_sound(sound: &audio::Sound, stop: &AtomicBool) {
     while !sound.is_finished() && !stop.load(Ordering::Relaxed) && Instant::now() < give_up {
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// The video's first frame, as playing it would show it (so rotated, and
+/// tone mapped where playing is).
+pub fn first_frame(path: &Path) -> Result<DynamicImage> {
+    let (mut sender, mut receiver) = mpsc::channel(2);
+    std::thread::scope(|scope| {
+        // Stops at the next frame once the receiver's gone.
+        let decoding =
+            scope.spawn(move || decode(path, &AtomicBool::new(false), &mut sender, true, None));
+        let first = futures::executor::block_on(receiver.next());
+        drop(receiver);
+        let decoded = decoding
+            .join()
+            .map_err(|_| anyhow!("decoding {} panicked", path.display()))?;
+        match first {
+            Some(Message::Frame(frame)) => frame.to_image(),
+            _ => decoded.and_then(|()| Err(anyhow!("no frames in {}", path.display()))),
+        }
+    })
 }
 
 /// Decodes the video's frames and sends them at their presentation times,
@@ -533,6 +579,30 @@ mod tests {
                 assert_close(colour, EXPECTED, &format!("{name} (hardware: {hardware})"));
             }
         }
+    }
+
+    /// Posters look as the video does, however it's encoded.
+    #[test]
+    fn first_frames_show_the_videos_colours() {
+        for name in ["bt709-limited.mov", "bt601-full.mov"] {
+            let image = first_frame(&fixture(name)).unwrap().into_rgb8();
+            let centre = image.get_pixel(image.width() / 2, image.height() / 2).0;
+            assert_close(centre, [0xC0, 0x30, 0x60], name);
+        }
+    }
+
+    #[test]
+    fn first_frame_of_something_else_fails() {
+        assert!(first_frame(Path::new("Cargo.toml")).is_err());
+    }
+
+    /// Unlike the copy path, posters of HDR video aren't washed out.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn first_frames_of_hdr_video_are_tone_mapped() {
+        let image = first_frame(&fixture("hlg-bt2020.mov")).unwrap().into_rgb8();
+        let [r, g, b] = image.get_pixel(image.width() / 2, image.height() / 2).0;
+        assert!(r > 128 && r > g + 64 && r > b + 32, "got {:?}", [r, g, b]);
     }
 
     /// HDR frames are tone mapped to SDR in GPUI's surface format. The exact

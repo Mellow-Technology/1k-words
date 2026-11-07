@@ -27,6 +27,7 @@ use anyhow::{Context as _, Result, anyhow, bail};
 
 use super::Library;
 use super::catalog::{Catalog, FileRole, LibraryFile, SyncItemRecord, SyncState};
+use super::derivatives::DerivativeKind;
 use super::id::Id;
 use crate::plugins::{
     Capabilities, Config, LocalItem, Multipart, Plugin, Plugins, RemoteItem, Session, SyncError,
@@ -159,8 +160,7 @@ impl Library {
 
         let items = self.sync_items(id)?;
         // The files that need uploading, with their photos (by index) and
-        // sizes: derivatives first, so a library's thumbnails get there well
-        // ahead of its originals, then originals, oldest photos first.
+        // sizes, in `upload_order`, oldest photos first.
         let mut pending: Vec<(usize, LibraryFile, u64)> = self
             .catalog
             .photo_files()?
@@ -178,7 +178,7 @@ impl Library {
                 (photo, file, size)
             })
             .collect();
-        pending.sort_by_key(|(photo, file, _)| (file.role == FileRole::Original, *photo));
+        pending.sort_by_key(|(photo, file, _)| (upload_order(file.role), *photo));
 
         let mut upload = Uploading {
             library: self,
@@ -832,6 +832,16 @@ fn folder_name(name: &str) -> String {
 }
 
 /// The file at `path` in the library, to upload into `folder`.
+/// Files upload in this order: thumbnails, so a whole library can be shown
+/// soon, then the other derivatives, which are much bigger, then originals.
+fn upload_order(role: FileRole) -> u8 {
+    match role {
+        FileRole::Derivative(DerivativeKind::Thumbnail) => 0,
+        FileRole::Derivative(_) => 1,
+        FileRole::Original => 2,
+    }
+}
+
 fn local_item(folder: &str, path: &str, role: FileRole, file: &Path) -> Result<LocalItem> {
     let metadata = std::fs::metadata(file).with_context(|| format!("reading {path}"))?;
     let modified_at = metadata
@@ -1048,10 +1058,24 @@ pub(crate) mod test_support {
 mod tests {
     use std::sync::Arc;
 
-    use super::super::derivatives::DerivativeKind;
     use super::super::{LibraryInfo, test_support};
     use super::test_support::{FakeS3, Received};
     use super::*;
+
+    #[test]
+    fn thumbnails_upload_before_other_derivatives_and_originals() {
+        let order = [
+            FileRole::Derivative(DerivativeKind::Thumbnail),
+            FileRole::Derivative(DerivativeKind::Preview),
+            FileRole::Original,
+        ]
+        .map(upload_order);
+        assert!(order.is_sorted() && order[0] < order[1] && order[1] < order[2]);
+        assert_eq!(
+            upload_order(FileRole::Derivative(DerivativeKind::Poster)),
+            upload_order(FileRole::Derivative(DerivativeKind::Preview))
+        );
+    }
 
     fn jpeg(path: &Path, shade: u8) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
