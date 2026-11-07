@@ -199,6 +199,15 @@ impl PhotoViewer {
             (f32::from(viewport.height) * scale).ceil() as u32,
         );
         let photo = photo.clone();
+        if let Some(library) = self.library.clone() {
+            let photo = photo.clone();
+            cx.background_spawn(async move {
+                if let Err(error) = library.touch(&photo) {
+                    eprintln!("couldn't record that a photo was opened: {error:#}");
+                }
+            })
+            .detach();
+        }
         self._load_image = cx.spawn({
             let photo = photo.clone();
             async move |this, cx| {

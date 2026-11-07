@@ -334,6 +334,7 @@ impl ImportSession {
             }
             return Err(error);
         }
+        self.library.note_imported(&placed);
         Ok(Imported::Added)
     }
 
