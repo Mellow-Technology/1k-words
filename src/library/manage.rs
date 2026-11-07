@@ -11,7 +11,7 @@ use anyhow::{Context as _, Result, bail};
 use super::catalog::Catalog;
 use super::device::Device;
 use super::sync::{LibraryTarget, SyncStatus};
-use super::{Library, LibraryInfo, ORIGINALS_DIR, marker_id, protect, sync};
+use super::{Library, LibraryInfo, ORIGINALS_DIR, marker_id, on_device, protect, sync};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LibraryStats {
@@ -185,7 +185,7 @@ impl LibraryHandle {
                 _ => {}
             }
         }
-        Ok(())
+        on_device::delete_database(&self.catalog_path)
     }
 
     /// Makes sure the folder is this library's, before moving or deleting

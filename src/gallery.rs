@@ -1242,6 +1242,9 @@ impl Gallery {
         cx.spawn(async move |this, cx| {
             let found = cx
                 .background_spawn(async move {
+                    if let Err(error) = library.refresh_originals() {
+                        eprintln!("couldn't check the library's originals: {error:#}");
+                    }
                     if let Err(error) = library.make_missing_thumbnails() {
                         eprintln!("couldn't make the library's thumbnails: {error:#}");
                     }
@@ -2656,11 +2659,11 @@ impl Gallery {
                     }),
                 )
             });
-            let menu = menu.item(keep);
-            match remove {
+            let menu = match remove {
                 Some(remove) => menu.item(remove),
                 None => menu,
-            }
+            };
+            menu.item(keep)
         })
         .into_any_element()
     }

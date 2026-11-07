@@ -86,8 +86,10 @@ its targets on the Libraries page (`src/sync_settings.rs`).
   catalogued apart from the originals, and uploaded ahead of them. Still to
   do for a device short on space:
   - sync the catalog itself, so another device knows the library's photos;
-  - record which originals are on the device (say, a column on `photos`),
-    and show and open photos whose originals aren't;
+  - show which photos' originals aren't on the device. Opening one fetches
+    it (`src/library/download.rs`). Which are here, how they came, last
+    opened and pins are recorded per device, apart from the synced catalog
+    (`src/library/on_device.rs`);
   - free up space by removing originals that are safely synced.
 - **More derivatives**, such as viewer-sized previews and video posters.
   Each is a `DerivativeKind`, with its own folder.
