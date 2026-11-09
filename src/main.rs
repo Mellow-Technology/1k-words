@@ -2,12 +2,15 @@ mod acknowledgements;
 mod album_dialogs;
 mod aspect_fit;
 mod assets;
+mod catalog_sync;
 mod config_form;
 mod decode;
 mod details;
 mod detect;
 mod detection_settings;
 mod devices;
+#[cfg(target_os = "macos")]
+mod dock_icon;
 mod gallery;
 mod heif;
 #[cfg(target_os = "macos")]
@@ -49,6 +52,8 @@ fn main() {
     gpui_kit::application()
         .with_assets(assets::Assets)
         .run(move |cx: &mut App| {
+            #[cfg(target_os = "macos")]
+            dock_icon::set();
             gpui_kit::init(cx);
             assets::load_fonts(cx);
             settings::init(cx);
@@ -58,6 +63,7 @@ fn main() {
             detection_settings::init(cx);
             sync_targets::init(cx);
             sync_settings::start_automatic_sync(cx);
+            catalog_sync::init(cx);
             cx.on_action(|_: &Quit, cx| cx.quit());
             gallery::bind_keys(cx);
             viewer::bind_keys(cx);

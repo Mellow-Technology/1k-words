@@ -31,7 +31,10 @@ mod sync;
 pub use albums::{
     Album, AlbumId, album_path, child_albums, nested_albums, shown_albums, tree_order,
 };
-pub use catalog::AlbumConflict;
+pub use catalog::{AlbumConflict, DeviceSyncRecord};
+// Named only by tests so far, but it's what `DeviceSyncRecord` holds.
+#[allow(unused_imports)]
+pub use catalog::SyncRun;
 pub use device::Device;
 pub use id::Id;
 pub use import::{ImportSession, ImportSummary, Imported, PreparedImport, prepare, source_drive};
@@ -191,6 +194,38 @@ impl Library {
         Ok(library)
     }
 
+    /// Syncs the catalog with `server` (see `Catalog::sync`), returning
+    /// whether anything changed here. Blocks on the network.
+    ///
+    /// How it went is recorded for this device (see `device_sync`), and
+    /// reaches the other devices with the next sync.
+    pub fn sync_catalog(&self, server: &CatalogServer) -> Result<bool> {
+        let synced = self
+            .catalog
+            .sync(&server.catalog_url(&self.info.id), server.token.as_deref());
+        // A catalog from a newer version can't be changed.
+        if !self.catalog.is_newer() {
+            let error = synced.as_ref().err().map(|error| format!("{error:#}"));
+            if let Err(error) =
+                self.catalog
+                    .record_device_sync(None, synced.is_ok(), error.as_deref(), None)
+            {
+                eprintln!("couldn't record the catalog's sync: {error:#}");
+            }
+        }
+        let changed = synced?;
+        if changed {
+            self.save_albums();
+        }
+        Ok(changed)
+    }
+
+    /// Whether the catalog is from a newer version of the app, as when
+    /// another device has synced it, so the library can't be changed.
+    pub fn catalog_is_newer(&self) -> bool {
+        self.catalog.is_newer()
+    }
+
     fn placing(&self) -> MutexGuard<'_, ()> {
         self.placing.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -237,6 +272,22 @@ impl Library {
 
 fn catalog_path(config_dir: &Path, id: &str) -> PathBuf {
     config_dir.join("libraries").join(format!("{id}.db"))
+}
+
+/// A server that catalogs sync with (see `Library::sync_catalog`): a
+/// turso-sync server, which keeps each library's catalog as a database
+/// named after the library, so one server can hold many.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogServer {
+    pub url: String,
+    pub token: Option<String>,
+}
+
+impl CatalogServer {
+    /// The URL of a library's catalog on the server.
+    pub fn catalog_url(&self, library_id: &str) -> String {
+        format!("{}/db/{library_id}", self.url.trim().trim_end_matches('/'))
+    }
 }
 
 /// The id in a library folder's marker, if it's a library.
@@ -443,6 +494,24 @@ pub fn init_at(config_dir: PathBuf, default_dir: PathBuf, cx: &mut App) {
 /// The open library, if any.
 pub fn current(cx: &App) -> Option<Arc<Library>> {
     cx.try_global::<Libraries>()?.current.clone()
+}
+
+/// Every open library: the current one, and any opened to sync, say.
+pub fn loaded(cx: &App) -> Vec<Arc<Library>> {
+    cx.try_global::<Libraries>()
+        .map_or_else(Vec::new, |libraries| {
+            libraries
+                .loaded
+                .values()
+                .filter_map(Weak::upgrade)
+                .chain(libraries.current.clone())
+                .fold(Vec::new(), |mut open, library| {
+                    if !open.iter().any(|l| Arc::ptr_eq(l, &library)) {
+                        open.push(library);
+                    }
+                    open
+                })
+        })
 }
 
 /// Why no library is open, if none is.

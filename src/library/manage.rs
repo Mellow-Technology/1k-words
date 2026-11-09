@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context as _, Result, bail};
 
-use super::catalog::Catalog;
+use super::catalog::{Catalog, DeviceSyncRecord};
 use super::device::Device;
 use super::sync::{LibraryTarget, SyncStatus};
 use super::{Library, LibraryInfo, ORIGINALS_DIR, marker_id, protect, sync};
@@ -82,6 +82,14 @@ impl LibraryHandle {
                 .collect()
         })?;
         Ok(overview.unwrap_or_default())
+    }
+
+    /// Every device that has opened the library's catalog, and how its
+    /// syncs last went (see `Catalog::device_sync`).
+    pub fn device_sync(&self) -> Result<Vec<DeviceSyncRecord>> {
+        Ok(self
+            .with_catalog(|catalog| catalog.device_sync())?
+            .unwrap_or_default())
     }
 
     /// Stops syncing to a target (by its id in `sync_targets`), as when
@@ -175,16 +183,10 @@ impl LibraryHandle {
                 return Err(error).context("moving the library to the Trash");
             }
         }
-        for suffix in ["", "-wal", "-shm"] {
-            let mut file = self.catalog_path.clone().into_os_string();
-            file.push(suffix);
-            match std::fs::remove_file(&file) {
-                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                    return Err(error).context("deleting the library's catalog");
-                }
-                _ => {}
-            }
-        }
+        super::catalog::remove_database(&self.catalog_path)
+            .context("deleting the library's catalog")?;
+        super::catalog::remove_database(&self.catalog_path.with_extension("db.before-sync"))
+            .context("deleting the library's catalog")?;
         Ok(())
     }
 

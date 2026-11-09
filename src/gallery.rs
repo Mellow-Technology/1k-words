@@ -32,6 +32,7 @@ use crate::album_dialogs::{
 };
 use crate::aspect_fit::aspect_fit;
 use crate::assets::{BRACKET_ICON, BURST_ICON, LIVE_ICON};
+use crate::catalog_sync::{self, CatalogChanged};
 use crate::decode;
 use crate::detection_settings::{self, DetectionSettings};
 use crate::devices::{self, Device};
@@ -350,6 +351,7 @@ pub struct Gallery {
     /// its key, and whether it was ready.
     applied_detector: Option<(String, bool)>,
     _detection_subscription: Subscription,
+    _catalog_subscription: Subscription,
 }
 
 impl Gallery {
@@ -431,6 +433,7 @@ impl Gallery {
             applied_detector: None,
             _detection_subscription: cx
                 .observe_global::<DetectionSettings>(Self::detection_changed),
+            _catalog_subscription: cx.observe_global::<CatalogChanged>(Self::catalog_changed),
         };
         gallery.load(Source::Library, cx);
         gallery
@@ -1177,6 +1180,24 @@ impl Gallery {
         self.apply_search(Duration::ZERO, cx);
     }
 
+    /// Shows changes another device made to the open library, which a sync
+    /// has just fetched.
+    fn catalog_changed(&mut self, cx: &mut Context<Self>) {
+        let library_id = &cx.global::<CatalogChanged>().library_id;
+        let showing_changed_library = self.showing_library()
+            && library::current(cx).is_some_and(|l| &l.info.id == library_id);
+        if !showing_changed_library {
+            return;
+        }
+        // As after an import: the viewer's photos are left as they are.
+        if self.viewer.is_some() {
+            self.stale = true;
+            self.load_albums(cx);
+        } else {
+            self.load(self.source.clone(), cx);
+        }
+    }
+
     /// Goes back to the library if the device shown has gone away (or is
     /// about to unmount).
     fn devices_changed(&mut self, cx: &mut Context<Self>) {
@@ -1490,6 +1511,7 @@ impl Gallery {
         self.notice = Some(summary_text(&imports.summary).into());
         for id in &imports.added_to {
             sync_settings::sync_in_background(id, cx);
+            catalog_sync::sync_in_background(id, cx);
         }
         if !imports.summary.failed.is_empty() {
             let detail = failure_list(&imports.summary.failed);

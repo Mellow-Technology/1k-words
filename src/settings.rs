@@ -71,6 +71,9 @@ pub struct AppSettings {
     /// Whether libraries only sync with Sync Now, rather than after imports
     /// and from time to time as well (see `sync_settings`).
     pub pause_automatic_sync: bool,
+    /// The server libraries' catalogs sync with, if any (see
+    /// `catalog_sync`). Its token is in the keychain.
+    pub catalog_server: Option<String>,
 }
 
 impl Global for AppSettings {}
@@ -107,6 +110,10 @@ pub fn set_detection_plugin(plugin: Option<String>, cx: &mut App) {
 
 pub fn set_sync_automatically(on: bool, cx: &mut App) {
     update(cx, |settings| settings.pause_automatic_sync = !on);
+}
+
+pub fn set_catalog_server(url: Option<String>, cx: &mut App) {
+    update(cx, |settings| settings.catalog_server = url);
 }
 
 /// Applies the appearance setting, reading the system appearance from

@@ -27,8 +27,9 @@
 //!   `album_conflicts`).
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::{Context as _, Result, bail};
 use futures::executor::block_on;
@@ -45,7 +46,7 @@ use crate::photos::CaptureMeta;
 
 /// Bumped with each change to the schema, which `migrate` brings old
 /// catalogs up to.
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 10;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE photos (
@@ -189,6 +190,62 @@ CREATE TABLE album_photos (
 );
 CREATE INDEX album_photos_photo_id ON album_photos (photo_id);
 ";
+
+/// The schema version, kept in a table: syncing carries tables but not
+/// `PRAGMA user_version`, and a catalog synced from a server needs to say
+/// which version it is.
+const SCHEMA_V9: &str = "
+CREATE TABLE catalog_info (
+    name TEXT PRIMARY KEY,
+    value INTEGER NOT NULL
+);
+INSERT INTO catalog_info (name, value) VALUES ('schema_version', 9);
+";
+
+/// How syncing last went on each device, so each can show how the others
+/// stand. A device writes only its own rows, so syncing them never
+/// conflicts. `target_id` is a row in `sync_targets`, for uploading there,
+/// or empty for the catalog's own sync with the catalog server.
+///
+/// Errors are per device, as targets' settings and credentials are, so
+/// `sync_targets.error` is no longer used; what it held is dropped, and
+/// found again on the next upload.
+const SCHEMA_V10: &str = "
+CREATE TABLE device_sync (
+    device_id BLOB NOT NULL,
+    target_id BLOB NOT NULL,
+    -- When it last tried, and last went all the way through.
+    attempted_at REAL NOT NULL,
+    synced_at REAL,
+    -- Why it stopped, if it stopped for something only the user can fix
+    -- (bad credentials), or the catalog's sync failed.
+    error TEXT,
+    -- For uploads: the files on the device still to go, as of the last try.
+    pending INTEGER,
+    PRIMARY KEY (device_id, target_id)
+);
+";
+
+/// The tables holding the catalog's contents, copied when it moves to a
+/// server (see `Catalog::sync`). Not `catalog_info`, which the copy makes
+/// for itself.
+const TABLES: &[&str] = &[
+    "devices",
+    "device_sync",
+    "photos",
+    "sync_targets",
+    "sync_items",
+    "derivatives",
+    "detector_scans",
+    "objects",
+    "albums",
+    "album_photos",
+];
+
+/// The files a database is kept in: Turso's write-ahead log, and with
+/// syncing, what's been synced and the changes not yet sent.
+pub(super) const DATABASE_SUFFIXES: &[&str] =
+    &["", "-wal", "-shm", "-info", "-changes", "-wal-revert"];
 
 /// Whether an album shows the photos of the albums in it as well as its
 /// own.
@@ -453,6 +510,32 @@ pub struct SyncTargetRecord {
     pub error: Option<String>,
 }
 
+/// A device, and how its syncs last went.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeviceSyncRecord {
+    pub id: Id,
+    pub name: String,
+    pub this_device: bool,
+    /// When it last opened the catalog (seconds since the Unix epoch).
+    pub seen_at: f64,
+    /// The catalog's own sync with the catalog server.
+    pub catalog: Option<SyncRun>,
+    /// Uploads, by the row in `sync_targets`.
+    pub uploads: Vec<(Id, SyncRun)>,
+}
+
+/// How a sync last went on a device. Times are seconds since the Unix
+/// epoch, by that device's clock.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SyncRun {
+    pub attempted_at: f64,
+    /// When it last went all the way through.
+    pub synced_at: Option<f64>,
+    pub error: Option<String>,
+    /// For uploads: the files on the device still to go.
+    pub pending: Option<usize>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyncState {
     Synced,
@@ -502,42 +585,185 @@ pub struct AlbumConflict {
 }
 
 pub struct Catalog {
-    connection: Mutex<Connection>,
-    _database: Database,
+    state: Mutex<State>,
+    path: PathBuf,
     /// This device, which changes are recorded as made on.
     device: Id,
+    device_name: String,
+    /// Whether the catalog is from a newer version of the app, so it's only
+    /// read. Kept outside `state` so it can be read during a sync.
+    newer: AtomicBool,
+}
+
+/// The open database, swapped for another when the catalog moves to a
+/// server (see `Catalog::sync`).
+struct State {
+    connection: Connection,
+    store: Store,
+}
+
+impl std::ops::Deref for State {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        &self.connection
+    }
+}
+
+enum Store {
+    Local {
+        _database: Database,
+    },
+    /// Synced with a server, at `url`, with the token to reach it, which is
+    /// set before each sync.
+    Synced {
+        database: turso::sync::Database,
+        url: String,
+        token: Arc<Mutex<Option<String>>>,
+    },
 }
 
 impl Catalog {
     /// Opens the catalog at `path`, creating it if needed, to change on
-    /// `device`.
+    /// `device`. Doesn't need the server a synced catalog syncs with.
     pub fn open(path: &Path, device: &Device) -> Result<Self> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let path_str = path.to_str().context("catalog path isn't valid UTF-8")?;
-        block_on(async {
-            let database = turso::Builder::new_local(path_str).build().await?;
-            let connection = database.connect()?;
-            migrate(&connection).await?;
-            connection
-                .execute(
-                    "INSERT INTO devices (id, name, seen_at) VALUES (?1, ?2, ?3)
-                    ON CONFLICT (id) DO UPDATE SET name = excluded.name, seen_at = excluded.seen_at",
-                    turso::params![device.id, device.name.as_str(), super::now()],
-                )
-                .await?;
-            Ok::<_, anyhow::Error>(Self {
-                connection: Mutex::new(connection),
-                _database: database,
-                device: device.id,
-            })
+        let (state, newer) = block_on(open_state(path, device))
+            .with_context(|| format!("opening catalog {}", path.display()))?;
+        Ok(Self {
+            state: Mutex::new(state),
+            newer: AtomicBool::new(newer),
+            path: path.to_owned(),
+            device: device.id,
+            device_name: device.name.clone(),
         })
-        .with_context(|| format!("opening catalog {}", path.display()))
     }
 
-    fn connection(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.connection.lock().unwrap_or_else(|e| e.into_inner())
+    fn connection(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether the catalog is from a newer version of the app, so it can't
+    /// be changed.
+    pub fn is_newer(&self) -> bool {
+        self.newer.load(Ordering::Relaxed)
+    }
+
+    /// The server the catalog syncs with, if it does: the URL of its copy
+    /// there.
+    #[cfg(test)]
+    pub fn server_url(&self) -> Option<String> {
+        match &self.connection().store {
+            Store::Local { .. } => None,
+            Store::Synced { url, .. } => Some(url.clone()),
+        }
+    }
+
+    /// Syncs the catalog with its copy at `url`, on a server (see the
+    /// module's description): sends the changes made here, then fetches
+    /// those made elsewhere, returning whether any changed its photos or
+    /// albums. Blocks on the network, and on other calls meanwhile.
+    ///
+    /// The first time, or if the catalog synced somewhere else before, it
+    /// moves into a new database synced with `url` (see `move_to_server`).
+    pub fn sync(&self, url: &str, token: Option<&str>) -> Result<bool> {
+        let mut state = self.connection();
+        let current = match &state.store {
+            Store::Synced {
+                url: synced,
+                token: slot,
+                database,
+            } if synced == url => {
+                *lock(slot) = token.map(str::to_owned);
+                Some(database.clone())
+            }
+            _ => None,
+        };
+        let Some(database) = current else {
+            self.move_to_server(&mut state, url, token)?;
+            return Ok(true);
+        };
+        let (before, pulled) = block_on(async {
+            let before = fingerprint(&state.connection).await?;
+            // A catalog from a newer version may have changes the push
+            // would undo, and has none of its own.
+            if !self.is_newer() {
+                database.push().await.context("sending changes")?;
+            }
+            let pulled = database.pull().await.context("fetching changes")?;
+            Ok::<_, anyhow::Error>((before, pulled))
+        })?;
+        // What's fetched includes what was just sent.
+        if !pulled {
+            return Ok(false);
+        }
+        if !self.is_newer() && !block_on(migrate(&state.connection))? {
+            block_on(state.connection.execute("PRAGMA query_only = 1", ()))?;
+            self.newer.store(true, Ordering::Relaxed);
+            return Ok(true);
+        }
+        Ok(block_on(fingerprint(&state.connection))? != before)
+    }
+
+    /// Moves the catalog into a new database synced with `url`. If the
+    /// server has no copy of it yet, this one is copied there; if it has,
+    /// as when another device has synced it already, that's used, and this
+    /// one kept beside it as `<id>.db.before-sync`. Either way, it's only
+    /// moved once the server has it, so the catalog stays as it was if the
+    /// server can't be reached.
+    fn move_to_server(&self, state: &mut State, url: &str, token: Option<&str>) -> Result<()> {
+        if self.is_newer() {
+            bail!("the catalog is from a newer version of 1k Words");
+        }
+        let new_path = with_suffix(&self.path, ".new");
+        remove_database(&new_path)?;
+        let slot = Arc::new(Mutex::new(token.map(str::to_owned)));
+        let copied = block_on(async {
+            let database = open_synced(&new_path, url, slot.clone()).await?;
+            let connection = database.connect().await?;
+            let server_has_it = table_exists(&connection, "photos").await?;
+            if !migrate(&connection).await? {
+                bail!("the server's copy is from a newer version of 1k Words");
+            }
+            if !server_has_it {
+                copy_tables(&state.connection, &connection).await?;
+            }
+            database.push().await.context("sending the catalog")?;
+            Ok(())
+        });
+        if let Err(error) = copied {
+            remove_database(&new_path).ok();
+            return Err(error.context("moving the catalog to the server"));
+        }
+
+        // Closed, to move its files.
+        let placeholder = block_on(turso::Builder::new_local(":memory:").build())?;
+        state.connection = placeholder.connect()?;
+        state.store = Store::Local {
+            _database: placeholder,
+        };
+        let backup = with_suffix(&self.path, ".before-sync");
+        remove_database(&backup)?;
+        rename_database(&self.path, &backup)?;
+        rename_database(&new_path, &self.path)?;
+        (*state, _) = block_on(open_state(&self.path, &self.device()))
+            .context("opening the catalog moved to the server")?;
+        if let Store::Synced {
+            token: new_slot, ..
+        } = &state.store
+        {
+            *lock(new_slot) = token.map(str::to_owned);
+        }
+        Ok(())
+    }
+
+    fn device(&self) -> Device {
+        Device {
+            id: self.device,
+            name: self.device_name.clone(),
+        }
     }
 
     /// Every photo, oldest first.
@@ -1464,8 +1690,10 @@ impl Catalog {
         block_on(async {
             let mut rows = connection
                 .query(
-                    "SELECT id, target, folder, error FROM sync_targets ORDER BY id",
-                    (),
+                    "SELECT t.id, t.target, t.folder, d.error FROM sync_targets AS t
+                    LEFT JOIN device_sync AS d ON d.target_id = t.id AND d.device_id = ?1
+                    ORDER BY t.id",
+                    turso::params![self.device],
                 )
                 .await?;
             let mut targets = Vec::new();
@@ -1492,13 +1720,92 @@ impl Catalog {
         Ok(id)
     }
 
-    pub fn set_sync_target_error(&self, id: Id, error: Option<&str>) -> Result<()> {
+    /// Records how a sync on this device went: uploading to `target`, or
+    /// the catalog's own sync for `None`. `completed` is whether it went
+    /// all the way through; `error`, why it stopped if only the user can
+    /// fix it; `pending`, the files still to upload.
+    pub fn record_device_sync(
+        &self,
+        target: Option<Id>,
+        completed: bool,
+        error: Option<&str>,
+        pending: Option<usize>,
+    ) -> Result<()> {
         let connection = self.connection();
+        let now = super::now();
         block_on(connection.execute(
-            "UPDATE sync_targets SET error = ?2 WHERE id = ?1",
-            turso::params![id, error],
+            "INSERT INTO device_sync (device_id, target_id, attempted_at, synced_at, error, pending)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT (device_id, target_id) DO UPDATE SET
+                attempted_at = excluded.attempted_at,
+                synced_at = coalesce(excluded.synced_at, synced_at),
+                error = excluded.error,
+                pending = excluded.pending",
+            turso::params![
+                self.device,
+                target_value(target),
+                now,
+                completed.then_some(now),
+                error,
+                pending.map(|pending| pending as i64)
+            ],
         ))?;
         Ok(())
+    }
+
+    /// Every device that has opened the catalog, and how its syncs last
+    /// went, this device first, then by name.
+    pub fn device_sync(&self) -> Result<Vec<DeviceSyncRecord>> {
+        let connection = self.connection();
+        block_on(async {
+            let mut rows = connection
+                .query(
+                    "SELECT d.id, d.name, d.seen_at,
+                        s.target_id, s.attempted_at, s.synced_at, s.error, s.pending
+                    FROM devices AS d
+                    LEFT JOIN device_sync AS s ON s.device_id = d.id
+                    ORDER BY d.id = ?1 DESC, d.name, d.id",
+                    turso::params![self.device],
+                )
+                .await?;
+            let mut devices: Vec<DeviceSyncRecord> = Vec::new();
+            while let Some(row) = rows.next().await? {
+                let id = Id::from_value(row.get_value(0)?)?;
+                if devices.last().is_none_or(|device| device.id != id) {
+                    devices.push(DeviceSyncRecord {
+                        id,
+                        name: row.get(1)?,
+                        this_device: id == self.device,
+                        seen_at: row.get(2)?,
+                        catalog: None,
+                        uploads: Vec::new(),
+                    });
+                }
+                let device = devices.last_mut().expect("just pushed");
+                let target = match row.get_value(3)? {
+                    Value::Null => continue,
+                    Value::Blob(bytes) if bytes.is_empty() => None,
+                    value => Some(Id::from_value(value)?),
+                };
+                let run = SyncRun {
+                    attempted_at: row.get(4)?,
+                    synced_at: match row.get_value(5)? {
+                        Value::Real(at) => Some(at),
+                        _ => None,
+                    },
+                    error: optional_text(&row, 6)?,
+                    pending: match row.get_value(7)? {
+                        Value::Integer(pending) => Some(pending.max(0) as usize),
+                        _ => None,
+                    },
+                };
+                match target {
+                    None => device.catalog = Some(run),
+                    Some(target) => device.uploads.push((target, run)),
+                }
+            }
+            Ok(devices)
+        })
     }
 
     /// Removes a target, and the record of what was synced to it.
@@ -1508,6 +1815,7 @@ impl Catalog {
         block_on(connection.execute_batch(&format!(
             "BEGIN;
             DELETE FROM sync_items WHERE target_id = {id};
+            DELETE FROM device_sync WHERE target_id = {id};
             DELETE FROM sync_targets WHERE id = {id};
             COMMIT;"
         )))?;
@@ -1600,6 +1908,171 @@ impl Catalog {
 }
 
 /// Whether there's an album `album`, not deleted.
+/// Opens the database at `path`: synced, if it's been moved to a server
+/// (see `Catalog::sync`), or local.
+/// Returns it, and whether it's from a newer version of the app (see
+/// `migrate`).
+async fn open_state(path: &Path, device: &Device) -> Result<(State, bool)> {
+    let (connection, store) = match synced_url(path) {
+        Some(url) => {
+            let token = Arc::new(Mutex::new(None));
+            let database = open_synced(path, &url, token.clone()).await?;
+            let connection = database.connect().await?;
+            (
+                connection,
+                Store::Synced {
+                    database,
+                    url,
+                    token,
+                },
+            )
+        }
+        None => {
+            let path = path.to_str().context("catalog path isn't valid UTF-8")?;
+            let database = turso::Builder::new_local(path).build().await?;
+            (
+                database.connect()?,
+                Store::Local {
+                    _database: database,
+                },
+            )
+        }
+    };
+    let newer = !migrate(&connection).await?;
+    if newer {
+        connection.execute("PRAGMA query_only = 1", ()).await?;
+    } else {
+        connection
+            .execute(
+                "INSERT INTO devices (id, name, seen_at) VALUES (?1, ?2, ?3)
+                ON CONFLICT (id) DO UPDATE SET name = excluded.name, seen_at = excluded.seen_at",
+                turso::params![device.id, device.name.as_str(), super::now()],
+            )
+            .await?;
+    }
+    Ok((State { connection, store }, newer))
+}
+
+/// Opens, or makes, a database synced with `url`. Making one needs the
+/// server, to fetch what it has; opening one doesn't.
+async fn open_synced(
+    path: &Path,
+    url: &str,
+    token: Arc<Mutex<Option<String>>>,
+) -> Result<turso::sync::Database> {
+    // Fails, harmlessly, once one's installed.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+    let path = path.to_str().context("catalog path isn't valid UTF-8")?;
+    let database = turso::sync::Builder::new_remote(path)
+        .with_remote_url(url)
+        .with_client_name("1k-words")
+        .with_auth_token_fn(move || {
+            let token = lock(&token).clone().unwrap_or_default();
+            async move { Ok(token) }
+        })
+        .build()
+        .await?;
+    Ok(database)
+}
+
+/// The server a database at `path` syncs with, if it does: kept by Turso
+/// in a file beside it.
+fn synced_url(path: &Path) -> Option<String> {
+    let info = std::fs::read(with_suffix(path, "-info")).ok()?;
+    let info: serde_json::Value = serde_json::from_slice(&info).ok()?;
+    info["saved_configuration"]["remote_url"]
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// Stands for the photos' and albums' versions, which every change to them,
+/// or to what's in an album, replaces: if it's the same, they are.
+async fn fingerprint(connection: &Connection) -> Result<u64> {
+    use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+    let mut rows = connection
+        .query(
+            "SELECT version FROM photos UNION ALL SELECT version FROM albums",
+            (),
+        )
+        .await?;
+    let hasher = BuildHasherDefault::<DefaultHasher>::default();
+    let (mut combined, mut count) = (0u64, 0u64);
+    while let Some(row) = rows.next().await? {
+        // Whatever order the rows come in.
+        combined ^= hasher.hash_one(row.get_value(0)?.as_blob().map(Vec::as_slice));
+        count += 1;
+    }
+    Ok(combined ^ hasher.hash_one(count))
+}
+
+/// Copies every row of the catalog's tables into another catalog of the
+/// same version.
+async fn copy_tables(from: &Connection, to: &Connection) -> Result<()> {
+    to.execute("BEGIN", ()).await?;
+    let copied = async {
+        for table in TABLES {
+            let mut rows = from.query(&format!("SELECT * FROM {table}"), ()).await?;
+            while let Some(row) = rows.next().await? {
+                let values = (0..row.column_count())
+                    .map(|ix| row.get_value(ix))
+                    .collect::<turso::Result<Vec<Value>>>()?;
+                let params = vec!["?"; values.len()].join(", ");
+                to.execute(&format!("INSERT INTO {table} VALUES ({params})"), values)
+                    .await?;
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    match copied {
+        Ok(()) => {
+            to.execute("COMMIT", ()).await?;
+            Ok(())
+        }
+        Err(error) => {
+            to.execute("ROLLBACK", ()).await.ok();
+            Err(error.context("copying the catalog"))
+        }
+    }
+}
+
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut path = path.as_os_str().to_owned();
+    path.push(suffix);
+    PathBuf::from(path)
+}
+
+/// Deletes a database's files (see `DATABASE_SUFFIXES`).
+pub(super) fn remove_database(path: &Path) -> Result<()> {
+    for suffix in DATABASE_SUFFIXES {
+        let file = with_suffix(path, suffix);
+        match std::fs::remove_file(&file) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(error).with_context(|| format!("deleting {}", file.display()));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn rename_database(from: &Path, to: &Path) -> Result<()> {
+    for suffix in DATABASE_SUFFIXES {
+        let (from, to) = (with_suffix(from, suffix), with_suffix(to, suffix));
+        if from.exists() {
+            std::fs::rename(&from, &to)
+                .with_context(|| format!("moving {} to {}", from.display(), to.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 async fn album_exists(connection: &Connection, album: Id) -> Result<bool> {
     let mut rows = connection
         .query(
@@ -1610,6 +2083,11 @@ async fn album_exists(connection: &Connection, album: Id) -> Result<bool> {
     Ok(rows.next().await?.is_some())
 }
 
+/// `device_sync.target_id`: the target's row, or empty for the catalog.
+fn target_value(target: Option<Id>) -> Value {
+    target.map_or(Value::Blob(Vec::new()), Value::from)
+}
+
 fn optional_text(row: &Row, ix: usize) -> Result<Option<String>> {
     Ok(match row.get_value(ix)? {
         Value::Text(text) => Some(text),
@@ -1617,23 +2095,21 @@ fn optional_text(row: &Row, ix: usize) -> Result<Option<String>> {
     })
 }
 
-async fn migrate(connection: &Connection) -> Result<()> {
-    let mut rows = connection.query("PRAGMA user_version", ()).await?;
-    let version = match rows.next().await? {
-        Some(row) => row.get::<i64>(0)?,
-        None => 0,
-    };
-    drop(rows);
+/// Brings the catalog up to `SCHEMA_VERSION`, returning whether it can be
+/// changed: one from a newer version of the app, as when another device
+/// has synced it, can only be read.
+async fn migrate(connection: &Connection) -> Result<bool> {
+    let mut version = schema_version(connection).await?;
     if version > SCHEMA_VERSION {
-        bail!("the catalog is from a newer version of 1k Words (schema {version})");
+        return Ok(false);
     }
     if version == 0 {
         connection
             .execute_batch(&format!(
-                "BEGIN; {SCHEMA_V8} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"
+                "BEGIN; {SCHEMA_V8} PRAGMA user_version = 8; COMMIT;"
             ))
             .await?;
-        return Ok(());
+        version = 8;
     }
     for (to, schema) in [
         (1, SCHEMA_V1),
@@ -1662,7 +2138,49 @@ async fn migrate(connection: &Connection) -> Result<()> {
             }
         };
     }
-    Ok(())
+    for (to, schema) in [(9, SCHEMA_V9), (10, SCHEMA_V10)] {
+        if version < to {
+            connection
+                .execute_batch(&format!(
+                    "BEGIN; {schema}
+                    UPDATE catalog_info SET value = {to} WHERE name = 'schema_version';
+                    PRAGMA user_version = {to}; COMMIT;"
+                ))
+                .await?;
+        }
+    }
+    Ok(true)
+}
+
+/// The catalog's schema version, 0 for an empty one: in `catalog_info`
+/// from version 9, in `PRAGMA user_version` before.
+async fn schema_version(connection: &Connection) -> Result<i64> {
+    if table_exists(connection, "catalog_info").await? {
+        let mut rows = connection
+            .query(
+                "SELECT value FROM catalog_info WHERE name = 'schema_version'",
+                (),
+            )
+            .await?;
+        if let Some(row) = rows.next().await? {
+            return Ok(row.get::<i64>(0)?);
+        }
+    }
+    let mut rows = connection.query("PRAGMA user_version", ()).await?;
+    Ok(match rows.next().await? {
+        Some(row) => row.get::<i64>(0)?,
+        None => 0,
+    })
+}
+
+async fn table_exists(connection: &Connection, table: &str) -> Result<bool> {
+    let mut rows = connection
+        .query(
+            "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+            [table],
+        )
+        .await?;
+    Ok(rows.next().await?.is_some())
 }
 
 /// Converts a version 7 catalog to `SCHEMA_V8`, in the transaction under
@@ -1781,9 +2299,7 @@ async fn convert_to_v8(connection: &Connection) -> Result<()> {
             .await?;
     }
     connection.execute("DROP TABLE v8_ids", ()).await?;
-    connection
-        .execute(&format!("PRAGMA user_version = {SCHEMA_VERSION}"), ())
-        .await?;
+    connection.execute("PRAGMA user_version = 8", ()).await?;
     Ok(())
 }
 
@@ -2488,6 +3004,132 @@ mod tests {
                 assert_eq!(was, now, "{table}");
             }
         }
+
+        // With `TURSO_SYNC_SERVER` too, it moves to a server, and another
+        // device gets all of it.
+        let dir = path.with_extension("sync-test");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("server")).unwrap();
+        let Some(server) = SyncServer::start(&dir.join("server"), None) else {
+            return;
+        };
+        let url = server.url("library");
+        let every_count = |catalog: &Catalog| {
+            block_on(async {
+                let connection = catalog.connection();
+                let mut counts = Vec::new();
+                for table in TABLES {
+                    let mut rows = connection
+                        .query(&format!("SELECT count(*) FROM {table}"), ())
+                        .await
+                        .unwrap();
+                    let row = rows.next().await.unwrap().unwrap();
+                    counts.push((*table, row.get::<i64>(0).unwrap()));
+                }
+                counts
+            })
+        };
+        let catalog = Catalog::open(&path, &test_device()).unwrap();
+        let here = every_count(&catalog);
+        let started = std::time::Instant::now();
+        catalog.sync(&url, None).unwrap();
+        eprintln!("moved to the server in {:?}", started.elapsed());
+        assert_eq!(every_count(&catalog), here);
+        let other = Catalog::open(
+            &dir.join("other.db"),
+            &Device {
+                id: Id::from_u128(2),
+                name: "Other".into(),
+            },
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        other.sync(&url, None).unwrap();
+        eprintln!("fetched in {:?}", started.elapsed());
+        let there = every_count(&other);
+        eprintln!("there: {there:?}");
+        for ((table, was), (_, now)) in here.iter().zip(&there) {
+            // The other device adds itself.
+            let mine = i64::from(*table == "devices");
+            assert_eq!(was + mine, *now, "{table}");
+        }
+        assert_eq!(other.albums().unwrap(), catalog.albums().unwrap());
+        assert_eq!(other.photos().unwrap(), catalog.photos().unwrap());
+        drop((catalog, other, server));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn records_each_devices_syncs() {
+        let path = std::env::temp_dir().join(format!(
+            "1k-words-device-sync-{}.db",
+            std::process::id()
+        ));
+        remove_database(&path).ok();
+        let other_device = Device {
+            id: Id::from_u128(2),
+            name: "Other".into(),
+        };
+
+        let catalog = Catalog::open(&path, &test_device()).unwrap();
+        let target = catalog.add_sync_target("target-a", "Photos-1234").unwrap();
+        catalog.record_device_sync(None, true, None, None).unwrap();
+        catalog
+            .record_device_sync(Some(target), true, None, Some(2))
+            .unwrap();
+        drop(catalog);
+
+        // Another device's credentials fail. Its error is its own: this
+        // device's uploads there carry on.
+        let other = Catalog::open(&path, &other_device).unwrap();
+        other
+            .record_device_sync(Some(target), false, Some("Access denied."), Some(5))
+            .unwrap();
+        assert_eq!(
+            other.sync_targets().unwrap()[0].error.as_deref(),
+            Some("Access denied.")
+        );
+        drop(other);
+        let catalog = Catalog::open(&path, &test_device()).unwrap();
+        assert_eq!(catalog.sync_targets().unwrap()[0].error, None);
+
+        // Each device is listed, this one first, with how its syncs went.
+        let devices = catalog.device_sync().unwrap();
+        assert_eq!(devices.len(), 2);
+        let (here, there) = (&devices[0], &devices[1]);
+        assert!(here.this_device && !there.this_device);
+        assert_eq!((here.name.as_str(), there.name.as_str()), ("Test", "Other"));
+        let catalog_run = here.catalog.as_ref().unwrap();
+        assert!(catalog_run.synced_at.is_some() && catalog_run.error.is_none());
+        assert_eq!(here.uploads.len(), 1);
+        assert_eq!(here.uploads[0].0, target);
+        assert_eq!(here.uploads[0].1.pending, Some(2));
+        assert_eq!(there.catalog, None);
+        let (_, run) = &there.uploads[0];
+        assert_eq!(run.error.as_deref(), Some("Access denied."));
+        assert_eq!(run.pending, Some(5));
+        assert_eq!(run.synced_at, None);
+
+        // A failed try keeps when it last went through, and a success
+        // clears the error.
+        let synced_at = here.uploads[0].1.synced_at;
+        catalog
+            .record_device_sync(Some(target), false, Some("Nope."), Some(2))
+            .unwrap();
+        let run = catalog.device_sync().unwrap()[0].uploads[0].1.clone();
+        assert_eq!((run.synced_at, run.error.as_deref()), (synced_at, Some("Nope.")));
+        catalog
+            .record_device_sync(Some(target), true, None, Some(0))
+            .unwrap();
+        let run = catalog.device_sync().unwrap()[0].uploads[0].1.clone();
+        assert_eq!((run.error, run.pending), (None, Some(0)));
+
+        // Removing a target forgets how syncing to it went.
+        catalog.remove_sync_target(target).unwrap();
+        let devices = catalog.device_sync().unwrap();
+        assert!(devices.iter().all(|device| device.uploads.is_empty()));
+        drop((catalog, devices));
+        remove_database(&path).ok();
     }
 
     #[test]
@@ -2501,7 +3143,7 @@ mod tests {
         // A target's added once.
         assert!(catalog.add_sync_target("target-a", "Again").is_err());
         catalog
-            .set_sync_target_error(id, Some("Access denied."))
+            .record_device_sync(Some(id), false, Some("Access denied."), Some(3))
             .unwrap();
         let targets = catalog.sync_targets().unwrap();
         assert_eq!(targets.len(), 2);
@@ -2545,5 +3187,226 @@ mod tests {
         assert_eq!(catalog.sync_items(other).unwrap().len(), 1);
         assert_eq!(catalog.sync_targets().unwrap().len(), 1);
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn lists_every_table_to_copy() {
+        let path =
+            std::env::temp_dir().join(format!("1k-words-catalog-tables-{}.db", std::process::id()));
+        remove_database(&path).unwrap();
+        let catalog = Catalog::open(&path, &test_device()).unwrap();
+        let mut tables: Vec<String> = block_on(async {
+            let connection = catalog.connection();
+            let mut rows = connection
+                .query(
+                    "SELECT name FROM sqlite_schema WHERE type = 'table'
+                    AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'turso_%'
+                    AND name != 'catalog_info'",
+                    (),
+                )
+                .await
+                .unwrap();
+            let mut tables = Vec::new();
+            while let Some(row) = rows.next().await.unwrap() {
+                tables.push(row.get::<String>(0).unwrap());
+            }
+            tables
+        });
+        tables.sort();
+        let mut expected: Vec<&str> = TABLES.to_vec();
+        expected.sort();
+        assert_eq!(tables, expected);
+        assert_eq!(block_on(schema_version(&catalog.connection())).unwrap(), SCHEMA_VERSION);
+        drop(catalog);
+        remove_database(&path).unwrap();
+    }
+
+    /// A turso-sync server, run from the binary `TURSO_SYNC_SERVER` names.
+    struct SyncServer {
+        process: std::process::Child,
+        port: u16,
+        data: PathBuf,
+    }
+
+    impl SyncServer {
+        fn start(data: &Path, port: Option<u16>) -> Option<Self> {
+            let binary = std::env::var_os("TURSO_SYNC_SERVER")?;
+            let port = port.unwrap_or_else(|| {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.local_addr().unwrap().port()
+            });
+            let process = std::process::Command::new(binary)
+                .arg("serve")
+                .arg("--data")
+                .arg(data)
+                .args([
+                    "--listen",
+                    &format!("127.0.0.1:{port}"),
+                    "--admin-listen",
+                    "off",
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            for _ in 0..100 {
+                if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                    return Some(Self {
+                        process,
+                        port,
+                        data: data.to_owned(),
+                    });
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            panic!("the sync server didn't start");
+        }
+
+        fn url(&self, library: &str) -> String {
+            format!("http://127.0.0.1:{}/db/{library}", self.port)
+        }
+
+        fn restart(mut self) -> Self {
+            self.process.kill().unwrap();
+            self.process.wait().unwrap();
+            Self::start(&self.data.clone(), Some(self.port)).unwrap()
+        }
+    }
+
+    impl Drop for SyncServer {
+        fn drop(&mut self) {
+            self.process.kill().ok();
+            self.process.wait().ok();
+        }
+    }
+
+    /// Two devices syncing a catalog through a server, with
+    /// `TURSO_SYNC_SERVER=<path to turso-sync> cargo test syncs_between`.
+    #[test]
+    fn syncs_between_devices() {
+        let dir =
+            std::env::temp_dir().join(format!("1k-words-catalog-sync-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("server")).unwrap();
+        let Some(server) = SyncServer::start(&dir.join("server"), None) else {
+            eprintln!("skipped: TURSO_SYNC_SERVER isn't set");
+            return;
+        };
+        let url = server.url("library");
+        let (laptop, studio) = (
+            test_device(),
+            Device {
+                id: Id::from_u128(2),
+                name: "Studio".into(),
+            },
+        );
+        let photo = |path: &str| PhotoRecord {
+            path: path.into(),
+            ..Default::default()
+        };
+
+        // The laptop has a library already, which moves to the server.
+        let a_path = dir.join("laptop.db");
+        let a = Catalog::open(&a_path, &laptop).unwrap();
+        a.insert(&photo("Originals/a.jpg")).unwrap();
+        let trips = a.create_album("Trips", None).unwrap();
+        a.add_paths_to_album(trips, &["Originals/a.jpg".into()])
+            .unwrap();
+        assert_eq!(a.server_url(), None);
+        assert!(a.sync(&url, None).unwrap());
+        assert_eq!(a.server_url().as_deref(), Some(url.as_str()));
+        assert!(with_suffix(&a_path, ".before-sync").exists());
+        assert_eq!(a.photo_count().unwrap(), 1);
+
+        // The studio's catalog of it was empty: it takes the server's.
+        let b_path = dir.join("studio.db");
+        let b = Catalog::open(&b_path, &studio).unwrap();
+        assert!(b.sync(&url, None).unwrap());
+        assert_eq!(b.photo_count().unwrap(), 1);
+        assert_eq!(b.album_photos(&[trips]).unwrap().len(), 1);
+
+        // Changes go both ways, and are only fetched once.
+        b.rename_album(trips, "Travel").unwrap();
+        b.insert(&photo("Originals/b.jpg")).unwrap();
+        assert!(!b.sync(&url, None).unwrap());
+        assert!(a.sync(&url, None).unwrap());
+        assert!(!a.sync(&url, None).unwrap());
+        assert_eq!(a.albums().unwrap()[0].name, "Travel");
+        assert_eq!(a.photo_count().unwrap(), 2);
+
+        // The laptop deletes the album while the studio, not having seen
+        // that, adds to it: the laptop's asked which was meant.
+        a.delete_albums(&[trips]).unwrap();
+        b.add_paths_to_album(trips, &["Originals/b.jpg".into()])
+            .unwrap();
+        a.sync(&url, None).unwrap();
+        b.sync(&url, None).unwrap();
+        a.sync(&url, None).unwrap();
+        let conflicts = a.album_conflicts().unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(
+            (
+                conflicts[0].deleted_on.as_str(),
+                conflicts[0].changed_on.as_str()
+            ),
+            ("Test", "Studio")
+        );
+        a.resolve_album_conflict(trips, true).unwrap();
+        a.sync(&url, None).unwrap();
+        b.sync(&url, None).unwrap();
+        assert_eq!(b.album_photos(&[trips]).unwrap().len(), 2);
+
+        // Offline, catalogs open and change as usual, and sync once the
+        // server's back.
+        drop(server);
+        drop(a);
+        let a = Catalog::open(&a_path, &laptop).unwrap();
+        assert_eq!(a.photo_count().unwrap(), 2);
+        a.insert(&photo("Originals/c.jpg")).unwrap();
+        assert!(a.sync(&url, None).is_err());
+        let server = SyncServer::start(&dir.join("server"), Some(url_port(&url))).unwrap();
+        a.sync(&url, None).unwrap();
+        assert!(b.sync(&url, None).unwrap());
+        assert_eq!(b.photo_count().unwrap(), 3);
+
+        // Moving to another server, or the same one under another name,
+        // copies the catalog there; moving back takes the server's copy.
+        let server = server.restart();
+        let other = server.url("library-2");
+        assert!(b.sync(&other, None).unwrap());
+        let c = Catalog::open(&dir.join("other.db"), &laptop).unwrap();
+        c.sync(&other, None).unwrap();
+        assert_eq!(c.photo_count().unwrap(), 3);
+        b.sync(&url, None).unwrap();
+        assert_eq!(b.server_url().as_deref(), Some(url.as_str()));
+        assert_eq!(b.photo_count().unwrap(), 3);
+
+        // A newer version of the app on the studio changes the schema:
+        // the laptop's catalog can then only be read.
+        block_on(b.connection().execute(
+            "UPDATE catalog_info SET value = 10 WHERE name = 'schema_version'",
+            (),
+        ))
+        .unwrap();
+        b.sync(&url, None).unwrap();
+        assert!(a.sync(&url, None).unwrap());
+        assert!(a.is_newer());
+        assert_eq!(a.photo_count().unwrap(), 3);
+        assert!(a.insert(&photo("Originals/d.jpg")).is_err());
+        drop(a);
+        assert!(Catalog::open(&a_path, &laptop).unwrap().is_newer());
+        drop((b, c, server));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn url_port(url: &str) -> u16 {
+        url.split(':')
+            .nth(2)
+            .unwrap()
+            .split('/')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
     }
 }

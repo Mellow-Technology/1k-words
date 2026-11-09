@@ -4,7 +4,8 @@
 //! `sync_targets`), with a dialog to add or edit one from its plugin's
 //! settings. Each library's group on the Libraries page lists the targets it
 //! syncs to, how far along each is, and buttons to sync now or stop syncing
-//! there (see `library_items`).
+//! there (see `library_items`), then, once more than one device has opened
+//! the library, how syncing last went on each.
 //!
 //! What each library syncs to, and uploads in progress, are kept app-wide so
 //! the pages can show them.
@@ -30,7 +31,8 @@ use gpui_kit::{
 use crate::config_form::{ConfigForm, form_row};
 use crate::gallery::{show_error, show_warning};
 use crate::library::{
-    self, LibraryInfo, LibraryTarget, SyncStatus, TargetSettings, UploadProgress, UploadSummary,
+    self, DeviceSyncRecord, Id, LibraryInfo, LibraryTarget, SyncStatus, TargetSettings,
+    UploadProgress, UploadSummary,
 };
 use crate::plugins::{Config, FieldKind, Plugin, Plugins};
 use crate::settings;
@@ -111,6 +113,8 @@ type LinkKey = (String, library::Id);
 struct SyncActivity {
     /// What each library syncs to, and how far along each is.
     links: HashMap<String, Vec<(LibraryTarget, SyncStatus)>>,
+    /// The devices that have opened each library, and how their syncs went.
+    devices: HashMap<String, Vec<DeviceSyncRecord>>,
     uploads: HashMap<LinkKey, Arc<Upload>>,
     /// Uploads asked for again while under way, to go again once they're
     /// done.
@@ -230,23 +234,32 @@ fn read_activity(cx: &App) -> Option<&SyncActivity> {
     cx.try_global::<SyncActivity>()
 }
 
-/// Reads again what a library syncs to, in the background.
+/// Reads again what a library syncs to, and how each device's syncs went,
+/// in the background.
 pub fn refresh_library(library_id: &str, cx: &mut App) {
     let Some(handle) = library::handle(library_id, cx) else {
-        activity(cx).links.remove(library_id);
+        let activity = activity(cx);
+        activity.links.remove(library_id);
+        activity.devices.remove(library_id);
         return;
     };
     let id = library_id.to_owned();
     cx.spawn(async move |cx| {
-        let overview = cx
-            .background_spawn(async move { handle.sync_overview() })
+        let (overview, devices) = cx
+            .background_spawn(async move { (handle.sync_overview(), handle.device_sync()) })
             .await;
         cx.update(|cx| {
             match overview {
                 Ok(links) => {
-                    activity(cx).links.insert(id, links);
+                    activity(cx).links.insert(id.clone(), links);
                 }
                 Err(error) => eprintln!("couldn't read what a library syncs to: {error:#}"),
+            }
+            match devices {
+                Ok(devices) => {
+                    activity(cx).devices.insert(id, devices);
+                }
+                Err(error) => eprintln!("couldn't read how devices synced: {error:#}"),
             }
             cx.refresh_windows();
         });
@@ -288,6 +301,7 @@ pub fn page(cx: &App) -> SettingPage {
                 ),
             ),
         )
+        .group(crate::catalog_sync::group(cx))
         .groups(sync_targets::list(cx).iter().map(target_group))
         .group(add_group(cx))
 }
@@ -666,6 +680,11 @@ pub fn library_items(info: &LibraryInfo, cx: &App) -> Vec<SettingItem> {
         .iter()
         .map(|(link, status)| link_item(&info.id, link, *status, cx))
         .collect();
+    if let Some(devices) = read_activity(cx).and_then(|activity| activity.devices.get(&info.id))
+        && devices.len() > 1
+    {
+        items.push(devices_item(devices, &links, cx));
+    }
 
     let linked: Vec<String> = links.iter().map(|(link, _)| link.target.clone()).collect();
     let available: Vec<(SharedString, SharedString)> = sync_targets::list(cx)
@@ -701,9 +720,90 @@ pub fn library_items(info: &LibraryInfo, cx: &App) -> Vec<SettingItem> {
     items
 }
 
+/// How syncing last went on each device that has opened the library, a
+/// line each.
+fn devices_item(
+    devices: &[DeviceSyncRecord],
+    links: &[(LibraryTarget, SyncStatus)],
+    cx: &App,
+) -> SettingItem {
+    let target_name = |id: Id| {
+        links
+            .iter()
+            .find(|(link, _)| link.id == id)
+            .map_or_else(|| "Deleted target".to_owned(), |(link, _)| target_name(link, cx))
+    };
+    let now = library::now();
+    let lines: Vec<SharedString> = devices
+        .iter()
+        .map(|device| device_text(device, &target_name, now).into())
+        .collect();
+    SettingItem::new(
+        "Devices",
+        SettingField::render(move |_, _, cx| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .children(lines.iter().map(|line| value_text(line.clone(), cx)))
+        }),
+    )
+    .description("How syncing last went on each device that has opened the library.")
+}
+
+/// "MacBook (this device): catalog synced 2 minutes ago · S3: 140 files to
+/// upload".
+fn device_text(device: &DeviceSyncRecord, target_name: &dyn Fn(Id) -> String, now: f64) -> String {
+    let mut parts = Vec::new();
+    if let Some(run) = &device.catalog {
+        parts.push(match (&run.error, run.synced_at) {
+            (Some(error), _) => format!("catalog sync failed: {error}"),
+            (None, Some(at)) => format!("catalog synced {}", ago(at, now)),
+            (None, None) => format!("catalog last tried {}", ago(run.attempted_at, now)),
+        });
+    }
+    for (target, run) in &device.uploads {
+        let state = match (&run.error, run.pending) {
+            (Some(error), _) => format!("stopped: {error}"),
+            (None, Some(0)) => "up to date".to_owned(),
+            (None, Some(1)) => "1 file to upload".to_owned(),
+            (None, Some(pending)) => format!("{} files to upload", format_count(pending)),
+            (None, None) => format!("uploaded {}", ago(run.attempted_at, now)),
+        };
+        parts.push(format!("{}: {state}", target_name(*target)));
+    }
+    if parts.is_empty() {
+        parts.push(format!("last opened the library {}", ago(device.seen_at, now)));
+    }
+    let name = if device.this_device {
+        format!("{} (this device)", device.name)
+    } else {
+        device.name.clone()
+    };
+    format!("{name}: {}", parts.join(" · "))
+}
+
+/// How long ago `at` was, both in seconds since the Unix epoch.
+fn ago(at: f64, now: f64) -> String {
+    let minutes = ((now - at).max(0.0) / 60.0) as u64;
+    match minutes {
+        0 => "just now".into(),
+        1 => "a minute ago".into(),
+        2..60 => format!("{minutes} minutes ago"),
+        60..120 => "an hour ago".into(),
+        120..1440 => format!("{} hours ago", minutes / 60),
+        1440..2880 => "yesterday".into(),
+        _ => format!("{} days ago", minutes / 1440),
+    }
+}
+
+fn target_name(link: &LibraryTarget, cx: &App) -> String {
+    sync_targets::get(&link.target, cx)
+        .map_or_else(|| "Deleted target".to_owned(), |target| target.name)
+}
+
 fn link_item(library_id: &str, link: &LibraryTarget, status: SyncStatus, cx: &App) -> SettingItem {
-    let name = sync_targets::get(&link.target, cx)
-        .map_or_else(|| "Deleted target".to_owned(), |target| target.name);
+    let name = target_name(link, cx);
     let key: LinkKey = (library_id.to_owned(), link.id);
     let activity = read_activity(cx);
     let upload = activity.and_then(|a| a.uploads.get(&key)).cloned();
@@ -1026,13 +1126,16 @@ fn start_ticking(cx: &mut App) {
             let syncing = cx.update(|cx| {
                 cx.refresh_windows();
                 let activity = activity(cx);
-                if activity.uploads.is_empty() {
+                let syncing = if activity.uploads.is_empty() {
                     activity.samples.clear();
                     false
                 } else {
                     activity.sample(Instant::now());
                     true
-                }
+                };
+                #[cfg(target_os = "macos")]
+                crate::dock_icon::show_progress(progress(cx).map(|sync| sync.percent));
+                syncing
             });
             if !syncing {
                 break;
@@ -1066,6 +1169,69 @@ mod tests {
 
     use super::*;
     use crate::library::sync_test_support::FakeS3;
+
+    #[test]
+    fn describes_each_devices_syncs() {
+        use crate::library::SyncRun;
+        let (now, s3) = (1_000_000.0, Id::from_u128(7));
+        let name = |id: Id| if id == s3 { "S3".to_owned() } else { "Deleted target".to_owned() };
+        let run = |ago: f64, pending: Option<usize>, error: Option<&str>| SyncRun {
+            attempted_at: now - ago,
+            synced_at: error.is_none().then_some(now - ago),
+            error: error.map(str::to_owned),
+            pending,
+        };
+        let mut device = DeviceSyncRecord {
+            id: Id::from_u128(1),
+            name: "MacBook".into(),
+            this_device: true,
+            seen_at: now,
+            catalog: Some(run(120.0, None, None)),
+            uploads: vec![(s3, run(30.0, Some(1_400), None))],
+        };
+        assert_eq!(
+            device_text(&device, &name, now),
+            "MacBook (this device): catalog synced 2 minutes ago · S3: 1,400 files to upload"
+        );
+
+        device.this_device = false;
+        device.catalog = Some(run(3.0 * 3600.0, None, None));
+        device.uploads = vec![
+            (s3, run(60.0, Some(4), Some("InvalidAccessKeyId: Nope"))),
+            (Id::from_u128(8), run(60.0, Some(0), None)),
+        ];
+        assert_eq!(
+            device_text(&device, &name, now),
+            "MacBook: catalog synced 3 hours ago · S3: stopped: InvalidAccessKeyId: Nope \
+             · Deleted target: up to date"
+        );
+
+        // A device that's never synced says when it was last around.
+        device.catalog = None;
+        device.uploads.clear();
+        device.seen_at = now - 3.0 * 86_400.0;
+        assert_eq!(
+            device_text(&device, &name, now),
+            "MacBook: last opened the library 3 days ago"
+        );
+    }
+
+    #[test]
+    fn says_how_long_ago() {
+        let now = 1_000_000.0;
+        for (seconds, text) in [
+            (-5.0, "just now"),
+            (59.0, "just now"),
+            (60.0, "a minute ago"),
+            (59.0 * 60.0, "59 minutes ago"),
+            (90.0 * 60.0, "an hour ago"),
+            (5.0 * 3600.0, "5 hours ago"),
+            (30.0 * 3600.0, "yesterday"),
+            (10.0 * 86_400.0, "10 days ago"),
+        ] {
+            assert_eq!(ago(now - seconds, now), text, "{seconds}s");
+        }
+    }
 
     struct Blank;
 

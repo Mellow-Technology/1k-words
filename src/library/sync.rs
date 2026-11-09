@@ -269,16 +269,46 @@ impl Library {
         })?;
 
         let mut summary = upload.summary;
-        match upload.stopping {
+        // Only errors the user has to fix are kept, as they hold off
+        // syncing in the background until Sync Now.
+        let error = match upload.stopping {
             Some(Stop::Config(message)) => {
-                self.catalog.set_sync_target_error(id, Some(&message))?;
-                summary.stopped = Some(message);
+                summary.stopped = Some(message.clone());
+                Some(message)
             }
-            Some(Stop::Other(message)) => summary.stopped = Some(message),
-            None if target.error.is_some() => self.catalog.set_sync_target_error(id, None)?,
-            None => {}
-        }
+            Some(Stop::Other(message)) => {
+                summary.stopped = Some(message);
+                None
+            }
+            None => None,
+        };
+        let pending = self.pending_here(id)?;
+        self.catalog.record_device_sync(
+            Some(id),
+            summary.stopped.is_none(),
+            error.as_deref(),
+            Some(pending),
+        )?;
         Ok(summary)
+    }
+
+    /// The files on this device still to upload to a target (`id` being
+    /// the library's id for it): not yet there, or to be tried again.
+    /// Files the catalog lists that aren't here, as when another device
+    /// imported them, are left out.
+    fn pending_here(&self, id: Id) -> Result<usize> {
+        let items = self.sync_items(id)?;
+        Ok(self
+            .catalog
+            .files()?
+            .into_iter()
+            .filter(|file| {
+                items
+                    .get(&file.path)
+                    .is_none_or(|item| item.state == SyncState::Failed)
+            })
+            .filter(|file| self.info.path.join(&file.path).exists())
+            .count())
     }
 }
 
