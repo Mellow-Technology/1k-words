@@ -2,6 +2,7 @@
 name = "openai-vision-detect"
 version = "0.1.0"
 edition = "2024"
+license = "LGPL-3.0-only"
 description = "1k Words detection plugin for OpenAI-compatible vision models"
 publish = false
 
