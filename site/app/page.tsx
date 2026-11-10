@@ -17,6 +17,7 @@ import { Shot } from "@/components/Shot";
 import styles from "./page.module.scss";
 
 const REPO = "https://github.com/Mellow-Technology/1k-words";
+const RELEASES = `${REPO}/releases`;
 
 function Brand() {
   return (
@@ -287,45 +288,43 @@ export default function Home() {
           id="get-started"
           size="wide"
           eyebrow="Get started"
-          title="Build it in a few minutes"
-          description="1k Words is built with Rust and runs best on macOS. There's no download yet, so for now you build it from source."
+          title="Install it in a minute"
+          description="1k Words is for Macs with Apple silicon, running macOS 13 or later. It's free, from GitHub."
         >
           <div className={styles.split}>
             <Steps
               steps={[
                 {
-                  title: "Install Rust",
+                  title: "Download it",
                   body: (
                     <>
-                      From <a href="https://rustup.rs">rustup.rs</a>, if you don&apos;t have it yet. The right
-                      toolchain is picked up from the repository.
+                      Get the latest release from <a href={RELEASES}>GitHub</a>: the zip ending in{" "}
+                      <code>macos-arm64</code>.
                     </>
                   ),
                 },
                 {
-                  title: "Install FFmpeg and libheif",
+                  title: "Move it to Applications",
+                  body: "Unzip it, and drag 1k Words into your Applications folder.",
+                },
+                {
+                  title: "Let macOS open it",
                   body: (
                     <>
-                      With <a href="https://brew.sh">Homebrew</a>. They decode Live Photo videos and HEIC photos.
+                      Releases aren&apos;t notarized by Apple yet, so macOS quarantines the download and may say the
+                      app is damaged or can&apos;t be checked. Run this once in Terminal to lift the quarantine, then
+                      open 1k Words as usual.
                     </>
                   ),
                 },
-                {
-                  title: "Build and open the app",
-                  body: "Clone the repository and run it. Make a library, then import from a card or a folder.",
-                },
               ]}
             />
-            <Terminal
-              label="Terminal"
-              lines={[
-                "brew install ffmpeg libheif pkg-config",
-                "git clone https://github.com/Mellow-Technology/1k-words",
-                "cd 1k-words",
-                "cargo run --release",
-              ]}
-            />
+            <Terminal label="Terminal" lines={['xattr -dr com.apple.quarantine "/Applications/1k Words.app"']} />
           </div>
+          <p className={styles.buildNote}>
+            Rather build it yourself? It takes Rust and a few Homebrew packages: the{" "}
+            <a href={`${REPO}#building-from-source`}>README</a> has the steps.
+          </p>
         </Section>
 
         <section className={styles.cta}>
@@ -333,7 +332,7 @@ export default function Home() {
             title="A thousand words, one frame at a time"
             actions={
               <>
-                <Button href={REPO} icon={<GitHubIcon />}>
+                <Button href={RELEASES} icon={<GitHubIcon />}>
                   Get 1k Words
                 </Button>
                 <Button href={`${REPO}#readme`} variant="secondary">

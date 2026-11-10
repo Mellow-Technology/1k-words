@@ -222,6 +222,14 @@ $-irises: patterns.svg-url(
   }
 }
 
+// ---- Get started -----------------------------------------------------------------
+
+.buildNote {
+  max-width: 62ch;
+  margin: var(--gm-space-6) 0 0;
+  color: var(--gm-color-text-muted);
+}
+
 // ---- Closing ---------------------------------------------------------------------
 
 .cta {

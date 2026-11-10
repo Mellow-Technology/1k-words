@@ -81,7 +81,11 @@ Only the differences, as far as we know. Apple Photos is a lovely place for iPho
 
 ## Status
 
-1k Words is macOS first. There's no download yet, so for now you build it from source.
+1k Words is macOS first, for Macs with Apple silicon running macOS 13 or later. Releases are on [GitHub](https://github.com/Mellow-Technology/1k-words/releases). They aren't notarized by Apple yet (KW-50), so after moving the app to Applications, lift macOS's quarantine once before opening it:
+
+```sh
+xattr -dr com.apple.quarantine "/Applications/1k Words.app"
+```
 
 Still to come (see [`TODO.md`](TODO.md) for the full list):
 
