@@ -27,13 +27,15 @@ use image::{DynamicImage, Frame, ImageDecoder, ImageReader, RgbaImage};
 use crate::heif::{self, is_heif};
 use crate::photos::{Photo, read_exif};
 use crate::raw::{self, is_raw};
+use crate::video;
 
 /// Gallery thumbnails are decoded at this width (in device pixels), which
 /// is enough for a sharp masonry column on a 2x display.
 pub const THUMBNAIL_WIDTH: u32 = 560;
 /// Filmstrip thumbnails in the viewer are decoded at this height.
 pub const FILMSTRIP_THUMBNAIL_HEIGHT: u32 = 180;
-/// The quick preview shows photos scaled to fit this size.
+/// The quick preview shows photos scaled to fit this size, and the previews
+/// and posters a library keeps are made to fit it.
 pub const VIEWER_PREVIEW_SIZE: u32 = 2048;
 /// Embedded previews smaller than this (on their long side) aren't worth
 /// showing in the viewer; the gallery thumbnail is about as good.
@@ -108,6 +110,27 @@ pub fn thumbnail_image(photo: &Photo) -> Result<DynamicImage> {
         _ => decode_full(photo)?,
     };
     Ok(fit(image, THUMBNAIL_WIDTH, u32::MAX))
+}
+
+/// The preview a library keeps for a photo (see `library::derivatives`):
+/// the embedded preview only when it's as big as a preview, as this may end
+/// up being the best copy on the device, otherwise made from the full image.
+pub fn preview_image(photo: &Photo) -> Result<DynamicImage> {
+    let image = match embedded_preview(photo) {
+        Some(preview) if preview.width().max(preview.height()) >= VIEWER_PREVIEW_SIZE => preview,
+        _ => decode_full(photo)?,
+    };
+    Ok(fit(image, VIEWER_PREVIEW_SIZE, VIEWER_PREVIEW_SIZE))
+}
+
+/// The poster a library keeps for a Live Photo's video (see
+/// `library::derivatives`): its first frame.
+pub fn poster_image(video: &Path) -> Result<DynamicImage> {
+    Ok(fit(
+        video::first_frame(video)?,
+        VIEWER_PREVIEW_SIZE,
+        VIEWER_PREVIEW_SIZE,
+    ))
 }
 
 /// A thumbnail the library made earlier, if it's there.

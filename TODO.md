@@ -90,8 +90,6 @@ its targets on the Libraries page (`src/sync_settings.rs`).
     how they came, last opened and pins are recorded per device, apart from
     the synced catalog (`src/library/on_device.rs`);
   - free up space by removing originals that are safely synced.
-- **More derivatives**, such as viewer-sized previews and video posters.
-  Each is a `DerivativeKind`, with its own folder.
 
 ## Object detection
 

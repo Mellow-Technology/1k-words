@@ -1122,7 +1122,8 @@ impl Gallery {
     }
 
     /// Makes the library's missing thumbnails, then has its detector find
-    /// the objects in the photos it hasn't looked at, in the background.
+    /// the objects in the photos it hasn't looked at, in the background,
+    /// while the missing previews and posters are made.
     /// Tests don't find objects, so they don't download the model.
     fn scan_library(&mut self, library: Arc<Library>, cx: &mut Context<Self>) {
         let finished = Arc::new(AtomicBool::new(false));
@@ -1140,17 +1141,32 @@ impl Gallery {
             }
         }));
         cx.spawn(async move |this, cx| {
-            let found = cx
-                .background_spawn(async move {
+            cx.background_spawn({
+                let library = library.clone();
+                async move {
                     if let Err(error) = library.refresh_originals() {
                         eprintln!("couldn't check the library's originals: {error:#}");
                     }
                     if let Err(error) = library.make_missing_thumbnails() {
                         eprintln!("couldn't make the library's thumbnails: {error:#}");
                     }
-                    // From the thumbnails, so after them.
-                    (!cfg!(test)).then(|| library.detect_missing_objects())
-                })
+                }
+            })
+            .await;
+            cx.background_spawn({
+                let library = library.clone();
+                async move {
+                    if let Err(error) = library.make_missing_previews() {
+                        eprintln!("couldn't make the library's previews: {error:#}");
+                    }
+                }
+            })
+            .detach();
+            // From the thumbnails, so after them.
+            let found = cx
+                .background_spawn(
+                    async move { (!cfg!(test)).then(|| library.detect_missing_objects()) },
+                )
                 .await;
             let error = match found {
                 Some(Err(error)) => {

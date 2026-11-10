@@ -3,7 +3,7 @@
 //!
 //! A library's folder holds a marker, a README and the originals, filed by
 //! the day they were taken, and derivatives made from them, such as
-//! thumbnails, laid out the same way (see `derivatives`):
+//! thumbnails and previews, laid out the same way (see `derivatives`):
 //!
 //! ```text
 //! 1K Words/
@@ -11,6 +11,7 @@
 //!   README.txt
 //!   Originals/2026/10/15/IMG_0001.JPG
 //!   Thumbnails/2026/10/15/IMG_0001.JPG.jpg
+//!   Previews/2026/10/15/IMG_0001.JPG.jpg
 //! ```
 //!
 //! The originals are read-only by default (see `protect`). Each library's
@@ -77,8 +78,9 @@ changed, moved or deleted here won't be reflected in the app.
 
 The photos are read-only so they aren't changed by accident.
 
-Thumbnails holds smaller copies of the photos, which the app makes from
-the originals as it needs them.
+Thumbnails and Previews hold smaller copies of the photos, and Posters a
+still from each Live Photo's video, which the app makes from the originals
+as it needs them.
 
 Catalog holds a copy of the library's albums, which the app restores
 them from if its own catalog of the library is lost.
@@ -115,7 +117,8 @@ pub struct Library {
     placing: Mutex<()>,
     /// Held while writing the copy of the albums (see `albums`).
     saving_albums: Mutex<()>,
-    derivatives: Activity,
+    thumbnails: Activity,
+    previews: Activity,
     detecting: Activity,
     /// What finds objects in its photos (see `set_detector`).
     detector: Mutex<objects::DetectorSlot>,
@@ -189,7 +192,8 @@ impl Library {
             on_device,
             placing: Mutex::new(()),
             saving_albums: Mutex::new(()),
-            derivatives: Activity::default(),
+            thumbnails: Activity::default(),
+            previews: Activity::default(),
             detecting: Activity::default(),
             detector: Mutex::default(),
             detection_progress: Default::default(),
