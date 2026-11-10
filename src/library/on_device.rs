@@ -186,7 +186,7 @@ impl OnDevice {
 
     /// Every original recorded as here, with its size and when it was
     /// fetched, if it was.
-    fn originals(&self) -> Result<HashMap<String, (u64, Option<f64>)>> {
+    pub(super) fn originals(&self) -> Result<HashMap<String, (u64, Option<f64>)>> {
         let connection = self.connection();
         block_on(async {
             let mut rows = connection
@@ -287,7 +287,7 @@ impl OnDevice {
         })
     }
 
-    fn pinned_photos(&self) -> Result<HashSet<String>> {
+    pub(super) fn pinned_photos(&self) -> Result<HashSet<String>> {
         let connection = self.connection();
         block_on(async {
             let mut rows = connection
@@ -411,7 +411,7 @@ impl Library {
         self.on_device.update_originals(&found, &gone)
     }
 
-    fn check_folder(&self) -> Result<()> {
+    pub(super) fn check_folder(&self) -> Result<()> {
         if marker_id(&self.info.path).as_deref() != Some(self.info.id.as_str()) {
             bail!("{} isn't there", self.info.path.display());
         }

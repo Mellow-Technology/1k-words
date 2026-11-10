@@ -32,8 +32,9 @@ use gpui_kit::{
 use crate::config_form::{ConfigForm, form_row};
 use crate::gallery::{show_error, show_warning};
 use crate::library::{
-    self, DeviceSyncRecord, DownloadSource, DownloadSummary, Id, Library, LibraryInfo,
-    LibraryTarget, SyncStatus, TargetSettings, UploadProgress, UploadSummary,
+    self, DeviceSyncRecord, DownloadSource, DownloadSummary, FreeUpSummary, Id, Library,
+    LibraryInfo, LibraryTarget, SpaceOverview, SyncStatus, TargetSettings, UploadProgress,
+    UploadSummary,
 };
 use crate::photos::Photo;
 use crate::plugins::{Config, FieldKind, Plugin, Plugins};
@@ -123,6 +124,12 @@ struct SyncActivity {
     again: HashSet<LinkKey>,
     /// How each target's last upload went.
     results: HashMap<LinkKey, String>,
+    /// How each library's originals stand on this device.
+    space: HashMap<String, SpaceOverview>,
+    /// The libraries having originals removed.
+    freeing: HashSet<String>,
+    /// How each library's last freeing up of space went.
+    freed: HashMap<String, String>,
     /// Bytes sent by uploads that have finished, so the total sent only
     /// goes up.
     finished_sent: u64,
@@ -246,6 +253,7 @@ pub fn refresh_library(library_id: &str, cx: &mut App) {
         return;
     };
     let id = library_id.to_owned();
+    refresh_space(library_id, cx);
     cx.spawn(async move |cx| {
         let (overview, devices) = cx
             .background_spawn(async move { (handle.sync_overview(), handle.device_sync()) })
@@ -269,9 +277,39 @@ pub fn refresh_library(library_id: &str, cx: &mut App) {
     .detach();
 }
 
-/// Whether anything's uploading.
+/// Reads again how a library's originals stand, in the background. Its
+/// folder may be on a drive that isn't connected, when there's nothing to
+/// say.
+fn refresh_space(library_id: &str, cx: &mut App) {
+    if crate::library_settings::is_busy(cx) {
+        return;
+    }
+    let id = library_id.to_owned();
+    let Ok(library) = library::get(library_id, cx) else {
+        activity(cx).space.remove(&id);
+        return;
+    };
+    cx.spawn(async move |cx| {
+        let overview = cx
+            .background_spawn(async move { library.space_overview() })
+            .await;
+        cx.update(|cx| {
+            match overview {
+                Ok(overview) => {
+                    activity(cx).space.insert(id, overview);
+                }
+                Err(error) => eprintln!("couldn't read a library's originals: {error:#}"),
+            }
+            cx.refresh_windows();
+        });
+    })
+    .detach();
+}
+
+/// Whether anything's uploading, or having originals removed.
 pub fn is_syncing(cx: &App) -> bool {
-    read_activity(cx).is_some_and(|activity| !activity.uploads.is_empty())
+    read_activity(cx)
+        .is_some_and(|activity| !activity.uploads.is_empty() || !activity.freeing.is_empty())
 }
 
 /// The Sync page: the targets, and adding more.
@@ -304,8 +342,81 @@ pub fn page(cx: &App) -> SettingPage {
             ),
         )
         .group(crate::catalog_sync::group(cx))
+        .group(space_group())
         .groups(sync_targets::list(cx).iter().map(target_group))
         .group(add_group(cx))
+}
+
+/// A dropdown of numbers with labels, for the space budget.
+fn number_field(
+    options: &[(u32, &str)],
+    get: impl Fn(&library::SpaceBudget) -> u32 + 'static,
+    set: impl Fn(&mut library::SpaceBudget, u32) + 'static,
+) -> SettingField<SharedString> {
+    let options = options
+        .iter()
+        .map(|(value, label)| {
+            (
+                value.to_string().into(),
+                SharedString::from(label.to_string()),
+            )
+        })
+        .collect();
+    SettingField::dropdown(
+        options,
+        move |cx| get(&settings::get(cx).space_budget).to_string().into(),
+        move |key, cx| {
+            if let Ok(value) = key.parse() {
+                settings::set_space_budget(cx, |budget| set(budget, value));
+            }
+        },
+    )
+}
+
+/// How much originals may take on this device. What's pinned is shown with
+/// each library, on the Libraries page.
+fn space_group() -> SettingGroup {
+    let cap = number_field(
+        &[
+            (10, "10%"),
+            (25, "25%"),
+            (50, "50%"),
+            (75, "75%"),
+            (100, "100%"),
+        ],
+        |budget| budget.cap_percent,
+        |budget, value| budget.cap_percent = value,
+    );
+    let floor = number_field(
+        &[
+            (5, "5 GB"),
+            (10, "10 GB"),
+            (25, "25 GB"),
+            (50, "50 GB"),
+            (100, "100 GB"),
+        ],
+        |budget| budget.floor_gb,
+        |budget, value| budget.floor_gb = value,
+    );
+    let copies = number_field(
+        &[(1, "1 target"), (2, "2 targets"), (3, "3 targets")],
+        |budget| budget.copies,
+        |budget, value| budget.copies = value,
+    );
+    SettingGroup::new()
+        .title("Free Up Space")
+        .item(SettingItem::new("Originals Cap", cap).description(
+            "How much of its disk a library's originals may take. Past this, the ones wanted \
+             longest ago are removed from this device, and downloaded again as they're opened.",
+        ))
+        .item(
+            SettingItem::new("Keep Free", floor)
+                .description("Originals are removed too if a library's disk gets this full."),
+        )
+        .item(SettingItem::new("Copies Required", copies).description(
+            "How many targets must hold an original before it can be removed. Pinned originals \
+             always stay.",
+        ))
 }
 
 fn target_group(target: &TargetInfo) -> SettingGroup {
@@ -493,6 +604,10 @@ fn delete_target(id: &str, window: &mut Window, cx: &mut App) {
             let target = id.clone();
             let forgotten = cx
                 .background_spawn(async move {
+                    // All of them first, so it's not left half done.
+                    handles
+                        .iter()
+                        .try_for_each(|handle| handle.check_sync_target_forgettable(&target))?;
                     handles
                         .iter()
                         .try_for_each(|handle| handle.forget_sync_target(&target))
@@ -719,6 +834,9 @@ pub fn library_items(info: &LibraryInfo, cx: &App) -> Vec<SettingItem> {
         )
         .description(description),
     );
+    if !links.is_empty() {
+        items.push(space_item(&info.id, cx));
+    }
     items
 }
 
@@ -802,6 +920,67 @@ fn ago(at: f64, now: f64) -> String {
 fn target_name(link: &LibraryTarget, cx: &App) -> String {
     sync_targets::get(&link.target, cx)
         .map_or_else(|| "Deleted target".to_owned(), |target| target.name)
+}
+
+/// A library's originals on this device, what's pinned, and a way to bring
+/// it within budget now.
+fn space_item(library_id: &str, cx: &App) -> SettingItem {
+    let activity = read_activity(cx);
+    let overview = activity.and_then(|activity| activity.space.get(library_id));
+    let mut text = overview.map_or_else(
+        || "Not available.".to_owned(),
+        |overview| space_text(overview, &settings::get(cx).space_budget),
+    );
+    if let Some(freed) = activity.and_then(|activity| activity.freed.get(library_id)) {
+        text.push_str(&format!(" {freed}"));
+    }
+    let freeing = activity.is_some_and(|activity| activity.freeing.contains(library_id));
+    let library_id = library_id.to_owned();
+    SettingItem::new(
+        "Originals on This Device",
+        SettingField::render(move |_, _, _| {
+            let library_id = library_id.clone();
+            Button::new("free-up")
+                .label(if freeing {
+                    "Freeing Up…"
+                } else {
+                    "Free Up Space"
+                })
+                .small()
+                .disabled(freeing)
+                .on_click(move |_, window, cx| free_up_now(&library_id, window, cx))
+        }),
+    )
+    .description(text)
+}
+
+/// "12 GB of 250 GB allowed. 1 GB is pinned: 3 photos and Family."
+fn space_text(overview: &SpaceOverview, budget: &library::SpaceBudget) -> String {
+    let usage = overview.usage;
+    let mut text = format_size(usage.bytes);
+    match overview.volume {
+        Some(volume) => text.push_str(&format!(
+            " of {} allowed, with {} free on the disk.",
+            format_size(budget.cap(volume.total)),
+            format_size(volume.free)
+        )),
+        None => text.push('.'),
+    }
+    let mut pins = Vec::new();
+    match overview.pinned_photos {
+        0 => {}
+        1 => pins.push("1 photo".to_owned()),
+        n => pins.push(format!("{} photos", format_count(n))),
+    }
+    pins.extend(overview.pinned_albums.iter().cloned());
+    if !pins.is_empty() {
+        text.push_str(&format!(
+            " {} is pinned: {}.",
+            format_size(usage.pinned_bytes),
+            pins.join(", ")
+        ));
+    }
+    text
 }
 
 fn link_item(library_id: &str, link: &LibraryTarget, status: SyncStatus, cx: &App) -> SettingItem {
@@ -1097,14 +1276,104 @@ fn start_upload(
                 None => false,
             };
             let again = activity.again.remove(&key) && !cancelled && result.is_ok();
+            let finished = !again && !cancelled && result.is_ok();
             activity.results.insert(key.clone(), result_text(result));
             refresh_library(&key.0, cx);
             if again {
                 sync_in_background(&key.0, cx);
+            } else if finished {
+                free_up_in_background(&key.0, cx);
             }
         });
     })
     .detach();
+}
+
+/// Brings a library within its budget after syncing, if the setting's on.
+/// Like syncing in the background, nothing's shown if it can't.
+fn free_up_in_background(library_id: &str, cx: &mut App) {
+    if settings::get(cx).pause_automatic_sync || crate::library_settings::is_busy(cx) {
+        return;
+    }
+    let Ok(Some(plugins)) = sync_targets::plugins(cx) else {
+        return;
+    };
+    if let Ok(library) = library::get(library_id, cx) {
+        start_free_up(library, plugins, cx);
+    }
+}
+
+/// Brings a library within its budget now, as asked. Done even while
+/// automatic sync is paused.
+fn free_up_now(library_id: &str, window: &mut Window, cx: &mut App) {
+    if crate::library_settings::is_busy(cx) {
+        show_warning(
+            "Please wait until the library is free.",
+            "A library is being moved or deleted.",
+            window,
+            cx,
+        );
+        return;
+    }
+    let Some(plugins) = loaded_plugins(window, cx) else {
+        return;
+    };
+    match library::get(library_id, cx) {
+        Ok(library) => start_free_up(library, plugins, cx),
+        Err(error) => show_error("The library couldn't be opened.", &error, window, cx),
+    }
+}
+
+/// Removes originals from a library in the background, unless it's doing
+/// that already.
+fn start_free_up(library: Arc<Library>, plugins: Arc<Plugins>, cx: &mut App) {
+    let id = library.info.id.clone();
+    if !activity(cx).freeing.insert(id.clone()) {
+        return;
+    }
+    let budget = settings::get(cx).space_budget;
+    let targets = sync_targets::list(cx).to_vec();
+    cx.refresh_windows();
+    let task = cx.background_spawn(async move {
+        let sources = download_sources(&library, &targets)?;
+        library.free_up_space(&plugins, &sources, &budget)
+    });
+    cx.spawn(async move |cx| {
+        let result = task.await;
+        cx.update(|cx| {
+            let activity = activity(cx);
+            activity.freeing.remove(&id);
+            activity.freed.insert(id.clone(), freed_text(result));
+            refresh_library(&id, cx);
+        });
+    })
+    .detach();
+}
+
+/// How freeing up space went, for after what the library's originals take.
+fn freed_text(result: Result<FreeUpSummary>) -> String {
+    let summary = match result {
+        Ok(summary) => summary,
+        Err(error) => return format!("Couldn't free up space: {error:#}"),
+    };
+    let mut text = match summary.removed {
+        0 => String::new(),
+        1 => format!("Removed 1 original ({}).", format_size(summary.bytes)),
+        n => format!(
+            "Removed {} originals ({}).",
+            format_count(n),
+            format_size(summary.bytes)
+        ),
+    };
+    if let Some(stopped) = summary.stopped {
+        text.push_str(&format!(" {stopped}"));
+    } else if summary.short > 0 {
+        text.push_str(&format!(
+            " {} more has to stay, as it's pinned or not yet safely synced.",
+            format_size(summary.short)
+        ));
+    }
+    text.trim().to_owned()
 }
 
 /// What's needed to download from a library's targets, in the background.
@@ -1258,6 +1527,84 @@ mod tests {
 
     use super::*;
     use crate::library::sync_test_support::FakeS3;
+    use crate::library::{OriginalsUsage, SpaceBudget, Volume};
+
+    #[test]
+    fn says_how_originals_stand() {
+        let mut overview = SpaceOverview {
+            usage: OriginalsUsage {
+                files: 3,
+                bytes: 12_000_000_000,
+                pinned_bytes: 1_000_000_000,
+            },
+            pinned_photos: 0,
+            pinned_albums: Vec::new(),
+            volume: Some(Volume {
+                total: 1_000_000_000_000,
+                free: 400_000_000_000,
+            }),
+        };
+        let budget = SpaceBudget::default();
+        assert_eq!(
+            space_text(&overview, &budget),
+            "12.0 GB of 250.0 GB allowed, with 400.0 GB free on the disk."
+        );
+        overview.pinned_photos = 3;
+        overview.pinned_albums = vec!["Family".into()];
+        overview.volume = None;
+        assert_eq!(
+            space_text(&overview, &budget),
+            "12.0 GB. 1.0 GB is pinned: 3 photos, Family."
+        );
+    }
+
+    #[test]
+    fn says_how_freeing_up_space_went() {
+        let summary = |removed, short, stopped: Option<&str>| {
+            Ok(FreeUpSummary {
+                removed,
+                bytes: removed as u64 * 2_000_000,
+                short,
+                stopped: stopped.map(Into::into),
+            })
+        };
+        assert_eq!(freed_text(summary(0, 0, None)), "");
+        assert_eq!(
+            freed_text(summary(1, 0, None)),
+            "Removed 1 original (2.0 MB)."
+        );
+        assert_eq!(
+            freed_text(summary(2, 5_000_000, None)),
+            "Removed 2 originals (4.0 MB). 5.0 MB more has to stay, as it's pinned or not yet \
+             safely synced."
+        );
+        assert_eq!(freed_text(summary(0, 9, Some("Stopped."))), "Stopped.");
+        assert_eq!(
+            freed_text(Err(anyhow!("no disk"))),
+            "Couldn't free up space: no disk"
+        );
+    }
+
+    struct SyncPage;
+
+    impl Render for SyncPage {
+        fn render(&mut self, _: &mut Window, cx: &mut gpui_kit::Context<Self>) -> impl IntoElement {
+            gpui_kit::component::setting::Settings::new("settings").page(page(cx))
+        }
+    }
+
+    #[gpui_kit::test]
+    fn the_sync_page_draws_the_space_budget(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            settings::init(cx);
+            gpui_kit::open_window(WindowOptions::default(), cx, |_, cx| cx.new(|_| SyncPage))
+                .unwrap();
+            settings::set_space_budget(cx, |budget| budget.copies = 2);
+            assert_eq!(settings::get(cx).space_budget.copies, 2);
+        });
+        cx.run_until_parked();
+    }
 
     #[test]
     fn describes_each_devices_syncs() {

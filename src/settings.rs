@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::acknowledgements;
 use crate::detection_settings;
+use crate::library::SpaceBudget;
 use crate::library_settings::{self, LibraryActions};
 use crate::sync_settings;
 
@@ -74,6 +75,8 @@ pub struct AppSettings {
     /// The server libraries' catalogs sync with, if any (see
     /// `catalog_sync`). Its token is in the keychain.
     pub catalog_server: Option<String>,
+    /// How much originals may take on this device (see `library::free_space`).
+    pub space_budget: SpaceBudget,
 }
 
 impl Global for AppSettings {}
@@ -106,6 +109,10 @@ pub fn set_show_object_boxes(show: bool, cx: &mut App) {
 
 pub fn set_detection_plugin(plugin: Option<String>, cx: &mut App) {
     update(cx, |settings| settings.detection_plugin = plugin);
+}
+
+pub fn set_space_budget(cx: &mut App, f: impl FnOnce(&mut SpaceBudget)) {
+    update(cx, |settings| f(&mut settings.space_budget));
 }
 
 pub fn set_sync_automatically(on: bool, cx: &mut App) {

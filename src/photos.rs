@@ -64,6 +64,12 @@ impl Photo {
         .flatten()
     }
 
+    /// Whether what's shown of it is on this device. Its raw pair needn't
+    /// be: that can be removed ahead of the JPEG (see `library::free_space`).
+    pub fn shown_here(&self) -> bool {
+        self.path.is_file() && self.live_video.iter().all(|video| video.is_file())
+    }
+
     pub fn aspect_ratio(&self) -> f32 {
         if self.width == 0 || self.height == 0 {
             1.0
@@ -1021,6 +1027,23 @@ mod tests {
         let image_id = photo_content_id(Path::new(&image));
         assert!(image_id.is_some());
         assert_eq!(image_id, video_content_id(Path::new(&video)));
+    }
+
+    #[test]
+    fn a_missing_raw_pair_does_not_stop_a_photo_being_shown() {
+        let dir = std::env::temp_dir().join(format!("1k-words-shown-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let jpeg = dir.join("a.jpg");
+        std::fs::write(&jpeg, b"jpeg").unwrap();
+        let mut p = photo(jpeg.to_str().unwrap(), 0.0, 0.0);
+        p.raw_pair = Some(dir.join("a.arw"));
+        assert!(p.shown_here());
+        p.live_video = Some(dir.join("a.mov"));
+        assert!(!p.shown_here());
+        p.live_video = None;
+        std::fs::remove_file(&jpeg).unwrap();
+        assert!(!p.shown_here());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

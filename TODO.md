@@ -90,7 +90,9 @@ its targets on the Libraries page (`src/sync_settings.rs`).
     it (`src/library/download.rs`). Which are here, how they came, last
     opened and pins are recorded per device, apart from the synced catalog
     (`src/library/on_device.rs`);
-  - free up space by removing originals that are safely synced.
+  - have the catalog's sync (the first item) answer `catalog_synced` in
+    `src/library/free_space.rs`. Removing originals to stay within the
+    budget in Settings is built, but nothing's removed until it says yes.
 
 ## Object detection
 

@@ -272,6 +272,12 @@ impl Library {
         if !self.synced_paths()?.contains(path) {
             bail!("{path} isn't safely synced");
         }
+        self.remove_original_file(path)
+    }
+
+    /// Removes an original's file and its record. It's for the caller to
+    /// be sure it can go.
+    pub(super) fn remove_original_file(&self, path: &str) -> Result<()> {
         library_path(path)?;
         let file = self.info.path.join(path);
         let dir = file.parent().context("no folder")?;
@@ -542,7 +548,7 @@ fn library_path(path: &str) -> Result<Vec<String>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
 
@@ -552,16 +558,16 @@ mod tests {
 
     /// A library of `count` photos with thumbnails, all uploaded to a fake
     /// S3, the plugins, and the library's id and settings for the target.
-    struct Synced {
-        library: Arc<Library>,
-        root: PathBuf,
-        s3: FakeS3,
-        plugins: Plugins,
-        id: Id,
-        settings: TargetSettings,
+    pub(in super::super) struct Synced {
+        pub library: Arc<Library>,
+        pub root: PathBuf,
+        pub s3: FakeS3,
+        pub plugins: Plugins,
+        pub id: Id,
+        pub settings: TargetSettings,
     }
 
-    fn synced(name: &str, count: u8) -> Synced {
+    pub(in super::super) fn synced(name: &str, count: u8) -> Synced {
         let (config_dir, library_dir) = test_support::temp_dirs(name);
         let root = config_dir.parent().unwrap().to_path_buf();
         let source = root.join("card");

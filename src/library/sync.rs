@@ -119,42 +119,15 @@ impl Library {
     /// uploaded stays there. Refused if that would lose track of the only
     /// copy of originals that have been evicted from this device.
     pub fn remove_sync_target(&self, id: Id) -> Result<()> {
-        let mut elsewhere = HashSet::new();
-        for target in self.sync_targets()? {
-            if target.id != id {
-                elsewhere.extend(self.synced_items(target.id)?);
-            }
-        }
-        let stranded = self
-            .synced_items(id)?
-            .into_iter()
-            .filter(|path| !elsewhere.contains(path))
-            .filter(|path| !self.info.path.join(path).is_file())
-            .count();
-        if stranded > 0 {
-            bail!(
-                "{stranded} files are only on this target, not on this device. Pin their photos \
-                 to download them first."
-            );
-        }
+        check_not_stranded(&self.catalog, &self.info.path, id)?;
         self.catalog.remove_sync_target(id)
-    }
-
-    /// The files safely on a target.
-    fn synced_items(&self, id: Id) -> Result<Vec<String>> {
-        Ok(self
-            .sync_items(id)?
-            .into_values()
-            .filter(|item| item.state == SyncState::Synced)
-            .map(|item| item.path)
-            .collect())
     }
 
     /// The files safely on any target.
     pub(super) fn synced_paths(&self) -> Result<HashSet<String>> {
         let mut paths = HashSet::new();
         for target in self.sync_targets()? {
-            paths.extend(self.synced_items(target.id)?);
+            paths.extend(synced_items(&self.catalog, target.id)?);
         }
         Ok(paths)
     }
@@ -846,6 +819,39 @@ impl Uploading<'_> {
         }
         Ok(())
     }
+}
+
+/// The files safely on a target.
+fn synced_items(catalog: &Catalog, id: Id) -> Result<Vec<String>> {
+    Ok(sync_items(catalog, id)?
+        .into_values()
+        .filter(|item| item.state == SyncState::Synced)
+        .map(|item| item.path)
+        .collect())
+}
+
+/// Fails if forgetting a target would lose track of the only copy of
+/// originals that have been removed from this device, in the library at
+/// `root`.
+pub(super) fn check_not_stranded(catalog: &Catalog, root: &Path, id: Id) -> Result<()> {
+    let mut elsewhere = HashSet::new();
+    for target in sync_targets(catalog)? {
+        if target.id != id {
+            elsewhere.extend(synced_items(catalog, target.id)?);
+        }
+    }
+    let stranded = synced_items(catalog, id)?
+        .into_iter()
+        .filter(|path| !elsewhere.contains(path))
+        .filter(|path| !root.join(path).is_file())
+        .count();
+    if stranded > 0 {
+        bail!(
+            "{stranded} files are only on this target, not on this device. Pin their photos to \
+             download them first."
+        );
+    }
+    Ok(())
 }
 
 pub(super) fn sync_targets(catalog: &Catalog) -> Result<Vec<LibraryTarget>> {

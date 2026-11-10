@@ -218,7 +218,7 @@ impl PhotoViewer {
                 // what's said of the photo read again once they're here.
                 let here = cx.background_spawn({
                     let photo = photo.clone();
-                    async move { photo.files().all(|file| file.is_file()) }
+                    async move { photo.shown_here() }
                 });
                 if let Some(library) = library
                     && !here.await
