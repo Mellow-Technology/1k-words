@@ -162,10 +162,14 @@ for file in "$EXECUTABLE" "$CONTENTS/Frameworks"/*.dylib; do
     esac
   done < <(otool -L "$file" | tail -n +2 | awk '{print $1}' | grep -v -F "$(otool -D "$file" | tail -n +2)")
 done
-# And none of this machine's paths are left in it.
-if grep -r -l -F "$HOME/" "$CONTENTS/MacOS" "$CONTENTS/Frameworks" >/dev/null 2>&1; then
+# And none of this build's paths are left in it: the ones remapped above.
+# Not all of $HOME: the prebuilt ONNX Runtime (from ort) has its own build
+# machine's paths, /Users/runner/..., which is $HOME on GitHub's runners.
+LEAKS=(-e "$ROOT/" -e "${CARGO_HOME:-$HOME/.cargo}/" -e "$(rustc --print sysroot)/")
+if grep -r -l -F "${LEAKS[@]}" "$CONTENTS/MacOS" "$CONTENTS/Frameworks" >/dev/null 2>&1; then
   echo "The bundle still has paths from this machine in:" >&2
-  grep -r -l -F "$HOME/" "$CONTENTS/MacOS" "$CONTENTS/Frameworks" >&2
+  grep -r -l -F "${LEAKS[@]}" "$CONTENTS/MacOS" "$CONTENTS/Frameworks" >&2
+  grep -r -h -o -a -F "${LEAKS[@]}" "$CONTENTS/MacOS" "$CONTENTS/Frameworks" | sort | uniq -c >&2
   problems=1
 fi
 [[ $problems == 0 ]] || exit 1
