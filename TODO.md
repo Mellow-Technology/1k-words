@@ -26,8 +26,10 @@
   named `@rpath/…`; build with `FFMPEG_DIR` pointing at it. Homebrew's
   (GPL) FFmpeg is for development only. Still to do: bundle it (below), and
   build it for Windows and Linux (KW-49).
-- **Bundle the native libraries.** FFmpeg and libheif (and its codec,
-  libde265) currently come from Homebrew; a distributed app must ship them.
+- **Bundle the native libraries.** Done for macOS: `scripts/bundle-macos.sh`
+  ships LGPL builds of FFmpeg and of libheif with libde265
+  (`scripts/build-libheif.sh`) in the app's Frameworks folder. Still to do:
+  Windows and Linux (KW-49).
 - **LGPL compliance.** rawler (LGPL-2.1) is statically linked Rust, so users
   must be able to relink against a modified version. libheif and FFmpeg are
   LGPL too.

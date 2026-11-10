@@ -65,3 +65,29 @@ fn to_image(handle: &ImageHandle) -> Result<DynamicImage> {
         .ok_or_else(|| anyhow!("unexpected HEIF plane size"))?;
     Ok(DynamicImage::ImageRgba8(buffer))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The app icon at 512 px, made HEIC by macOS's encoder (`sips -s format
+    /// heic`), so decoding is checked against whichever libheif the app's
+    /// built with: Homebrew's, or the LGPL one it ships
+    /// (`scripts/build-libheif.sh`).
+    const ICON: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/heic/icon.heic");
+
+    #[test]
+    fn decodes_heic() {
+        let path = Path::new(ICON);
+        assert!(is_heif(path));
+        assert_eq!(dimensions(path).unwrap(), (512, 512));
+        let image = decode(path).unwrap().to_rgb8();
+        assert_eq!(image.dimensions(), (512, 512));
+        // The icon's graphite, beside its top-left crop mark, and the mark's
+        // amber.
+        let [r, g, b] = image.get_pixel(80, 256).0;
+        assert!(r < 50 && g < 50 && b < 60, "graphite: {r} {g} {b}");
+        let [r, g, b] = image.get_pixel(115, 140).0;
+        assert!(r > 200 && g > 150 && b < 130, "amber: {r} {g} {b}");
+    }
+}

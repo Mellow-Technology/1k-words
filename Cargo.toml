@@ -8,12 +8,12 @@ license = "LGPL-3.0-only"
 name = "1k-words"
 path = "src/main.rs"
 
-# `cargo bundle --release` builds the .app (https://github.com/burtonageo/cargo-bundle).
-# The icon's source is `assets/app-icon/icon.svg`; the .icns and PNGs are
-# rendered from it.
+# What scripts/bundle-macos.sh names the .app, and its icon. The icon's
+# source is `assets/app-icon/icon.svg`; the .icns and PNGs are rendered
+# from it.
 [package.metadata.bundle]
 name = "1k Words"
-identifier = "com.mellow.1k-words"
+identifier = "com.reallymellow.1k-words"
 icon = ["assets/app-icon/icon.icns", "assets/app-icon/32x32.png", "assets/app-icon/128x128.png", "assets/app-icon/256x256.png", "assets/app-icon/512x512.png"]
 category = "public.app-category.photography"
 

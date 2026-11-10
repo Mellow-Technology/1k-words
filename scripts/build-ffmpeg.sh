@@ -35,6 +35,8 @@ SHA256=8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PREFIX="${1:-$ROOT/target/ffmpeg/$VERSION}"
+# The oldest macOS the app supports (MACOSX_DEPLOYMENT_TARGET).
+source "$ROOT/scripts/macos-target.sh"
 WORK="$ROOT/target/ffmpeg/src"
 TARBALL="$WORK/ffmpeg-$VERSION.tar.xz"
 SOURCE="$WORK/ffmpeg-$VERSION"
@@ -60,8 +62,12 @@ rm -rf "$SOURCE"
 tar -xf "$TARBALL" -C "$WORK"
 cd "$SOURCE"
 
+# FFmpeg keeps its configure line in the library (avutil_configuration()),
+# so it's configured with a neutral prefix and installed into PREFIX with
+# DESTDIR, to keep this machine's paths out of what's shipped. Nothing
+# needs the prefix: the app's build finds FFmpeg through FFMPEG_DIR.
 ./configure \
-  --prefix="$PREFIX" \
+  --prefix=/ffmpeg \
   --install-name-dir='@rpath' \
   --enable-shared \
   --disable-static \
@@ -81,7 +87,9 @@ cd "$SOURCE"
   --enable-demuxer=mov \
   --enable-decoder=h264,hevc,aac \
   --enable-parser=h264,hevc,aac \
-  --enable-hwaccel=h264_videotoolbox,hevc_videotoolbox
+  --enable-hwaccel=h264_videotoolbox,hevc_videotoolbox \
+  --extra-cflags="-mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET" \
+  --extra-ldflags="-mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET"
 
 # configure records the licence it chose. Stop before installing anything
 # that isn't LGPL.
@@ -93,12 +101,15 @@ for flag in CONFIG_GPL CONFIG_NONFREE; do
 done
 
 make -j"$(sysctl -n hw.ncpu)"
-rm -rf "$PREFIX"
-make install
+rm -rf "$PREFIX" "$WORK/stage"
+make install DESTDIR="$WORK/stage"
+mkdir -p "$(dirname "$PREFIX")"
+mv "$WORK/stage/ffmpeg" "$PREFIX"
+rm -rf "$WORK/stage"
 
 # The licence as the built library reports it, from its configuration.
 LICENSE="$(grep '^#define FFMPEG_LICENSE ' config.h | cut -d'"' -f2)"
 echo
-echo "Built FFmpeg $VERSION ($LICENSE) into $PREFIX"
+echo "Built FFmpeg $VERSION ($LICENSE), for macOS $MACOSX_DEPLOYMENT_TARGET and later, into $PREFIX"
 echo "Build the app against it with:"
 echo "  FFMPEG_DIR=$PREFIX cargo build --release"

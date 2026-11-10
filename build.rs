@@ -11,6 +11,7 @@ const TARGET: &str = "wasm32-wasip2";
 
 fn main() {
     link_ffmpeg();
+    link_libheif();
     let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap()).join("plugins");
     println!("cargo:rerun-if-changed=wit");
@@ -72,5 +73,33 @@ fn link_ffmpeg() {
     if let Ok(dir) = env::var("FFMPEG_DIR") {
         let lib = PathBuf::from(dir).join("lib");
         println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib.display());
+    }
+}
+
+/// libheif, found through pkg-config, likewise: if it's the build from
+/// `scripts/build-libheif.sh` (put first on PKG_CONFIG_PATH), named
+/// `@rpath/libheif.1.dylib`, its folder goes on the rpath too. Homebrew's
+/// has an absolute name and needs nothing.
+fn link_libheif() {
+    println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
+        return;
+    }
+    let Ok(output) = Command::new("pkg-config")
+        .args(["--variable=libdir", "libheif"])
+        .output()
+    else {
+        return;
+    };
+    let libdir = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if libdir.is_empty() {
+        return;
+    }
+    let id = Command::new("otool")
+        .arg("-D")
+        .arg(PathBuf::from(&libdir).join("libheif.dylib"))
+        .output();
+    if id.is_ok_and(|id| String::from_utf8_lossy(&id.stdout).contains("@rpath/")) {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{libdir}");
     }
 }
