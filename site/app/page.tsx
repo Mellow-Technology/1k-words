@@ -109,7 +109,7 @@ export default function Home() {
           <Shot
             className={styles.heroShot}
             src="library-grid.jpg"
-            ratio={2080 / 1388}
+            ratio={2080 / 1377}
             eager
             alt="The library grid, its tiles badged RAW+ for raw and JPEG pairs, with three-shot brackets stacked into single tiles and Live Photos marked"
             caption="Library · square grid · brackets badged by frame count"
