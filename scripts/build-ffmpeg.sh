@@ -49,7 +49,7 @@ fi
 mkdir -p "$WORK"
 if [[ ! -f "$TARBALL" ]]; then
   echo "Downloading FFmpeg ${VERSION}…"
-  curl -fL --retry 3 -o "$TARBALL.part" "https://ffmpeg.org/releases/ffmpeg-$VERSION.tar.xz"
+  curl -fL --retry 5 --retry-delay 15 -o "$TARBALL.part" "https://ffmpeg.org/releases/ffmpeg-$VERSION.tar.xz"
   mv "$TARBALL.part" "$TARBALL"
 fi
 echo "$SHA256  $TARBALL" | shasum -a 256 -c - >/dev/null || {

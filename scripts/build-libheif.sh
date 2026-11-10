@@ -52,7 +52,7 @@ fetch() {
   local tarball="$WORK/$name-$version.tar.gz"
   if [[ ! -f "$tarball" ]]; then
     echo "Downloading ${name} ${version}…"
-    curl -fL --retry 3 -o "$tarball.part" \
+    curl -fL --retry 5 --retry-delay 15 -o "$tarball.part" \
       "https://github.com/strukturag/$name/releases/download/v$version/$name-$version.tar.gz"
     mv "$tarball.part" "$tarball"
   fi
