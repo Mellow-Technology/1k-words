@@ -1,0 +1,159 @@
+# Builds 1k Words for macOS and publishes it as a GitHub release, when a
+# version tag (v1.2.3) is pushed. The tag must match Cargo.toml's version.
+#
+#   1. Builds the LGPL FFmpeg and libheif the app ships (cached between runs)
+#      and runs the tests against them.
+#   2. Bundles the app (scripts/bundle-macos.sh), signed with a Developer ID
+#      and notarized if the secrets below are set, or signed ad hoc if not.
+#   3. Publishes "1k-Words-<version>-macos-arm64.zip" and its SHA-256 as a
+#      release. A tag with a hyphen (v1.2.3-beta.1) is a prerelease.
+#
+# Signing (KW-20), as repository secrets:
+#   MACOS_CERTIFICATE           a "Developer ID Application" certificate and
+#                               its key, exported as .p12, base64-encoded
+#   MACOS_CERTIFICATE_PASSWORD  the .p12's password
+#   MACOS_SIGN_IDENTITY         its name, e.g. "Developer ID Application:
+#                               Mellow Technology (TEAMID)"
+# Notarizing, which needs signing too:
+#   APPLE_ID                    the Apple Account to notarize with
+#   APPLE_TEAM_ID               its team's ID
+#   APPLE_APP_PASSWORD          an app-specific password for it
+#
+# Apple silicon only for now; Windows and Linux are KW-49.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+# One release build per tag at a time.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      TAG: ${{ github.ref_name }}
+      SIGNED: ${{ secrets.MACOS_CERTIFICATE != '' && secrets.MACOS_SIGN_IDENTITY != '' }}
+      NOTARIZED: ${{ secrets.MACOS_CERTIFICATE != '' && secrets.MACOS_SIGN_IDENTITY != '' && secrets.APPLE_ID != '' && secrets.APPLE_TEAM_ID != '' && secrets.APPLE_APP_PASSWORD != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag is Cargo.toml's version
+        run: |
+          # [package]'s, the first line that starts with it.
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [[ "$TAG" != "v$version" ]]; then
+            echo "::error::The tag $TAG doesn't match Cargo.toml's version, $version. Tag v$version, or change the version first."
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Install the tools
+        run: |
+          brew install pkg-config cmake
+          # The toolchain and wasm32-wasip2 target in rust-toolchain.toml.
+          rustup toolchain install
+          rustup show active-toolchain
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Just ~/.cargo: target/ holds the native libraries, cached below.
+          cache-targets: false
+
+      - name: Restore the native libraries
+        id: native
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/ffmpeg
+            target/libheif
+          key: native-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-ffmpeg.sh', 'scripts/build-libheif.sh', 'scripts/macos-target.sh') }}
+
+      - name: Build the native libraries
+        if: steps.native.outputs.cache-hit != 'true'
+        run: |
+          scripts/build-ffmpeg.sh
+          scripts/build-libheif.sh
+
+      - name: Test against them
+        run: |
+          export FFMPEG_DIR="$PWD/target/ffmpeg/$(sed -n 's/^VERSION=//p' scripts/build-ffmpeg.sh)"
+          export PKG_CONFIG_PATH="$PWD/target/libheif/$(sed -n 's/^LIBHEIF_VERSION=//p' scripts/build-libheif.sh)/lib/pkgconfig"
+          cargo test --locked --bin 1k-words
+
+      - name: Import the signing certificate
+        if: env.SIGNED == 'true'
+        env:
+          CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password="$(openssl rand -hex 24)"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          echo "$CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" \
+            -P "$CERTIFICATE_PASSWORD" -f pkcs12 -A -t cert
+          rm "$RUNNER_TEMP/certificate.p12"
+          security set-key-partition-list -S apple-tool:,apple: -k "$password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+
+      - name: Bundle the app
+        env:
+          SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+        run: scripts/bundle-macos.sh
+
+      - name: Notarize it
+        if: env.NOTARIZED == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          ditto -c -k --keepParent "target/bundle/1k Words.app" "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" --wait \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD"
+          # So it opens offline too, without asking Apple first.
+          xcrun stapler staple "target/bundle/1k Words.app"
+          spctl --assess --type execute --verbose "target/bundle/1k Words.app"
+
+      - name: Package it
+        run: |
+          mkdir -p dist
+          zip="1k-Words-$VERSION-macos-arm64.zip"
+          # ditto keeps the app's symlinks, extended attributes and signature.
+          ditto -c -k --sequesterRsrc --keepParent "target/bundle/1k Words.app" "dist/$zip"
+          (cd dist && shasum -a 256 "$zip" > "$zip.sha256")
+          ls -l dist
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes="$RUNNER_TEMP/notes.md"
+          if [[ "$NOTARIZED" == "true" ]]; then
+            echo "For Macs with Apple silicon, running macOS 13 or later." > "$notes"
+          else
+            cat > "$notes" <<'NOTES'
+          For Macs with Apple silicon, running macOS 13 or later.
+
+          **This build isn't signed by a registered developer or notarized by Apple yet**, so macOS won't open it at first. Unzip it, move **1k Words** to Applications and open it; when macOS says it can't check it, open **System Settings › Privacy & Security** and click **Open Anyway**.
+          NOTES
+          fi
+          prerelease=()
+          [[ "$VERSION" == *-* ]] && prerelease=(--prerelease)
+          gh release create "$TAG" dist/* \
+            --verify-tag \
+            --title "1k Words $VERSION" \
+            --notes-file "$notes" \
+            --generate-notes \
+            ${prerelease[@]+"${prerelease[@]}"}

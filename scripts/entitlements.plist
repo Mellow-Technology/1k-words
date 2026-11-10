@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  What the app needs of macOS's hardened runtime, which Developer ID signing
+  and notarization require. scripts/bundle-macos.sh signs with these when it
+  signs with a real identity (SIGN_IDENTITY).
+
+  allow-unsigned-executable-memory: plugins are WebAssembly, compiled to
+  native code by Wasmtime as they're loaded (src/plugins). Wasmtime makes
+  that memory executable with mprotect rather than MAP_JIT, so allow-jit
+  isn't enough: without this, the hardened app is killed the moment a
+  plugin's loaded (checked by running the plugin tests hardened).
+-->
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+</dict>
+</plist>

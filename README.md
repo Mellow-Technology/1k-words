@@ -106,18 +106,32 @@ cargo run --release
 
 FFmpeg decodes Live Photo videos and libheif decodes HEIC photos. [`build.rs`](build.rs) builds the built-in plugins in [`plugins`](plugins) into WebAssembly components, which the app embeds.
 
-`cargo bundle --release` (with [cargo-bundle](https://github.com/burtonageo/cargo-bundle)) builds the `.app`.
+### The app, with its own libraries
 
-### An LGPL-only FFmpeg
+Homebrew's FFmpeg and libheif are built with GPL components (libheif links the x265 encoder), so the app ships its own, LGPL only and with just what it uses:
 
-Homebrew's FFmpeg is built with GPL components, so releases will use their own. [`scripts/build-ffmpeg.sh`](scripts/build-ffmpeg.sh) builds FFmpeg 9.0.2, LGPL only and with just what the app uses, into `target/ffmpeg/9.0.2` (macOS only for now). Build against it with `FFMPEG_DIR`:
+- [`scripts/build-ffmpeg.sh`](scripts/build-ffmpeg.sh) builds FFmpeg 9.0.2 into `target/ffmpeg/9.0.2`.
+- [`scripts/build-libheif.sh`](scripts/build-libheif.sh) builds libheif 1.23.7 with libde265 1.1.3, decoding only, into `target/libheif/1.23.7`. It needs CMake (`brew install cmake`).
+
+[`scripts/bundle-macos.sh`](scripts/bundle-macos.sh) builds both if they aren't there, builds the app against them, and makes `target/bundle/1k Words.app`, with the libraries in its `Frameworks` folder and their licences in `Resources/Licences`. It checks the app loads nothing from outside the bundle but macOS's, and signs it ad hoc (or with `SIGN_IDENTITY`):
 
 ```sh
-scripts/build-ffmpeg.sh
-FFMPEG_DIR=$PWD/target/ffmpeg/9.0.2 cargo build --release
+scripts/bundle-macos.sh
+open "target/bundle/1k Words.app"
 ```
 
-Development builds without `FFMPEG_DIR` still use Homebrew's.
+The app and its libraries support macOS 13 and later ([`scripts/macos-target.sh`](scripts/macos-target.sh)). Development builds use Homebrew's libraries, unless `FFMPEG_DIR` and `PKG_CONFIG_PATH` point at these.
+
+### Releases
+
+Pushing a version tag that matches `Cargo.toml`'s version, such as `v0.1.0`, runs [`.github/workflows/release.yml`](.github/workflows/release.yml). It builds the libraries, runs the tests against them, bundles the app and publishes it as a GitHub release, zipped with its SHA-256. A tag with a hyphen, such as `v0.2.0-beta.1`, is a prerelease.
+
+```sh
+git tag v0.1.0
+git push github v0.1.0
+```
+
+With a Developer ID certificate in the repository's secrets, the app is signed with the hardened runtime ([`scripts/entitlements.plist`](scripts/entitlements.plist)) and notarized; the workflow's header lists the secrets. Without them it's signed ad hoc, and the release notes say how to open it anyway.
 
 ## A library's folder
 
