@@ -1,0 +1,62 @@
+// Site-wide touches on top of the theme (theme.scss).
+
+:root {
+  scroll-behavior: smooth;
+  // Anchored sections land below the sticky header.
+  scroll-padding-top: calc(var(--gm-header-height) + var(--gm-space-4));
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    scroll-behavior: auto;
+  }
+}
+
+// A lightbox by day: an even glow from above. By night, a darkroom's
+// vignette, with a little of the amber safelight up top.
+body {
+  min-height: 100dvh;
+  background:
+    radial-gradient(70rem 36rem at 50% -14%, color-mix(in srgb, var(--gm-color-surface) 90%, transparent), transparent 72%),
+    var(--gm-color-bg);
+}
+
+:root[data-theme="dark"] body {
+  background:
+    radial-gradient(60rem 30rem at 50% -14%, color-mix(in srgb, var(--gm-color-primary) 9%, transparent), transparent 70%),
+    radial-gradient(120rem 80rem at 50% 40%, transparent 55%, rgba(0, 0, 0, 0.35)),
+    var(--gm-color-bg);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) body {
+    background:
+      radial-gradient(60rem 30rem at 50% -14%, color-mix(in srgb, var(--gm-color-primary) 9%, transparent), transparent 70%),
+      radial-gradient(120rem 80rem at 50% 40%, transparent 55%, rgba(0, 0, 0, 0.35)),
+      var(--gm-color-bg);
+  }
+}
+
+// Archivo a little wide, like the engraving on a lens barrel.
+h1,
+h2,
+h3 {
+  font-stretch: 112%;
+  font-variation-settings: "wdth" 112;
+}
+
+// Zero specificity, so component classes can set their own spacing.
+:where(ul[class], ol[class]) {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+// The emphasised words in headings, in the icon's amber (darker by day, to
+// read on white).
+// Prefixed with #top to win over the components' own <em> styles: Archivo's
+// italic isn't loaded, so it'd be a slanted fake.
+#top :is(h1, h2) em {
+  color: var(--gm-color-accent);
+  font-style: normal;
+}

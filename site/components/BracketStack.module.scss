@@ -1,0 +1,130 @@
+@use "gui-mellow/styles/mixins" as gm;
+
+.compare {
+  display: grid;
+  grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr);
+  gap: var(--gm-space-6);
+  align-items: end;
+  margin: 0;
+  padding: var(--gm-space-6);
+  border: 1px solid var(--gm-color-border);
+  border-radius: var(--gm-radius-lg);
+  background: var(--gm-color-surface);
+  box-shadow: var(--gm-shadow-sm);
+
+  @include gm.below(sm) {
+    grid-template-columns: minmax(0, 1fr);
+    padding: var(--gm-space-5);
+  }
+}
+
+.side {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gm-space-4);
+  min-width: 0;
+}
+
+.frame {
+  display: block;
+  overflow: hidden;
+  border-radius: var(--gm-radius-sm);
+  aspect-ratio: 3 / 2;
+
+  svg {
+    display: block;
+    width: 100%;
+    height: 100%;
+  }
+}
+
+// ---- Five separate tiles --------------------------------------------------------
+
+.loose {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: var(--gm-space-2);
+}
+
+.looseShot {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gm-space-1);
+  min-width: 0;
+}
+
+.ev {
+  color: var(--gm-color-text-subtle);
+  font-family: var(--gm-font-mono);
+  font-size: var(--gm-text-xs);
+  text-align: center;
+  white-space: nowrap;
+}
+
+// ---- One tile, fanned open ------------------------------------------------------
+
+.fan {
+  position: relative;
+  width: min(100%, 220px);
+  margin-inline: auto;
+  aspect-ratio: 3 / 2;
+}
+
+.fanFrame {
+  position: absolute;
+  inset: 0;
+  border-radius: var(--gm-radius-sm);
+  box-shadow: 0 6px 18px -8px rgba(0, 0, 0, 0.45);
+  transform-origin: 50% 120%;
+  transition: transform 300ms ease;
+
+  // From the darkest (-2) on the left to the brightest (+2) on the right.
+  &[data-position="-2"] { transform: rotate(-11deg) translateX(-10%); }
+  &[data-position="-1"] { transform: rotate(-5.5deg) translateX(-5%); }
+  &[data-position="1"] { transform: rotate(5.5deg) translateX(5%); }
+  &[data-position="2"] { transform: rotate(11deg) translateX(10%); }
+  &[data-position="0"] { outline: 2px solid var(--gm-color-accent); outline-offset: 2px; }
+}
+
+// Closed up into a single tile while the pointer's away, fanned on hover.
+@media (hover: hover) and (prefers-reduced-motion: no-preference) {
+  .compare:not(:hover) .fanFrame:not([data-position="0"]) {
+    transform: rotate(0) translateX(0);
+  }
+}
+
+// As the app badges a stack: its icon and how many frames.
+.badge {
+  position: absolute;
+  top: var(--gm-space-2);
+  right: var(--gm-space-2);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 6px;
+  border-radius: var(--gm-radius-sm);
+  background: rgba(0, 0, 0, 0.65);
+  color: #fff;
+  font-size: var(--gm-text-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.verdict {
+  margin: 0;
+  color: var(--gm-color-text-muted);
+  font-size: var(--gm-text-sm);
+  text-align: center;
+
+  strong {
+    color: var(--gm-color-heading);
+  }
+}
+
+.caption {
+  grid-column: 1 / -1;
+  color: var(--gm-color-text-subtle);
+  font-family: var(--gm-font-mono);
+  font-size: var(--gm-text-xs);
+  letter-spacing: 0.04em;
+  text-align: center;
+}

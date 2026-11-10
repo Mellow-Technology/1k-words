@@ -1,0 +1,26 @@
+{
+  "name": "1k-words-site",
+  "version": "0.1.0",
+  "private": true,
+  "license": "LGPL-3.0-only",
+  "type": "module",
+  "scripts": {
+    "dev": "next dev --port 3003",
+    "build": "next build",
+    "start": "bunx serve out",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "gui-mellow": "github:Mellow-Technology/gui-mellow",
+    "next": "^16.4.2",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "sass": "^1.106.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "typescript": "~5.9.3"
+  }
+}

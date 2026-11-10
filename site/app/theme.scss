@@ -1,0 +1,120 @@
+// 1k Words' theme: a contact sheet by day, the darkroom by night. Neutral
+// print-paper white with graphite type and the app icon's amber crop marks;
+// at night, the icon's graphite with the amber turned up. Small radii, like
+// the corners of a print, and a viewfinder's focus points where the default
+// theme has a grid.
+//
+// Loaded instead of "gui-mellow/styles.scss", merged over gui-mellow's
+// default theme.
+
+@use "gui-mellow/styles/patterns";
+
+// A viewfinder's autofocus points, with one point selected (its square
+// box), drawn in black: the pattern is a mask painted in --gm-pattern-color.
+$-plus: "<path d='M-4 0H4M0 -4V4'/>";
+$-viewfinder: patterns.svg-url(
+  "<svg xmlns='http://www.w3.org/2000/svg' width='144' height='144'>" +
+    "<g fill='none' stroke='black' stroke-width='1.2' stroke-linecap='square'>" +
+    "<g transform='translate(24 24)'>#{$-plus}</g>" +
+    "<g transform='translate(72 24)'>#{$-plus}</g>" +
+    "<g transform='translate(120 24)'>#{$-plus}</g>" +
+    "<g transform='translate(24 72)'>#{$-plus}</g>" +
+    "<path d='M64 64h4M64 64v4M80 64h-4M80 64v4M64 80h4M64 80v-4M80 80h-4M80 80v-4'/>" +
+    "<g transform='translate(120 72)'>#{$-plus}</g>" +
+    "<g transform='translate(24 120)'>#{$-plus}</g>" +
+    "<g transform='translate(72 120)'>#{$-plus}</g>" +
+    "<g transform='translate(120 120)'>#{$-plus}</g>" +
+    "</g></svg>"
+);
+
+@use "gui-mellow/styles/global" with (
+  $light: (
+    "color-bg": #f2f2ef,
+    "color-surface": #fbfbf9,
+    "color-surface-hover": #ecece8,
+    "color-surface-sunken": rgba(23, 26, 32, 0.05),
+    "color-overlay": rgba(242, 242, 239, 0.88),
+
+    "color-heading": #111317,
+    "color-text": #23262c,
+    "color-text-muted": #4d5058,
+    "color-text-subtle": #5d6068,
+    "color-text-faint": #6c6f77,
+
+    // Graphite buttons with amber labels, as on the app icon.
+    "color-primary": #171a20,
+    "color-primary-hover": #2b2f37,
+    "color-on-primary": #ffc24b,
+    "color-accent": #a86b00,
+    "color-on-accent": #fbfbf9,
+    "color-link": #8a5800,
+    "color-link-hover": #6b4400,
+    "color-focus": #a86b00,
+    "color-selection": rgba(255, 194, 75, 0.4),
+
+    "color-success": #2f7a4b,
+    "color-warning": #8f5a00,
+    "color-danger": #b42318,
+
+    "color-border-subtle": rgba(23, 26, 32, 0.07),
+    "color-border": rgba(23, 26, 32, 0.12),
+    "color-border-strong": rgba(23, 26, 32, 0.22),
+    "color-border-hover": rgba(23, 26, 32, 0.34),
+
+    "shadow-sm": 0 1px 2px rgba(17, 19, 23, 0.08),
+    "shadow-lg": 0 22px 48px -18px rgba(17, 19, 23, 0.28),
+    "glass-highlight": rgba(251, 251, 249, 0.8),
+    "pattern-color": rgba(23, 26, 32, 0.07),
+    "particle-colors": #{"255 194 75, 168 107 0, 23 26 32, 120 120 120, 242 242 239"},
+  ),
+  $dark: (
+    "color-bg": #101216,
+    "color-surface": rgba(244, 243, 238, 0.035),
+    "color-surface-hover": rgba(244, 243, 238, 0.06),
+    "color-surface-sunken": rgba(244, 243, 238, 0.06),
+    "color-overlay": rgba(16, 18, 22, 0.88),
+
+    "color-heading": #f4f3ee,
+    "color-text": #e1e0db,
+    "color-text-muted": #b3b2ac,
+    "color-text-subtle": #9d9c96,
+    "color-text-faint": #878680,
+
+    "color-primary": #ffc24b,
+    "color-primary-hover": #ffd47e,
+    "color-on-primary": #171a20,
+    "color-accent": #ffc24b,
+    "color-on-accent": #171a20,
+    "color-link": #ffcd6b,
+    "color-link-hover": #ffdd99,
+    "color-focus": #ffc24b,
+    "color-selection": rgba(255, 194, 75, 0.3),
+
+    "color-success": #72d197,
+    "color-warning": #ffc24b,
+    "color-danger": #ff7b6b,
+
+    "color-border-subtle": rgba(244, 243, 238, 0.07),
+    "color-border": rgba(244, 243, 238, 0.1),
+    "color-border-strong": rgba(244, 243, 238, 0.18),
+    "color-border-hover": rgba(244, 243, 238, 0.28),
+
+    "shadow-sm": 0 1px 2px rgba(0, 0, 0, 0.4),
+    "shadow-lg": 0 22px 48px -18px rgba(0, 0, 0, 0.7),
+    "glass-highlight": rgba(244, 243, 238, 0.1),
+    "pattern-color": rgba(255, 194, 75, 0.07),
+    "particle-colors": #{"255 194 75, 255 212 126, 244 243 238, 140 140 140, 23 26 32"},
+  ),
+  $tokens: (
+    "font-display": (var(--font-display, "Archivo"), "Helvetica Neue", Arial, sans-serif),
+    "font-body": (var(--font-body, "IBM Plex Sans"), ui-sans-serif, system-ui, sans-serif),
+    "font-mono": (var(--font-mono, "IBM Plex Mono"), ui-monospace, "SF Mono", Menlo, monospace),
+    "tracking-tight": -0.02em,
+    "radius-sm": 3px,
+    "radius-md": 6px,
+    "radius-lg": 10px,
+    "container": 1160px,
+    "pattern": $-viewfinder,
+    "pattern-size": 144px 144px,
+  )
+);

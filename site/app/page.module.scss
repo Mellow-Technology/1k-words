@@ -1,0 +1,210 @@
+@use "gui-mellow/styles/mixins" as gm;
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--gm-space-2);
+  color: var(--gm-color-heading);
+  font-family: var(--gm-font-display);
+  font-size: var(--gm-text-lg);
+  font-stretch: 112%;
+  font-variation-settings: "wdth" 112;
+  font-weight: 700;
+  text-decoration: none;
+  white-space: nowrap;
+
+  svg {
+    flex-shrink: 0;
+  }
+}
+
+// Wraps header extras that hide on phones, to leave room for the menu
+// button. `contents`, so the wrapper adds no box of its own.
+.wideOnly {
+  display: contents;
+
+  @include gm.below(sm) {
+    display: none !important;
+  }
+}
+
+// ---- Hero ------------------------------------------------------------------------
+
+.heroShot {
+  width: min(100%, 1040px);
+  margin: var(--gm-space-7) auto 0;
+}
+
+// ---- Stacks ----------------------------------------------------------------------
+
+// Text beside a picture, stacking on narrow screens.
+.split {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(380px, 100%), 1fr));
+  gap: var(--gm-space-7);
+  align-items: center;
+
+  > * {
+    min-width: 0;
+  }
+}
+
+.kinds {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gm-space-5);
+
+  li {
+    padding-left: var(--gm-space-4);
+    border-left: 2px solid var(--gm-color-accent);
+  }
+
+  h3 {
+    margin: 0 0 var(--gm-space-1);
+    color: var(--gm-color-heading);
+    font-family: var(--gm-font-display);
+    font-size: var(--gm-text-lg);
+  }
+
+  p {
+    margin: 0;
+    max-width: 58ch;
+    color: var(--gm-color-text-muted);
+  }
+}
+
+// ---- Compared --------------------------------------------------------------------
+
+// Wide tables scroll on their own, so the page never does.
+.compare {
+  overflow-x: auto;
+
+  table {
+    min-width: 640px;
+  }
+
+  td:first-child {
+    white-space: nowrap;
+  }
+}
+
+.theirs {
+  color: var(--gm-color-text-subtle);
+}
+
+// ---- Features --------------------------------------------------------------------
+
+.shots {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr));
+  gap: var(--gm-space-6);
+  margin-bottom: var(--gm-space-8);
+}
+
+// A feature's label, like the white markings on a camera body.
+.marking {
+  display: inline-block;
+  padding: 2px var(--gm-space-2);
+  border: 1px solid var(--gm-color-border-strong);
+  border-radius: var(--gm-radius-sm);
+  color: var(--gm-color-accent);
+  font-family: var(--gm-font-mono);
+  font-size: var(--gm-text-xs);
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+// ---- Storage ---------------------------------------------------------------------
+
+.flow {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--gm-space-6);
+
+  @include gm.below(md) {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  li {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: var(--gm-space-2);
+    padding: var(--gm-space-5);
+    border: 1px solid var(--gm-color-border);
+    border-radius: var(--gm-radius-lg);
+    background: var(--gm-color-surface);
+    box-shadow: var(--gm-shadow-sm);
+    color: var(--gm-color-text-muted);
+
+    // A frame-advance arrow from each to the next.
+    &:not(:last-child)::after {
+      content: "▸";
+      position: absolute;
+      top: 50%;
+      right: calc(var(--gm-space-6) / -2);
+      translate: 50% -50%;
+      color: var(--gm-color-accent);
+      font-size: var(--gm-text-md);
+
+      @include gm.below(md) {
+        content: "▾";
+        top: auto;
+        right: 50%;
+        bottom: calc(var(--gm-space-6) / -2);
+        translate: 50% 50%;
+      }
+    }
+  }
+
+  strong {
+    color: var(--gm-color-heading);
+    font-family: var(--gm-font-display);
+    font-size: var(--gm-text-xl);
+    font-stretch: 112%;
+    font-variation-settings: "wdth" 112;
+  }
+}
+
+.storageShot {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+  gap: var(--gm-space-7);
+  align-items: center;
+  margin-top: var(--gm-space-8);
+
+  @include gm.below(md) {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.next {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--gm-space-3);
+
+  h3 {
+    margin: 0;
+    color: var(--gm-color-heading);
+    font-family: var(--gm-font-display);
+    font-size: var(--gm-text-xl);
+  }
+
+  p {
+    margin: 0;
+    max-width: 52ch;
+    color: var(--gm-color-text-muted);
+  }
+}
+
+// ---- Closing ---------------------------------------------------------------------
+
+.cta {
+  width: 100%;
+  max-width: calc(var(--gm-container) + 2 * var(--gm-gutter));
+  margin-inline: auto;
+  padding: 0 var(--gm-gutter) var(--gm-space-9);
+}
