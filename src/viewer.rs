@@ -24,7 +24,7 @@ use crate::decode;
 use crate::details::{DetailSection, format_ev_value, objects_section, photo_details};
 use crate::detect::DetectedObject;
 use crate::gallery::show_error;
-use crate::library::{self, Album, AlbumId, Library, tree_order};
+use crate::library::{self, Album, AlbumId, Library, OriginalRole, OriginalStatus, tree_order};
 use crate::navigation;
 use crate::object_boxes::ObjectBoxes;
 use crate::photos::{Photo, Stack, StackKind, StartFrame};
@@ -74,6 +74,8 @@ pub enum ViewerEvent {
     Next,
     /// A photo was added to or taken out of an album, or an album was made.
     AlbumsChanged,
+    /// Keep Here was clicked: pin the photo to this device, or unpin it.
+    TogglePin(Box<Photo>),
 }
 
 struct LoadedImage {
@@ -89,6 +91,15 @@ enum LoadState {
     Loading,
     Done,
     Failed(SharedString),
+    /// Its original isn't on this device, and couldn't be downloaded.
+    Unavailable(SharedString),
+}
+
+/// How the selected photo's originals stand on this device.
+struct OnDevice {
+    originals: Vec<OriginalStatus>,
+    /// Pinned to stay here, itself or by an album.
+    pinned: bool,
 }
 
 pub struct PhotoViewer {
@@ -132,6 +143,10 @@ pub struct PhotoViewer {
     /// The albums the selected photo is in, once they're known.
     photo_albums: Option<Vec<AlbumId>>,
     _load_albums: Task<()>,
+    /// How the selected photo's originals stand on this device, once known;
+    /// only for a library's photos.
+    on_device: Option<OnDevice>,
+    _load_on_device: Task<()>,
 }
 
 impl EventEmitter<ViewerEvent> for PhotoViewer {}
@@ -170,6 +185,8 @@ impl PhotoViewer {
             albums: Arc::default(),
             photo_albums: None,
             _load_albums: Task::ready(()),
+            on_device: None,
+            _load_on_device: Task::ready(()),
         };
         this.load_filmstrip(cx);
         this.select(first, window, cx);
@@ -223,7 +240,22 @@ impl PhotoViewer {
                 if let Some(library) = library
                     && !here.await
                 {
+                    // Its preview stands in while it's fetched, and if it
+                    // can't be.
+                    let preview = cx
+                        .background_spawn({
+                            let (library, photo) = (library.clone(), photo.clone());
+                            async move {
+                                library
+                                    .preview_of(&photo)
+                                    .and_then(|preview| decode::kept_thumbnail(&preview))
+                            }
+                        })
+                        .await;
                     let fetched = this.update(cx, |this, cx| {
+                        if let Some(preview) = preview {
+                            this.show(preview, false, cx);
+                        }
                         this.load_state = LoadState::Fetching;
                         cx.notify();
                         crate::sync_settings::fetch_original(library, photo.clone(), cx)
@@ -234,9 +266,10 @@ impl PhotoViewer {
                         Ok(()) => {
                             this.load_state = LoadState::Loading;
                             this.load_details(photo.clone(), cx);
+                            this.load_on_device(cx);
                         }
                         Err(error) => {
-                            this.load_state = LoadState::Failed(format!("{error:#}").into());
+                            this.load_state = LoadState::Unavailable(format!("{error:#}").into());
                             cx.notify();
                         }
                     })
@@ -284,7 +317,79 @@ impl PhotoViewer {
 
         self.load_details(photo, cx);
         self.load_albums(cx);
+        self.on_device = None;
+        self.load_on_device(cx);
         cx.notify();
+    }
+
+    /// Reads how the selected photo's originals stand on this device, for
+    /// the sidebar: again whenever they may have changed.
+    pub fn load_on_device(&mut self, cx: &mut Context<Self>) {
+        let Some(library) = self.library.clone() else {
+            return;
+        };
+        let photo = self.stack.photos[self.selected].clone();
+        self._load_on_device = cx.spawn(async move |this, cx| {
+            let loaded = cx
+                .background_spawn(async move {
+                    anyhow::Ok(OnDevice {
+                        originals: library.original_status(&photo)?,
+                        pinned: library.is_pinned(&photo)?,
+                    })
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                match loaded {
+                    Ok(on_device) => this.on_device = Some(on_device),
+                    Err(error) => eprintln!("couldn't read where the originals are: {error:#}"),
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+    }
+
+    /// Where the photo's originals are, and a way to keep them here.
+    fn render_on_device(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let on_device = self.on_device.as_ref()?;
+        let required = settings::get(cx).space_budget.copies.max(1) as usize;
+        let section = DetailSection {
+            title: "On This Device".into(),
+            rows: on_device
+                .originals
+                .iter()
+                .map(|original| {
+                    let label = match original.role {
+                        OriginalRole::Shown => "Photo",
+                        OriginalRole::Raw => "Raw",
+                        OriginalRole::LiveVideo => "Live Video",
+                    };
+                    (label.into(), original_text(original, required).into())
+                })
+                .collect(),
+        };
+        let pinned = on_device.pinned;
+        let photo = self.stack.photos[self.selected].clone();
+        let toggle = Button::new("keep-here")
+            .icon(Icon::new(LucideIcon::Pin))
+            .label(if pinned { "Kept Here" } else { "Keep Here" })
+            .xsmall()
+            .ghost()
+            .selected(pinned)
+            .tooltip(if pinned {
+                "Its originals stay on this device. If an album keeps it here, unpin the album \
+                 to let them go."
+            } else {
+                "Keep its originals on this device, downloading any that aren't here"
+            })
+            .on_click(cx.listener(move |_, _, _, cx| {
+                cx.emit(ViewerEvent::TogglePin(Box::new(photo.clone())));
+            }));
+        Some(render_section(
+            &section,
+            Some(toggle.into_any_element()),
+            cx,
+        ))
     }
 
     /// Reads what's said of a photo, and the objects found in it.
@@ -335,7 +440,7 @@ impl PhotoViewer {
     pub fn load_result(&self) -> Result<bool, SharedString> {
         match &self.load_state {
             LoadState::Done => Ok(true),
-            LoadState::Failed(error) => Err(error.clone()),
+            LoadState::Failed(error) | LoadState::Unavailable(error) => Err(error.clone()),
             LoadState::Fetching | LoadState::Loading => Ok(false),
         }
     }
@@ -709,6 +814,20 @@ impl PhotoViewer {
         }
     }
 
+    /// What the sidebar says of where the photo's originals are, and
+    /// whether it's kept here, once known.
+    #[cfg(test)]
+    pub fn on_device(&self, cx: &App) -> Option<(Vec<String>, bool)> {
+        let on_device = self.on_device.as_ref()?;
+        let required = settings::get(cx).space_budget.copies.max(1) as usize;
+        let rows = on_device
+            .originals
+            .iter()
+            .map(|original| original_text(original, required))
+            .collect();
+        Some((rows, on_device.pinned))
+    }
+
     /// The size of the image shown, and whether it's at full resolution.
     #[cfg(test)]
     pub fn shown_image(&self) -> Option<(u32, u32, bool)> {
@@ -820,6 +939,9 @@ impl PhotoViewer {
         let loading_full = self.load_full.is_some();
         let status = match (&self.load_state, &self.image) {
             (LoadState::Failed(_), Some(_)) => Some("Preview only"),
+            (LoadState::Unavailable(_), Some(_)) => {
+                Some("Preview only: the original isn't on this device")
+            }
             (LoadState::Fetching, _) => Some("Downloading the original…"),
             (LoadState::Loading, _) => Some("Loading…"),
             _ if loading_full => Some("Loading full resolution…"),
@@ -875,6 +997,7 @@ impl PhotoViewer {
                     .iter()
                     .map(|section| render_section(section, None, cx)),
             )
+            .children(self.render_on_device(cx))
             .children(objects)
             .children(self.render_albums(cx))
     }
@@ -903,6 +1026,10 @@ impl PhotoViewer {
             (LoadState::Failed(error), None) => {
                 Some(format!("Can't display image: {error}").into())
             }
+            (LoadState::Unavailable(error), None) => Some(
+                format!("The original isn't on this device, and couldn't be downloaded: {error}")
+                    .into(),
+            ),
             _ => None,
         };
         let zoom = self.zoom.borrow();
@@ -1206,6 +1333,25 @@ impl Render for PhotoViewer {
 
 /// A section of the sidebar: its title, with `action` beside it if given,
 /// over its rows of labels and values.
+/// "On this device · backed up to 2 targets".
+fn original_text(original: &OriginalStatus, required: usize) -> String {
+    let here = if original.here {
+        "On this device"
+    } else {
+        "Not on this device"
+    };
+    let targets = |count: usize| match count {
+        1 => "1 target".to_owned(),
+        n => format!("{n} targets"),
+    };
+    let copies = match original.copies {
+        0 => "not backed up yet".to_owned(),
+        n if n >= required => format!("backed up to {}", targets(n)),
+        n => format!("backed up to {n} of the {} needed", targets(required)),
+    };
+    format!("{here} · {copies}")
+}
+
 fn render_section(section: &DetailSection, action: Option<AnyElement>, cx: &App) -> Div {
     let muted_foreground = cx.theme().muted_foreground;
     div()
@@ -1240,4 +1386,29 @@ fn render_section(section: &DetailSection, action: Option<AnyElement>, cx: &App)
                 )
                 .child(div().flex_1().min_w_0().child(value.clone()))
         }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn says_where_an_original_is() {
+        let original = |here, copies| OriginalStatus {
+            role: OriginalRole::Shown,
+            here,
+            copies,
+        };
+        let text = |here, copies, required| original_text(&original(here, copies), required);
+        assert_eq!(text(true, 0, 1), "On this device · not backed up yet");
+        assert_eq!(text(true, 1, 1), "On this device · backed up to 1 target");
+        assert_eq!(
+            text(false, 2, 1),
+            "Not on this device · backed up to 2 targets"
+        );
+        assert_eq!(
+            text(true, 1, 2),
+            "On this device · backed up to 1 of the 2 targets needed"
+        );
+    }
 }

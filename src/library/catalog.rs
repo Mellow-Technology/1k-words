@@ -3061,10 +3061,8 @@ mod tests {
 
     #[test]
     fn records_each_devices_syncs() {
-        let path = std::env::temp_dir().join(format!(
-            "1k-words-device-sync-{}.db",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("1k-words-device-sync-{}.db", std::process::id()));
         remove_database(&path).ok();
         let other_device = Device {
             id: Id::from_u128(2),
@@ -3117,7 +3115,10 @@ mod tests {
             .record_device_sync(Some(target), false, Some("Nope."), Some(2))
             .unwrap();
         let run = catalog.device_sync().unwrap()[0].uploads[0].1.clone();
-        assert_eq!((run.synced_at, run.error.as_deref()), (synced_at, Some("Nope.")));
+        assert_eq!(
+            (run.synced_at, run.error.as_deref()),
+            (synced_at, Some("Nope."))
+        );
         catalog
             .record_device_sync(Some(target), true, None, Some(0))
             .unwrap();
@@ -3216,7 +3217,10 @@ mod tests {
         let mut expected: Vec<&str> = TABLES.to_vec();
         expected.sort();
         assert_eq!(tables, expected);
-        assert_eq!(block_on(schema_version(&catalog.connection())).unwrap(), SCHEMA_VERSION);
+        assert_eq!(
+            block_on(schema_version(&catalog.connection())).unwrap(),
+            SCHEMA_VERSION
+        );
         drop(catalog);
         remove_database(&path).unwrap();
     }

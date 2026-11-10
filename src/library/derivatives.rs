@@ -262,6 +262,17 @@ impl Library {
         super::import::relative_path(&self.info.path, path)
     }
 
+    /// The photo's viewer-sized preview, if it's been made: what the viewer
+    /// shows while the photo's original isn't on this device.
+    pub fn preview_of(&self, photo: &Photo) -> Option<PathBuf> {
+        let original = self.relative(&photo.path).ok()?;
+        let preview = self
+            .info
+            .path
+            .join(DerivativeKind::Preview.path_for(&original)?);
+        preview.is_file().then_some(preview)
+    }
+
     /// Where the library keeps a thumbnail for the original at `original`
     /// (relative to the library), whether or not it's been made.
     pub(super) fn thumbnail_file(&self, original: &str) -> Option<PathBuf> {

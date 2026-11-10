@@ -83,16 +83,12 @@ its targets on the Libraries page (`src/sync_settings.rs`).
   longer load; the interface is `onekwords:plugins@0.2.0` now.
 - **Thumbnails first, originals on demand.** Thumbnails (and other
   derivatives, `src/library/derivatives.rs`) are kept in the library,
-  catalogued apart from the originals, and uploaded ahead of them. Still to
-  do for a device short on space:
-  - sync the catalog itself, so another device knows the library's photos;
-  - show which photos' originals aren't on the device. Opening one fetches
-    it (`src/library/download.rs`). Which are here, how they came, last
-    opened and pins are recorded per device, apart from the synced catalog
-    (`src/library/on_device.rs`);
-  - have the catalog's sync (the first item) answer `catalog_synced` in
-    `src/library/free_space.rs`. Removing originals to stay within the
-    budget in Settings is built, but nothing's removed until it says yes.
+  catalogued apart from the originals, and uploaded ahead of them. Photos
+  whose originals aren't on the device are marked in the grid, show their
+  preview, and are fetched as they're opened. Still to do: have the
+  catalog's sync answer `catalog_synced` in `src/library/free_space.rs`
+  (KW-45). Removing originals to stay within the budget in Settings is
+  built, but nothing's removed until it says yes.
 
 ## Object detection
 

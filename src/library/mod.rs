@@ -44,7 +44,7 @@ pub use device::Device;
 pub use download::{DownloadSource, DownloadSummary};
 #[cfg(test)]
 pub use free_space::Volume;
-pub use free_space::{FreeUpSummary, SpaceBudget, SpaceOverview};
+pub use free_space::{FreeUpSummary, OriginalRole, OriginalStatus, SpaceBudget, SpaceOverview};
 pub use id::Id;
 pub use import::{ImportSession, ImportSummary, Imported, PreparedImport, prepare, source_drive};
 pub use manage::{LibraryHandle, LibraryStats, MoveProgress};

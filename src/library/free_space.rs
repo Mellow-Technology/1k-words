@@ -40,7 +40,7 @@ use super::Library;
 use super::catalog::{SyncItemRecord, SyncState};
 use super::download::{DownloadSource, download_plugin};
 use super::on_device::OriginalsUsage;
-use crate::photos::{self, Stack};
+use crate::photos::{self, Photo, Stack};
 use crate::plugins::Plugins;
 
 const GB: u64 = 1_000_000_000;
@@ -197,6 +197,25 @@ fn plan(mut groups: Vec<Group>, need: u64) -> Vec<Vec<Candidate>> {
 /// Whether a target's record of a file of `size` bytes confirms it's there.
 fn confirmed(item: &SyncItemRecord, size: u64) -> bool {
     item.state == SyncState::Synced && item.remote_key.is_some() && item.size == Some(size)
+}
+
+/// Which of a photo's originals a file is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OriginalRole {
+    /// The file shown: the JPEG of a RAW+JPEG pair, or the only file.
+    Shown,
+    Raw,
+    LiveVideo,
+}
+
+/// Where one of a photo's originals is, for showing it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OriginalStatus {
+    pub role: OriginalRole,
+    pub here: bool,
+    /// The targets holding a confirmed copy, by their records: the targets
+    /// themselves aren't asked.
+    pub copies: usize,
 }
 
 /// What's known of a library's originals, to choose among them.
@@ -388,6 +407,46 @@ impl Library {
         }
         group.lighten.extend(frames);
         Ok(group)
+    }
+
+    /// Where each of a photo's originals is: on this device or not, and how
+    /// many targets hold a confirmed copy. A copy of a file that's here is
+    /// confirmed as `free_up_space` would; one that isn't here can't be
+    /// compared with it, so the target's record of it is taken as it is.
+    pub fn original_status(&self, photo: &Photo) -> Result<Vec<OriginalStatus>> {
+        let items = self
+            .sync_targets()?
+            .into_iter()
+            .map(|target| self.sync_items(target.id))
+            .collect::<Result<Vec<_>>>()?;
+        let files = [
+            (OriginalRole::Shown, Some(&photo.path)),
+            (OriginalRole::Raw, photo.raw_pair.as_ref()),
+            (OriginalRole::LiveVideo, photo.live_video.as_ref()),
+        ];
+        let mut statuses = Vec::new();
+        for (role, file) in files {
+            let Some(file) = file else { continue };
+            let path = self.relative(file)?;
+            let size = std::fs::metadata(file)
+                .ok()
+                .filter(|metadata| metadata.is_file())
+                .map(|metadata| metadata.len());
+            let copies = items
+                .iter()
+                .filter_map(|items| items.get(&path))
+                .filter(|item| match size {
+                    Some(size) => confirmed(item, size),
+                    None => item.state == SyncState::Synced && item.remote_key.is_some(),
+                })
+                .count();
+            statuses.push(OriginalStatus {
+                role,
+                here: size.is_some(),
+                copies,
+            });
+        }
+        Ok(statuses)
     }
 
     /// How the library's originals stand, as of the last records.
@@ -676,6 +735,30 @@ mod tests {
             .catalog
             .record_sync(synced.id, &item)
             .unwrap();
+    }
+
+    #[test]
+    fn says_where_each_original_is() {
+        let synced = synced("free-status", 2);
+        let photos = photos_of(&synced);
+        let status = |photo: &Photo| synced.library.original_status(photo).unwrap();
+        let shown = |here, copies| OriginalStatus {
+            role: OriginalRole::Shown,
+            here,
+            copies,
+        };
+        assert_eq!(status(&photos[0]), [shown(true, 1)]);
+
+        // A failed upload isn't a copy.
+        set_record(&synced, &photos[1], |item| item.state = SyncState::Failed);
+        assert_eq!(status(&photos[1]), [shown(true, 0)]);
+
+        // Once it's gone from the device, the target's record is taken as
+        // it is.
+        let path = synced.library.relative(&photos[0].path).unwrap();
+        synced.library.evict_original(&path).unwrap();
+        assert_eq!(status(&photos[0]), [shown(false, 1)]);
+        test_support::remove(&synced.root);
     }
 
     #[test]

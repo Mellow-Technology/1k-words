@@ -47,6 +47,7 @@ gpui_kit::assets::icon_assets!(
     LucideIcons,
     [
         Album,
+        CloudOff,
         CloudUpload,
         Eject,
         FolderPlus,
@@ -55,6 +56,7 @@ gpui_kit::assets::icon_assets!(
         Images,
         Import,
         LayoutDashboard,
+        Pin,
         ScanEye
     ]
 );

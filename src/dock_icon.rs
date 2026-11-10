@@ -58,7 +58,8 @@ pub fn show_progress(percent: Option<f32>) {
                 .ok()
                 .map(|image| image.to_rgba8())
         });
-        base.as_ref().map(|base| with_progress(base, percent as f32 / 100.0))
+        base.as_ref()
+            .map(|base| with_progress(base, percent as f32 / 100.0))
     }) else {
         return;
     };

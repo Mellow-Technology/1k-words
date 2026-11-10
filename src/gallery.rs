@@ -49,6 +49,7 @@ use crate::photos::{self, Photo, Stack, StackKind, StartFrame};
 use crate::quick_preview::QuickPreview;
 use crate::settings::{self, GridLayout};
 use crate::sync_settings;
+use crate::sync_settings::OriginalsChanged;
 use crate::video::{PlaybackState, VideoPlayer};
 use crate::viewer::{PhotoViewer, ViewerEvent};
 
@@ -286,6 +287,10 @@ pub struct Gallery {
     pinned_albums: Arc<Vec<AlbumId>>,
     pinned_files: Arc<HashSet<PathBuf>>,
     _albums_task: Option<Task<()>>,
+    /// The files of the photos loaded that aren't on this device, for the
+    /// tiles' badges (see `check_on_device`).
+    not_here: Arc<HashSet<PathBuf>>,
+    _not_here_task: Option<Task<()>>,
     /// Albums deleted on one device but changed on another since, to ask
     /// about one at a time, and whether one's being asked about.
     album_conflicts: VecDeque<AlbumConflict>,
@@ -356,6 +361,7 @@ pub struct Gallery {
     applied_detector: Option<(String, bool)>,
     _detection_subscription: Subscription,
     _catalog_subscription: Subscription,
+    _originals_subscription: Subscription,
 }
 
 impl Gallery {
@@ -395,6 +401,8 @@ impl Gallery {
             pinned_albums: Arc::default(),
             pinned_files: Arc::default(),
             _albums_task: None,
+            not_here: Arc::default(),
+            _not_here_task: None,
             album_conflicts: VecDeque::new(),
             asking_about_conflict: false,
             all_stacks: Arc::default(),
@@ -440,6 +448,7 @@ impl Gallery {
             _detection_subscription: cx
                 .observe_global::<DetectionSettings>(Self::detection_changed),
             _catalog_subscription: cx.observe_global::<CatalogChanged>(Self::catalog_changed),
+            _originals_subscription: cx.observe_global::<OriginalsChanged>(Self::originals_changed),
         };
         gallery.load(Source::Library, cx);
         gallery
@@ -711,11 +720,22 @@ impl Gallery {
     /// Pins the selected photos to stay on this device, downloading what
     /// they need; or if they're all pinned, takes their pins off.
     fn toggle_selection_pin(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let photos = self.selected_photos();
+        self.toggle_photos_pin(photos, window, cx);
+    }
+
+    /// Pins `photos` to stay on this device, downloading what they need; or
+    /// if they're all pinned, takes their pins off.
+    fn toggle_photos_pin(
+        &mut self,
+        photos: Vec<Photo>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(library) = library::current(cx) else {
             return;
         };
-        let photos = self.selected_photos();
-        let pin = !self.selection_pinned();
+        let pin = !self.all_pinned(&photos);
         self.change_pins(pin, window, cx, {
             let library = library.clone();
             move || {
@@ -732,8 +752,53 @@ impl Gallery {
 
     /// Whether every selected photo is pinned, itself or by an album.
     fn selection_pinned(&self) -> bool {
-        let photos = self.selected_photos();
+        self.all_pinned(&self.selected_photos())
+    }
+
+    /// Whether there are photos, and every one is pinned, itself or by an
+    /// album.
+    fn all_pinned(&self, photos: &[Photo]) -> bool {
         !photos.is_empty() && photos.iter().all(|p| self.pinned_files.contains(&p.path))
+    }
+
+    /// Looks for which files of the photos loaded aren't on this device, in
+    /// the background, for the tiles' badges. It goes by the disk, as the
+    /// viewer does, so it's right for originals removed outside the app
+    /// too. Only a library's photos can be elsewhere.
+    fn check_on_device(&mut self, cx: &mut Context<Self>) {
+        if !self.showing_library() {
+            self.not_here = Arc::default();
+            self._not_here_task = None;
+            return;
+        }
+        let (stacks, generation) = (self.all_stacks.clone(), self.generation);
+        self._not_here_task = Some(cx.spawn(async move |this, cx| {
+            let not_here = cx
+                .background_spawn(async move { files_not_here(&stacks) })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.generation == generation && *this.not_here != not_here {
+                    this.not_here = Arc::new(not_here);
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// Reads what's on this device again after originals have come or
+    /// gone: for the tiles' badges, and the viewer's sidebar.
+    fn originals_changed(&mut self, cx: &mut Context<Self>) {
+        let library_id = &cx.global::<OriginalsChanged>().library_id;
+        let showing_changed_library = self.showing_library()
+            && library::current(cx).is_some_and(|l| &l.info.id == library_id);
+        if !showing_changed_library {
+            return;
+        }
+        self.check_on_device(cx);
+        if let Some(viewer) = &self.viewer {
+            viewer.update(cx, |viewer, cx| viewer.load_on_device(cx));
+        }
     }
 
     /// Changes what's pinned with `change`, in the background, then, if
@@ -753,6 +818,9 @@ impl Gallery {
             let changed = change.await;
             let download = this.update_in(cx, |this, window, cx| {
                 this.load_albums(cx);
+                if let Some(viewer) = &this.viewer {
+                    viewer.update(cx, |viewer, cx| viewer.load_on_device(cx));
+                }
                 if let Err(error) = &changed {
                     show_error("What's kept couldn't be changed.", error, window, cx);
                 }
@@ -894,6 +962,7 @@ impl Gallery {
                         this.all_stacks = Arc::new(stacks);
                         this.status = Status::Loaded;
                         this.apply_search(Duration::ZERO, cx);
+                        this.check_on_device(cx);
                     }
                     Err(error) => this.status = Status::Error(format!("{error:#}").into()),
                 }
@@ -1852,6 +1921,9 @@ impl Gallery {
                     if matches!(this.source, Source::Album(_)) {
                         this.stale = true;
                     }
+                }
+                ViewerEvent::TogglePin(photo) => {
+                    this.toggle_photos_pin(vec![(**photo).clone()], window, cx)
                 }
             },
         ));
@@ -2871,7 +2943,16 @@ impl Gallery {
                 .justify_center()
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
-                .child("Can't display image"),
+                .child(
+                    match self
+                        .stacks
+                        .get(ix)
+                        .is_some_and(|stack| self.not_here.contains(&stack.cover().path))
+                    {
+                        true => "Not on this device",
+                        false => "Can't display image",
+                    },
+                ),
             _ => tile,
         };
         // A playing Live Photo covers the thumbnail.
@@ -2909,6 +2990,19 @@ impl Gallery {
         let raw_plus = stack.cover().raw_pair.is_some();
 
         let mut segments: Vec<Div> = Vec::new();
+        // Some of its originals aren't on this device, such as a raw file
+        // removed to free up space; or they're all pinned to stay here.
+        if stack
+            .photos
+            .iter()
+            .flat_map(Photo::files)
+            .any(|file| self.not_here.contains(file))
+        {
+            segments.push(div().child(badge_lucide(LucideIcon::CloudOff)));
+        }
+        if self.all_pinned(&stack.photos) {
+            segments.push(div().child(badge_lucide(LucideIcon::Pin)));
+        }
         if raw_plus {
             segments.push(div().child("RAW+"));
         }
@@ -3359,6 +3453,21 @@ fn update_and_render(
 
 // Badges sit on top of photos, so they use fixed colors that read on any
 // image rather than theme colors.
+
+/// The files of the photos in `stacks` that aren't on this device.
+fn files_not_here(stacks: &[Stack]) -> HashSet<PathBuf> {
+    stacks
+        .iter()
+        .flat_map(|stack| &stack.photos)
+        .flat_map(Photo::files)
+        .filter(|file| !file.is_file())
+        .cloned()
+        .collect()
+}
+
+fn badge_lucide(icon: LucideIcon) -> impl IntoElement {
+    svg().path(icon.path()).size_3p5().text_color(rgb(0xffffff))
+}
 
 fn badge_icon(icon: &'static str) -> impl IntoElement {
     svg().path(icon).size_3p5().text_color(rgb(0xffffff))
@@ -5288,6 +5397,128 @@ mod tests {
         );
 
         cx.update(|cx| sync_targets::delete(&target, cx)).unwrap();
+        library::test_support::remove(&root);
+        std::fs::remove_dir_all(folder).ok();
+    }
+
+    #[gpui_kit::test]
+    fn shows_whats_not_on_this_device(cx: &mut TestAppContext) {
+        use crate::library::sync_test_support::FakeS3;
+        use crate::sync_settings::OriginalsChanged;
+        use crate::sync_targets;
+
+        let folder = photo_folder(20);
+        let (window, gallery) = open_gallery(folder.clone(), cx);
+        let frame = |cx: &mut TestAppContext| {
+            cx.run_until_parked();
+            cx.update_window(window, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+            cx.run_until_parked();
+        };
+        frame(cx);
+        let library = cx.update(|cx| library::current(cx)).unwrap();
+        library.make_missing_previews().unwrap();
+
+        // Everything's uploaded, then the first tile's original is removed.
+        let s3 = FakeS3::start();
+        let root = std::env::temp_dir().join(format!("1k-words-kw46-{}", std::process::id()));
+        cx.update(|cx| sync_targets::test_support::init(root.clone(), cx));
+        let plugins = cx.update(|cx| sync_targets::plugins(cx)).unwrap().unwrap();
+        let config = sync_targets::validate(&plugins, "s3", s3.config()).unwrap();
+        let target = cx
+            .update(|cx| {
+                sync_targets::save(
+                    None,
+                    sync_targets::NewTarget {
+                        name: "Bucket".into(),
+                        plugin: "s3".into(),
+                        summary: String::new(),
+                        config: config.clone(),
+                    },
+                    cx,
+                )
+            })
+            .unwrap();
+        let id = library.add_sync_target(&target).unwrap();
+        let settings = crate::library::TargetSettings {
+            plugin: "s3".into(),
+            config,
+        };
+        let summary = library
+            .upload(
+                &plugins,
+                id,
+                &settings,
+                &AtomicBool::new(false),
+                &Default::default(),
+                |_| {},
+            )
+            .unwrap();
+        assert!(summary.failed.is_empty(), "{:?}", summary.failed);
+        let cover = gallery.read_with(cx, |gallery, _| gallery.stacks[0].cover().clone());
+        let path = cover.path.strip_prefix(&library.info.path).unwrap();
+        library.evict_original(path.to_str().unwrap()).unwrap();
+
+        // Told originals have gone, the grid marks it, and only it.
+        let library_id = library.info.id.clone();
+        cx.update(|cx| cx.set_global(OriginalsChanged { library_id }));
+        frame(cx);
+        gallery.read_with(cx, |gallery, _| {
+            assert_eq!(gallery.not_here.iter().collect::<Vec<_>>(), [&cover.path]);
+            assert!(!gallery.all_pinned(&gallery.stacks[0].photos));
+        });
+
+        // It can't be downloaded (the credentials are refused), so its
+        // preview is shown, and the sidebar says where it is.
+        s3.fail_next(&[403; 8]);
+        cx.update_window(window, |_, window, cx| {
+            gallery.update(cx, |gallery, cx| {
+                gallery.open_viewer(0, StartFrame::Cover, window, cx)
+            })
+        })
+        .unwrap();
+        frame(cx);
+        let viewer = |cx: &mut TestAppContext| {
+            gallery.read_with(cx, |gallery, cx| {
+                let viewer = gallery.viewer.as_ref().unwrap().read(cx);
+                (
+                    viewer.load_result(),
+                    viewer.shown_image(),
+                    viewer.on_device(cx),
+                )
+            })
+        };
+        let (result, shown, on_device) = viewer(cx);
+        assert!(result.is_err(), "{result:?}");
+        let (_, _, full) = shown.expect("its preview is shown");
+        assert!(!full);
+        assert_eq!(
+            on_device,
+            Some((
+                vec!["Not on this device · backed up to 1 target".to_owned()],
+                false
+            ))
+        );
+
+        // Keep Here pins it, and the sidebar and the tile say so.
+        cx.update_window(window, |_, window, cx| window.click("keep-here", cx))
+            .unwrap();
+        frame(cx);
+        assert!(
+            library
+                .pinned_originals()
+                .unwrap()
+                .contains(path.to_str().unwrap())
+        );
+        let (_, _, on_device) = viewer(cx);
+        assert_eq!(on_device.map(|(_, pinned)| pinned), Some(true));
+        press(window, "escape", cx);
+        frame(cx);
+        gallery.read_with(cx, |gallery, _| {
+            assert!(gallery.all_pinned(&gallery.stacks[0].photos));
+        });
+
+        cx.update(|cx| sync_targets::delete(&target, cx)).ok();
         library::test_support::remove(&root);
         std::fs::remove_dir_all(folder).ok();
     }

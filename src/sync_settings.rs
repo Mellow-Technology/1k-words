@@ -235,6 +235,21 @@ pub fn progress(cx: &App) -> Option<SyncProgress> {
 
 impl Global for SyncActivity {}
 
+/// Set when originals may have come to or gone from a library on this
+/// device: fetched as a photo's opened, downloaded for pins or by a sync,
+/// or removed to free up space. The gallery reads its badges again.
+pub struct OriginalsChanged {
+    pub library_id: String,
+}
+
+impl Global for OriginalsChanged {}
+
+fn originals_changed(library_id: &str, cx: &mut App) {
+    cx.set_global(OriginalsChanged {
+        library_id: library_id.to_owned(),
+    });
+}
+
 fn activity(cx: &mut App) -> &mut SyncActivity {
     cx.default_global::<SyncActivity>()
 }
@@ -848,10 +863,10 @@ fn devices_item(
     cx: &App,
 ) -> SettingItem {
     let target_name = |id: Id| {
-        links
-            .iter()
-            .find(|(link, _)| link.id == id)
-            .map_or_else(|| "Deleted target".to_owned(), |(link, _)| target_name(link, cx))
+        links.iter().find(|(link, _)| link.id == id).map_or_else(
+            || "Deleted target".to_owned(),
+            |(link, _)| target_name(link, cx),
+        )
     };
     let now = library::now();
     let lines: Vec<SharedString> = devices
@@ -893,7 +908,10 @@ fn device_text(device: &DeviceSyncRecord, target_name: &dyn Fn(Id) -> String, no
         parts.push(format!("{}: {state}", target_name(*target)));
     }
     if parts.is_empty() {
-        parts.push(format!("last opened the library {}", ago(device.seen_at, now)));
+        parts.push(format!(
+            "last opened the library {}",
+            ago(device.seen_at, now)
+        ));
     }
     let name = if device.this_device {
         format!("{} (this device)", device.name)
@@ -1279,6 +1297,7 @@ fn start_upload(
             let finished = !again && !cancelled && result.is_ok();
             activity.results.insert(key.clone(), result_text(result));
             refresh_library(&key.0, cx);
+            originals_changed(&key.0, cx);
             if again {
                 sync_in_background(&key.0, cx);
             } else if finished {
@@ -1345,6 +1364,7 @@ fn start_free_up(library: Arc<Library>, plugins: Arc<Plugins>, cx: &mut App) {
             activity.freeing.remove(&id);
             activity.freed.insert(id.clone(), freed_text(result));
             refresh_library(&id, cx);
+            originals_changed(&id, cx);
         });
     })
     .detach();
@@ -1415,20 +1435,32 @@ fn download_sources(library: &Library, targets: &[TargetInfo]) -> Result<Vec<Dow
 /// automatic sync is paused: the user's asked for it.
 pub fn fetch_original(library: Arc<Library>, photo: Photo, cx: &App) -> Task<Result<()>> {
     let setup = download_setup(cx);
-    cx.background_spawn(async move {
+    let id = library.info.id.clone();
+    let fetched = cx.background_spawn(async move {
         let (plugins, targets) = setup?;
         let sources = download_sources(&library, &targets)?;
         library.fetch_original(&plugins, &sources, &photo, &AtomicBool::new(false))
+    });
+    cx.spawn(async move |cx| {
+        let fetched = fetched.await;
+        cx.update(|cx| originals_changed(&id, cx));
+        fetched
     })
 }
 
 /// Downloads what a library's pinned photos and albums need.
 pub fn download_pinned(library: Arc<Library>, cx: &App) -> Task<Result<DownloadSummary>> {
     let setup = download_setup(cx);
-    cx.background_spawn(async move {
+    let id = library.info.id.clone();
+    let downloaded = cx.background_spawn(async move {
         let (plugins, targets) = setup?;
         let sources = download_sources(&library, &targets)?;
         library.download_pinned(&plugins, &sources, &AtomicBool::new(false))
+    });
+    cx.spawn(async move |cx| {
+        let downloaded = downloaded.await;
+        cx.update(|cx| originals_changed(&id, cx));
+        downloaded
     })
 }
 
@@ -1610,7 +1642,13 @@ mod tests {
     fn describes_each_devices_syncs() {
         use crate::library::SyncRun;
         let (now, s3) = (1_000_000.0, Id::from_u128(7));
-        let name = |id: Id| if id == s3 { "S3".to_owned() } else { "Deleted target".to_owned() };
+        let name = |id: Id| {
+            if id == s3 {
+                "S3".to_owned()
+            } else {
+                "Deleted target".to_owned()
+            }
+        };
         let run = |ago: f64, pending: Option<usize>, error: Option<&str>| SyncRun {
             attempted_at: now - ago,
             synced_at: error.is_none().then_some(now - ago),
