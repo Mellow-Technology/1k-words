@@ -27,7 +27,7 @@ use crate::gallery::show_error;
 use crate::library::{self, Album, AlbumId, Library, tree_order};
 use crate::navigation;
 use crate::object_boxes::ObjectBoxes;
-use crate::photos::{Stack, StackKind, StartFrame};
+use crate::photos::{Photo, Stack, StackKind, StartFrame};
 use crate::settings;
 use crate::tiles::{FullImage, Tiles};
 use crate::video::{PlaybackState, VideoPlayer};
@@ -84,6 +84,8 @@ struct LoadedImage {
 }
 
 enum LoadState {
+    /// Downloading its original, which isn't on this device.
+    Fetching,
     Loading,
     Done,
     Failed(SharedString),
@@ -208,9 +210,45 @@ impl PhotoViewer {
             })
             .detach();
         }
+        let library = self.library.clone();
         self._load_image = cx.spawn({
             let photo = photo.clone();
             async move |this, cx| {
+                // Evicted originals are fetched as they're opened, and
+                // what's said of the photo read again once they're here.
+                let here = cx.background_spawn({
+                    let photo = photo.clone();
+                    async move { photo.files().all(|file| file.is_file()) }
+                });
+                if let Some(library) = library
+                    && !here.await
+                {
+                    let fetched = this.update(cx, |this, cx| {
+                        this.load_state = LoadState::Fetching;
+                        cx.notify();
+                        crate::sync_settings::fetch_original(library, photo.clone(), cx)
+                    });
+                    let Ok(fetched) = fetched else { return };
+                    let fetched = fetched.await;
+                    this.update(cx, |this, cx| match fetched {
+                        Ok(()) => {
+                            this.load_state = LoadState::Loading;
+                            this.load_details(photo.clone(), cx);
+                        }
+                        Err(error) => {
+                            this.load_state = LoadState::Failed(format!("{error:#}").into());
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                    if !this
+                        .read_with(cx, |this, _| matches!(this.load_state, LoadState::Loading))
+                        .unwrap_or(false)
+                    {
+                        return;
+                    }
+                }
+
                 // The embedded preview of a raw file takes milliseconds.
                 let preview = cx.background_spawn({
                     let photo = photo.clone();
@@ -244,6 +282,13 @@ impl PhotoViewer {
             }
         });
 
+        self.load_details(photo, cx);
+        self.load_albums(cx);
+        cx.notify();
+    }
+
+    /// Reads what's said of a photo, and the objects found in it.
+    fn load_details(&mut self, photo: Photo, cx: &mut Context<Self>) {
         let library = library::current(cx);
         self._load_details = cx.spawn(async move |this, cx| {
             let details = cx
@@ -283,8 +328,16 @@ impl PhotoViewer {
                 .ok();
             }
         });
-        self.load_albums(cx);
-        cx.notify();
+    }
+
+    /// Whether the photo shown has loaded, and if not, why, if it failed.
+    #[cfg(test)]
+    pub fn load_result(&self) -> Result<bool, SharedString> {
+        match &self.load_state {
+            LoadState::Done => Ok(true),
+            LoadState::Failed(error) => Err(error.clone()),
+            LoadState::Fetching | LoadState::Loading => Ok(false),
+        }
     }
 
     /// The albums the photo shown is in, once they're known; never for
@@ -767,6 +820,7 @@ impl PhotoViewer {
         let loading_full = self.load_full.is_some();
         let status = match (&self.load_state, &self.image) {
             (LoadState::Failed(_), Some(_)) => Some("Preview only"),
+            (LoadState::Fetching, _) => Some("Downloading the original…"),
             (LoadState::Loading, _) => Some("Loading…"),
             _ if loading_full => Some("Loading full resolution…"),
             _ => None,

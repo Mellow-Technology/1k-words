@@ -177,7 +177,7 @@ impl Library {
 
     /// Creates `dir` (in `kind`'s folder) and the folders above it. The
     /// library's own folder must be there: it may have been moved away.
-    fn create_derivative_dirs(&self, kind: DerivativeKind, dir: &Path) -> Result<()> {
+    pub(super) fn create_derivative_dirs(&self, kind: DerivativeKind, dir: &Path) -> Result<()> {
         let root = &self.info.path;
         let base = root.join(kind.dir());
         if !root.is_dir() {

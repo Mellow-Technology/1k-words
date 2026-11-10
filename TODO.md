@@ -70,8 +70,9 @@ its targets on the Libraries page (`src/sync_settings.rs`).
   Credential Manager and the Secret Service.
 - **Sign the app** so the keychain doesn't ask again after each update (items
   are tied to the binary's code signature).
-- **Download and listing.** The plugin interface has them; the app doesn't
-  use them yet (restoring a library, adopting files already on a service).
+- **Listing.** The plugin interface has it; the app doesn't use it yet
+  (restoring a library, adopting files already on a service). Downloading
+  is `library::download`.
 - **Resume big uploads.** Files are uploaded several at once, and big ones
   in parts (`library::sync`), but a file whose upload in parts is stopped
   is given up on and starts again next time. S3 keeps the parts of an open
@@ -85,10 +86,10 @@ its targets on the Libraries page (`src/sync_settings.rs`).
   catalogued apart from the originals, and uploaded ahead of them. Still to
   do for a device short on space:
   - sync the catalog itself, so another device knows the library's photos;
-  - download a library's derivatives, and its originals only when asked;
-  - show and open photos whose originals aren't on the device. Which are,
-    how they came, last opened and pins are recorded per device, apart from
-    the synced catalog (`src/library/on_device.rs`);
+  - show which photos' originals aren't on the device. Opening one fetches
+    it (`src/library/download.rs`). Which are here, how they came, last
+    opened and pins are recorded per device, apart from the synced catalog
+    (`src/library/on_device.rs`);
   - free up space by removing originals that are safely synced.
 
 ## Object detection

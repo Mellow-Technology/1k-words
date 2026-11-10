@@ -139,8 +139,27 @@ pub fn kept_thumbnail(path: &Path) -> Option<Arc<RenderImage>> {
     Some(to_render_image(image))
 }
 
+/// All there is to show of a photo whose original has been evicted from
+/// this device (see `library::download`): its kept thumbnail.
+fn evicted_thumbnail(photo: &Photo) -> Option<DynamicImage> {
+    if photo.path.exists() {
+        return None;
+    }
+    ImageReader::open(photo.thumbnail.as_deref()?)
+        .ok()?
+        .decode()
+        .ok()
+}
+
 /// A filmstrip thumbnail, from the embedded preview when it's large enough.
 pub fn filmstrip_thumbnail(photo: &Photo) -> Result<Arc<RenderImage>> {
+    if let Some(image) = evicted_thumbnail(photo) {
+        return Ok(to_render_image(fit(
+            image,
+            u32::MAX,
+            FILMSTRIP_THUMBNAIL_HEIGHT,
+        )));
+    }
     let image = match embedded_preview(photo) {
         Some(preview) if preview.height().min(preview.width()) >= FILMSTRIP_THUMBNAIL_HEIGHT => {
             preview
@@ -171,6 +190,9 @@ pub fn viewer_embedded_preview(photo: &Photo) -> Option<Arc<RenderImage>> {
 /// The quick preview's image: the embedded preview when it's large enough,
 /// otherwise the photo scaled to fit `VIEWER_PREVIEW_SIZE`.
 pub fn quick_preview(photo: &Photo) -> Result<Arc<RenderImage>> {
+    if let Some(image) = evicted_thumbnail(photo) {
+        return Ok(to_render_image(image));
+    }
     if let Some(preview) = viewer_embedded_preview(photo) {
         return Ok(preview);
     }

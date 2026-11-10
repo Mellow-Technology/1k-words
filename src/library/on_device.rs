@@ -91,6 +91,7 @@ impl FetchedOriginal {
 }
 
 /// The space originals take on this device, as of the last records.
+#[allow(dead_code)] // For what's yet to be built on this.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct OriginalsUsage {
     pub files: usize,
@@ -438,15 +439,15 @@ impl Library {
     }
 }
 
-/// For what's built on this: fetching originals, and removing them.
-#[allow(dead_code)]
 impl Library {
+    #[allow(dead_code)] // For what's yet to be built on this.
     /// Whether the file the photo displays is on this device. Goes by the
     /// disk, so it needs no records, and is right for any photo.
     pub fn is_on_device(&self, photo: &Photo) -> bool {
         photo.path.is_file()
     }
 
+    #[allow(dead_code)] // For what's yet to be built on this.
     /// The originals the catalog has that aren't recorded as here, oldest
     /// photos first. Only as good as the records: call `refresh_originals`
     /// first if the disk may have changed.
@@ -478,6 +479,7 @@ impl Library {
         self.on_device.remove_original(path)
     }
 
+    #[allow(dead_code)] // For what's yet to be built on this.
     /// When each photo (by its displayed file) was last opened here.
     pub fn last_opened(&self) -> Result<HashMap<String, f64>> {
         self.on_device.opened()
@@ -544,6 +546,7 @@ impl Library {
         self.on_device.pinned_albums()
     }
 
+    #[allow(dead_code)] // For what's yet to be built on this.
     /// Whether the photo is pinned, itself or by an album.
     pub fn is_pinned(&self, photo: &Photo) -> Result<bool> {
         Ok(self
@@ -580,6 +583,7 @@ impl Library {
         Ok(pinned)
     }
 
+    #[allow(dead_code)] // For what's yet to be built on this.
     /// The space originals take here.
     pub fn originals_usage(&self) -> Result<OriginalsUsage> {
         let pinned = self.pinned_originals()?;
