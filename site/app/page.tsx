@@ -108,8 +108,11 @@ export default function Home() {
         >
           <Shot
             className={styles.heroShot}
-            alt="The library grid, with brackets and bursts stacked into single tiles and their badges showing"
-            caption="Library · masonry grid · dark appearance"
+            src="library-grid.jpg"
+            ratio={2080 / 1388}
+            eager
+            alt="The library grid, its tiles badged RAW+ for raw and JPEG pairs, with three-shot brackets stacked into single tiles and Live Photos marked"
+            caption="Library · square grid · brackets badged by frame count"
           />
         </Hero>
 
@@ -184,12 +187,16 @@ export default function Home() {
         >
           <div className={styles.shots}>
             <Shot
-              alt="Quick preview over the grid: a bracket's middle exposure, its aperture, shutter speed and ISO, and every frame along the bottom"
-              caption="Quick preview · Space"
+              src="quick-preview.jpg"
+              ratio={1946 / 1538}
+              alt="Quick preview over the grid: the second frame of a three-shot bracket, with its camera, lens, shutter speed, aperture, ISO and exposure compensation, and the bracket's frames at 0, −0.3 and +0.3 EV"
+              caption="Quick preview · Space · bracket 2 of 3"
             />
             <Shot
-              alt="The viewer zoomed in, with the details sidebar: exposure, lens, albums and On This Device"
-              caption="Viewer · details sidebar"
+              src="viewer.jpg"
+              ratio={1830 / 1206}
+              alt="The viewer zoomed in on a photo, with the bracket's frames below it and the details sidebar: the raw file beside the JPEG, the camera and lens, and the exposure, down to the auto bracket mode"
+              caption="Viewer · zoomed in · details sidebar"
             />
           </div>
           <FeatureGrid min="300px" className={styles.features}>
@@ -257,9 +264,10 @@ export default function Home() {
           </ol>
           <div className={styles.storageShot}>
             <Shot
-              ratio={4 / 3}
-              alt="Settings: a library backing up to an S3 bucket, with how syncing last went on each Mac"
-              caption="Settings · Libraries · Sync"
+              src="sync-settings.png"
+              ratio={2422 / 1738}
+              alt="Settings, Sync: adding S3-compatible storage, with its endpoint, region, bucket and access keys"
+              caption="Settings · Sync · add S3-compatible storage"
             />
             <div className={styles.next}>
               <Badge tone="warning" dot>

@@ -10,6 +10,9 @@ export interface ShotProps {
   ratio?: number;
   /** A caption under it, like the details printed on a contact sheet. */
   caption?: string;
+  /** Load it straight away rather than as it nears the screen, for one at
+   * the top of the page. */
+  eager?: boolean;
   className?: string;
 }
 
@@ -19,14 +22,24 @@ const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
  * A screenshot of the app, framed like a print. Without `src` it's a
  * placeholder: an 18% grey card with crop marks, saying what goes there.
  */
-export function Shot({ src, alt, ratio = 16 / 10, caption, className }: ShotProps) {
+export function Shot({ src, alt, ratio = 16 / 10, caption, eager = false, className }: ShotProps) {
   return (
     <figure className={[styles.shot, className].filter(Boolean).join(" ")}>
-      <div className={styles.frame} style={{ aspectRatio: ratio }}>
+      <div className={styles.frame}>
         {src ? (
-          <img src={`${basePath}/screenshots/${src}`} alt={alt} loading="lazy" />
+          <img
+            src={`${basePath}/screenshots/${src}`}
+            alt={alt}
+            loading={eager ? "eager" : "lazy"}
+            style={{ aspectRatio: ratio }}
+          />
         ) : (
-          <div className={styles.placeholder} role="img" aria-label={`Screenshot to come: ${alt}`}>
+          <div
+            className={styles.placeholder}
+            role="img"
+            aria-label={`Screenshot to come: ${alt}`}
+            style={{ aspectRatio: ratio }}
+          >
             <span className={styles.thirds} aria-hidden />
             <span className={styles.label}>
               <span className={styles.tag}>Screenshot</span>

@@ -1,2 +1,5 @@
 /target
 /plugins/*/target
+
+# Finder
+.DS_Store

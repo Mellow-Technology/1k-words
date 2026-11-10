@@ -16,17 +16,19 @@ The site shows a placeholder (an 18% grey card with crop marks) wherever a
 screenshot isn't here yet. To add one, save it in `public/screenshots` and pass its file name
 as `src` to its `<Shot>` in `app/page.tsx`.
 
-| File | Where | Ratio | What it shows |
+| File | Where | Size | What it shows |
 | --- | --- | --- | --- |
-| `library-grid.png` | Hero | 16:10 | The library grid, masonry, with brackets and bursts stacked and their badges showing. Dark appearance. |
-| `quick-preview.png` | Features | 16:10 | Quick preview (Space) over the grid: a bracket's middle exposure, its exposure details, and every frame along the bottom. |
-| `viewer.png` | Features | 16:10 | The viewer zoomed in, with the details sidebar: exposure, lens, albums and On This Device. |
-| `sync-settings.png` | Storage | 4:3 | Settings, Libraries: a library syncing to an S3 bucket, with the Devices row showing each Mac. |
+| `library-grid.jpg` | Hero | 2080 × 1388 | The library grid, square, with RAW+ and bracket badges showing. Dark appearance. |
+| `quick-preview.jpg` | Features | 1946 × 1538 | Quick preview (Space) over the grid: a bracket's middle exposure, its exposure details, and every frame along the bottom. |
+| `viewer.jpg` | Features | 1830 × 1206 | The viewer zoomed in, with the details sidebar: file, capture and exposure. |
+| `sync-settings.png` | Storage | 2422 × 1738 | Settings, Sync: adding S3-compatible storage. |
 
 Tips for good ones:
 
 - Use a real library with a mix of brackets, bursts, RAW+JPEG pairs and
   Live Photos, so the badges show.
-- Capture at 2x (Retina) and at least 2560 px wide for the 16:10 shots.
+- Capture at 2x (Retina). JPEG keeps photos small; the hero is resized to
+  2080 px wide, twice the width it's shown at.
+- Pass each one's width over height as `ratio`, so it isn't cropped.
 - Crop to the window, without the desktop. The site frames each one with
   crop marks and a shadow, so leave the window's own shadow out.
