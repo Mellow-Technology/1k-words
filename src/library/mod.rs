@@ -15,7 +15,8 @@
 //!
 //! The originals are read-only by default (see `protect`). Each library's
 //! catalog lives in the app's config directory, as `libraries/<id>.db`, and
-//! `libraries.json` there lists the libraries.
+//! `libraries.json` there lists the libraries. What's only true on this
+//! device, which isn't synced, is kept beside it (see `on_device`).
 
 mod albums;
 mod catalog;
@@ -25,6 +26,7 @@ mod id;
 mod import;
 mod manage;
 mod objects;
+mod on_device;
 mod protect;
 mod sync;
 
@@ -42,6 +44,8 @@ pub use manage::{LibraryHandle, LibraryStats, MoveProgress};
 #[cfg(test)]
 pub(crate) use objects::test_support as detect_test_support;
 pub use objects::{DetectionStatus, ObjectKind, suggestions};
+#[allow(unused_imports)] // For what's built on it: see `on_device`.
+pub use on_device::{FetchedOriginal, OriginalSource, OriginalsUsage};
 #[cfg(test)]
 pub(crate) use sync::test_support as sync_test_support;
 pub use sync::{LibraryTarget, SyncStatus, TargetSettings, UploadProgress, UploadSummary};
@@ -104,6 +108,8 @@ struct Marker {
 pub struct Library {
     pub info: LibraryInfo,
     catalog: Catalog,
+    /// What's only true on this device (see `on_device`).
+    on_device: on_device::OnDevice,
     /// Held while changing the originals, so imports running at the same
     /// time take turns (see `ImportSession`).
     placing: Mutex<()>,
@@ -174,10 +180,13 @@ impl Library {
             }
         }
         let device = Device::load(config_dir)?;
-        let catalog = Catalog::open(&catalog_path(config_dir, &info.id), &device)?;
+        let catalog_file = catalog_path(config_dir, &info.id);
+        let catalog = Catalog::open(&catalog_file, &device)?;
+        let on_device = on_device::OnDevice::open(&catalog_file)?;
         let library = Self {
             info,
             catalog,
+            on_device,
             placing: Mutex::new(()),
             saving_albums: Mutex::new(()),
             derivatives: Activity::default(),

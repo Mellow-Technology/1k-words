@@ -1142,6 +1142,9 @@ impl Gallery {
         cx.spawn(async move |this, cx| {
             let found = cx
                 .background_spawn(async move {
+                    if let Err(error) = library.refresh_originals() {
+                        eprintln!("couldn't check the library's originals: {error:#}");
+                    }
                     if let Err(error) = library.make_missing_thumbnails() {
                         eprintln!("couldn't make the library's thumbnails: {error:#}");
                     }
