@@ -10,6 +10,7 @@ const PLUGINS: &[(&str, &str)] = &[("s3", "s3-sync"), ("openai-vision", "openai-
 const TARGET: &str = "wasm32-wasip2";
 
 fn main() {
+    link_ffmpeg();
     let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap()).join("plugins");
     println!("cargo:rerun-if-changed=wit");
@@ -56,5 +57,20 @@ fn main() {
             .join(format!("{name}.wasm"));
         std::fs::copy(&wasm, out_dir.join(format!("{plugin}.wasm")))
             .unwrap_or_else(|e| panic!("copying {}: {e}", wasm.display()));
+    }
+}
+
+/// With FFMPEG_DIR set, as to the LGPL build from `scripts/build-ffmpeg.sh`,
+/// ffmpeg-sys links against the libraries there. They're named
+/// `@rpath/libav*.dylib`, so the app looks for them along its rpath: here,
+/// that folder, so it runs from `target/`. A bundled app adds its own
+/// Frameworks folder instead. Without FFMPEG_DIR, FFmpeg comes from
+/// pkg-config (Homebrew's, for development), whose libraries have
+/// absolute names and need no rpath.
+fn link_ffmpeg() {
+    println!("cargo:rerun-if-env-changed=FFMPEG_DIR");
+    if let Ok(dir) = env::var("FFMPEG_DIR") {
+        let lib = PathBuf::from(dir).join("lib");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib.display());
     }
 }

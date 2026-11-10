@@ -30,8 +30,10 @@ kamadak-exif = "0.6"
 futures = "0.3"
 # HEIC/HEIF decoding (iPhone photos); links the system libheif.
 libheif-rs = "3"
-# Video decoding for Live Photos; links the system FFmpeg libraries.
-ffmpeg-next = "9"
+# Video decoding for Live Photos. FFmpeg comes from Homebrew for development,
+# or the LGPL build from scripts/build-ffmpeg.sh with FFMPEG_DIR set; only
+# the parts the app uses, as that build has no libavdevice or libavfilter.
+ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "software-resampling", "software-scaling"] }
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
