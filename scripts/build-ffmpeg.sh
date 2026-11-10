@@ -48,7 +48,7 @@ fi
 
 mkdir -p "$WORK"
 if [[ ! -f "$TARBALL" ]]; then
-  echo "Downloading FFmpeg $VERSION…"
+  echo "Downloading FFmpeg ${VERSION}…"
   curl -fL --retry 3 -o "$TARBALL.part" "https://ffmpeg.org/releases/ffmpeg-$VERSION.tar.xz"
   mv "$TARBALL.part" "$TARBALL"
 fi
