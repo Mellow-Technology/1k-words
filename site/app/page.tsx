@@ -87,13 +87,14 @@ export default function Home() {
           size="full"
           align="center"
           pattern="theme"
+          className={styles.hero}
           eyebrow="Free and open source · For macOS"
           title={
             <>
-              Shoot the whole bracket. <em>See one photo.</em>
+              A picture is worth 1000 words, <em>make sure you can find the right one</em>
             </>
           }
-          subtitle="1k Words is a photo library for people with real cameras. It stacks exposure brackets and bursts into single tiles, keeps your originals as plain files on your own drives, and backs them up to storage you choose."
+          subtitle="For photographers who'd rather be shooting than sorting. Brackets stack themselves, search finds what's in your photos, and syncing just works, so you can focus on the stories your pictures tell."
           actions={
             <>
               <Button href="#get-started" size="lg">

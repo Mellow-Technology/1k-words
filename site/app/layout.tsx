@@ -12,9 +12,9 @@ const body = IBM_Plex_Sans({ variable: "--font-body", subsets: ["latin"], weight
 const mono = IBM_Plex_Mono({ variable: "--font-mono", subsets: ["latin"], weight: ["400", "500"] });
 
 export const metadata: Metadata = {
-  title: "1k Words · A photo library for people who shoot brackets and bursts",
+  title: "1k Words · A picture is worth 1000 words",
   description:
-    "1k Words stacks exposure brackets and bursts from any camera into single tiles, keeps your originals as plain files on your own drives, and syncs them to storage you choose. Free and open source.",
+    "For photographers who'd rather be shooting than sorting. Brackets stack themselves, search finds what's in your photos, and syncing just works, so you can focus on the stories your pictures tell.",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
