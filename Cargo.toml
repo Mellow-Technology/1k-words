@@ -94,3 +94,9 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = ["s
 objc2-core-foundation = "0.3.2"
 objc2-core-video = { version = "0.3.2", features = ["CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn"] }
 objc2-video-toolbox = { version = "0.3.2", features = ["VTSession", "VTPixelRotationSession", "VTPixelRotationProperties", "VTPixelTransferSession", "VTPixelTransferProperties"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+# Secrets (the catalog server's token) elsewhere: Credential Manager on
+# Windows, the Secret Service (GNOME Keyring, KWallet) on Linux
+# (`src/keychain.rs`).
+keyring = { version = "3", features = ["windows-native", "sync-secret-service", "crypto-rust"] }

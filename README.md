@@ -90,7 +90,7 @@ xattr -dr com.apple.quarantine "/Applications/1k Words.app"
 Still to come (see [`TODO.md`](TODO.md) for the full list):
 
 - **Free Up Space.** Removing originals that are safely synced, to keep a library within a budget set in Settings, is built but doesn't remove anything yet: it waits until the catalog itself is known to be synced ([`src/library/free_space.rs`](src/library/free_space.rs), KW-45).
-- **Release builds.** The macOS release build (KW-48), with an LGPL-only FFmpeg (KW-6) and the native libraries bundled. Windows and Linux release builds aren't done yet (KW-49).
+- **Release builds.** The macOS release build (KW-48), with an LGPL-only FFmpeg (KW-6) and the native libraries bundled. Linux and Windows builds are barebones so far: a folder to unpack and run, unsigned and without an installer (KW-49).
 - **Other platforms.** Removable devices in the sidebar are macOS only. Elsewhere, Live Photo video is decoded in software, and sync targets' settings are kept as plain JSON rather than in a secure store.
 - **Sync.** Syncing files in the background rather than only with Sync Now, resuming big uploads, and a way to install and review plugins from users.
 - **Object detection.** Asking before downloading the model, progress for the first scan of a big library, and refreshing search results as the scan finds more.
@@ -126,9 +126,34 @@ open "target/bundle/1k Words.app"
 
 The app and its libraries support macOS 13 and later ([`scripts/macos-target.sh`](scripts/macos-target.sh)). Development builds use Homebrew's libraries, unless `FFMPEG_DIR` and `PKG_CONFIG_PATH` point at these.
 
+### Linux
+
+The same two scripts build the libraries on Linux. On Ubuntu 24.04 (or Debian-based distributions as new), install the tools and GPUI's libraries first:
+
+```sh
+sudo apt install build-essential pkg-config cmake nasm clang libclang-dev \
+  libasound2-dev libfontconfig-dev libfreetype-dev libwayland-dev \
+  libxkbcommon-dev libxkbcommon-x11-dev libx11-dev libx11-xcb-dev \
+  libxcb1-dev libvulkan-dev libssl-dev libzstd-dev libdbus-1-dev \
+  zlib1g-dev patchelf
+scripts/bundle-linux.sh
+```
+
+[`scripts/bundle-linux.sh`](scripts/bundle-linux.sh) makes `target/bundle/1k-Words-<version>-linux-<arch>`, and a `.tar.gz` of it: the app, with the libraries in its `lib` folder, a desktop entry and icons, and the licences. Run `1k-words` in it. It's built against the system's glibc and libstdc++, so it runs on the distribution that built it and newer ones. The prebuilt ONNX Runtime needs GCC 14's libstdc++, which Ubuntu 22.04 doesn't have.
+
+### Windows
+
+On Windows the libraries come from [vcpkg](https://vcpkg.io), with the same LGPL-only choices: [`scripts/build-vcpkg-windows.sh`](scripts/build-vcpkg-windows.sh) clones it at a pinned commit into `target/vcpkg` and installs them there. In Git Bash, with Visual Studio's C++ tools and LLVM (for `LIBCLANG_PATH`):
+
+```sh
+scripts/bundle-windows.sh
+```
+
+[`scripts/bundle-windows.sh`](scripts/bundle-windows.sh) makes `target/bundle/1k-Words-<version>-windows-x86_64`, and a `.zip` of it: `1k-words.exe` with the libraries' DLLs next to it, and the licences.
+
 ### Releases
 
-Pushing a version tag that matches `Cargo.toml`'s version, such as `v0.1.0`, runs [`.github/workflows/release.yml`](.github/workflows/release.yml). It builds the libraries, runs the tests against them, bundles the app and publishes it as a GitHub release, zipped with its SHA-256. A tag with a hyphen, such as `v0.2.0-beta.1`, is a prerelease.
+Pushing a version tag that matches `Cargo.toml`'s version, such as `v0.1.0`, runs [`.github/workflows/release.yml`](.github/workflows/release.yml). For macOS, Linux and Windows, it builds the libraries, runs the tests against them and bundles the app, then publishes the three as a GitHub release, each with its SHA-256. A tag with a hyphen, such as `v0.2.0-beta.1`, is a prerelease. Run by hand from the Actions tab, the workflow builds all three as the run's artifacts and publishes nothing.
 
 ```sh
 git tag v0.1.0

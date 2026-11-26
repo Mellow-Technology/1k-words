@@ -1,12 +1,19 @@
-# Builds 1k Words for macOS and publishes it as a GitHub release, when a
-# version tag (v1.2.3) is pushed. The tag must match Cargo.toml's version.
+# Builds 1k Words for macOS, Linux and Windows and publishes them as a
+# GitHub release, when a version tag (v1.2.3) is pushed. The tag must match
+# Cargo.toml's version. Run by hand (Actions > Release > Run workflow), it
+# builds them as the run's artifacts without publishing anything.
 #
 #   1. Builds the LGPL FFmpeg and libheif the app ships (cached between runs)
-#      and runs the tests against them.
-#   2. Bundles the app (scripts/bundle-macos.sh), signed with a Developer ID
-#      and notarized if the secrets below are set, or signed ad hoc if not.
-#   3. Publishes "1k-Words-<version>-macos-arm64.zip" and its SHA-256 as a
-#      release. A tag with a hyphen (v1.2.3-beta.1) is a prerelease.
+#      and runs the tests against them: build-ffmpeg.sh and build-libheif.sh
+#      on macOS and Linux, build-vcpkg-windows.sh on Windows.
+#   2. Bundles the app: on macOS (bundle-macos.sh) signed with a Developer ID
+#      and notarized if the secrets below are set, or signed ad hoc if not;
+#      on Linux (bundle-linux.sh) and Windows (bundle-windows.sh), unsigned.
+#   3. Publishes them, each with its SHA-256, as a release:
+#        1k-Words-<version>-macos-arm64.zip
+#        1k-Words-<version>-linux-x86_64.tar.gz
+#        1k-Words-<version>-windows-x86_64.zip
+#      A tag with a hyphen (v1.2.3-beta.1) is a prerelease.
 #
 # Signing (KW-20), as repository secrets:
 #   MACOS_CERTIFICATE           a "Developer ID Application" certificate and
@@ -19,13 +26,16 @@
 #   APPLE_TEAM_ID               its team's ID
 #   APPLE_APP_PASSWORD          an app-specific password for it
 #
-# Apple silicon only for now; Windows and Linux are KW-49.
+# Apple silicon only on macOS. Linux and Windows are barebones so far
+# (KW-49): a folder to unpack and run, built on Ubuntu 24.04 (so for it and
+# newer distributions) and Windows Server 2025, not signed or installed.
 
 name: Release
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -36,25 +46,37 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  macos:
-    runs-on: macos-15
-    timeout-minutes: 120
-    env:
-      TAG: ${{ github.ref_name }}
-      SIGNED: ${{ secrets.MACOS_CERTIFICATE != '' && secrets.MACOS_SIGN_IDENTITY != '' }}
-      NOTARIZED: ${{ secrets.MACOS_CERTIFICATE != '' && secrets.MACOS_SIGN_IDENTITY != '' && secrets.APPLE_ID != '' && secrets.APPLE_TEAM_ID != '' && secrets.APPLE_APP_PASSWORD != '' }}
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Check the tag is Cargo.toml's version
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+          IS_TAG: ${{ github.ref_type == 'tag' }}
         run: |
           # [package]'s, the first line that starts with it.
           version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
-          if [[ "$TAG" != "v$version" ]]; then
+          if [[ "$IS_TAG" == "true" && "$TAG" != "v$version" ]]; then
             echo "::error::The tag $TAG doesn't match Cargo.toml's version, $version. Tag v$version, or change the version first."
             exit 1
           fi
-          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  macos:
+    needs: version
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      SIGNED: ${{ secrets.MACOS_CERTIFICATE != '' && secrets.MACOS_SIGN_IDENTITY != '' }}
+      NOTARIZED: ${{ secrets.MACOS_CERTIFICATE != '' && secrets.MACOS_SIGN_IDENTITY != '' && secrets.APPLE_ID != '' && secrets.APPLE_TEAM_ID != '' && secrets.APPLE_APP_PASSWORD != '' }}
+    steps:
+      - uses: actions/checkout@v4
 
       - name: Install the tools
         run: |
@@ -135,24 +157,179 @@ jobs:
           (cd dist && shasum -a 256 "$zip" > "$zip.sha256")
           ls -l dist
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*
+          if-no-files-found: error
+
+  linux:
+    needs: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the tools
+        run: |
+          sudo apt-get update
+          # Building FFmpeg and libheif, bindgen, GPUI (X11, Wayland, Vulkan,
+          # fonts), audio, the Secret Service, and bundling.
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config cmake nasm clang libclang-dev \
+            libasound2-dev libfontconfig-dev libfreetype-dev libwayland-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libx11-dev libx11-xcb-dev \
+            libxcb1-dev libvulkan-dev libssl-dev libzstd-dev libdbus-1-dev \
+            zlib1g-dev patchelf
+          rustup toolchain install
+          rustup show active-toolchain
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+
+      - name: Restore the native libraries
+        id: native
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/ffmpeg
+            target/libheif
+          key: native-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-ffmpeg.sh', 'scripts/build-libheif.sh') }}
+
+      - name: Build the native libraries
+        if: steps.native.outputs.cache-hit != 'true'
+        run: |
+          scripts/build-ffmpeg.sh
+          scripts/build-libheif.sh
+
+      - name: Test against them
+        run: |
+          export FFMPEG_DIR="$PWD/target/ffmpeg/$(sed -n 's/^VERSION=//p' scripts/build-ffmpeg.sh)"
+          export PKG_CONFIG_PATH="$PWD/target/libheif/$(sed -n 's/^LIBHEIF_VERSION=//p' scripts/build-libheif.sh)/lib/pkgconfig"
+          cargo test --locked --bin 1k-words
+
+      - name: Bundle the app
+        run: scripts/bundle-linux.sh
+
+      - name: Package it
+        run: |
+          mkdir -p dist
+          archive="1k-Words-$VERSION-linux-x86_64.tar.gz"
+          mv "target/bundle/$archive" dist/
+          (cd dist && sha256sum "$archive" > "$archive.sha256")
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*
+          if-no-files-found: error
+
+  windows:
+    needs: version
+    runs-on: windows-2025
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the tools
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
+          # bindgen (in ffmpeg-sys) needs libclang, from the runner's LLVM.
+          echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+
+      - name: Restore the native libraries
+        id: native
+        uses: actions/cache@v4
+        with:
+          path: target/vcpkg/installed
+          key: native-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-vcpkg-windows.sh') }}
+
+      - name: Build the native libraries
+        # Also when they're restored: vcpkg itself isn't cached, and finds
+        # the ports already installed.
+        run: scripts/build-vcpkg-windows.sh
+
+      - name: Test against them
+        run: |
+          triplet="$(sed -n 's/^TRIPLET=//p' scripts/build-vcpkg-windows.sh)"
+          export VCPKG_ROOT="$PWD/target/vcpkg" VCPKGRS_TRIPLET="$triplet" VCPKGRS_DYNAMIC=1
+          # The tests load the DLLs from there.
+          export PATH="$VCPKG_ROOT/installed/$triplet/bin:$PATH"
+          cargo test --locked --bin 1k-words
+
+      - name: Bundle the app
+        run: scripts/bundle-windows.sh
+
+      - name: Package it
+        run: |
+          mkdir -p dist
+          zip="1k-Words-$VERSION-windows-x86_64.zip"
+          mv "target/bundle/$zip" dist/
+          (cd dist && sha256sum "$zip" > "$zip.sha256")
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    # Only for a tag; a run by hand keeps the builds as its artifacts.
+    if: github.ref_type == 'tag'
+    needs: [version, macos, linux, windows]
+    runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ github.ref_name }}
+      VERSION: ${{ needs.version.outputs.version }}
+      # As the macos job decides it.
+      NOTARIZED: ${{ secrets.MACOS_CERTIFICATE != '' && secrets.MACOS_SIGN_IDENTITY != '' && secrets.APPLE_ID != '' && secrets.APPLE_TEAM_ID != '' && secrets.APPLE_APP_PASSWORD != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           notes="$RUNNER_TEMP/notes.md"
-          if [[ "$NOTARIZED" == "true" ]]; then
-            echo "For Macs with Apple silicon, running macOS 13 or later." > "$notes"
-          else
-            cat > "$notes" <<'NOTES'
-          For Macs with Apple silicon, running macOS 13 or later.
+          {
+            echo "**macOS:** for Macs with Apple silicon, running macOS 13 or later."
+            if [[ "$NOTARIZED" != "true" ]]; then
+              cat <<'NOTES'
 
-          **This build isn't notarized by Apple yet**, so macOS quarantines it and may say it's damaged or can't be checked. Unzip it, move **1k Words** to Applications, then run this once in Terminal before opening it:
+          **The macOS build isn't notarized by Apple yet**, so macOS quarantines it and may say it's damaged or can't be checked. Unzip it, move **1k Words** to Applications, then run this once in Terminal before opening it:
 
           ```sh
           xattr -dr com.apple.quarantine "/Applications/1k Words.app"
           ```
           NOTES
-          fi
+            fi
+            cat <<'NOTES'
+
+          **Linux** (x86-64, early): for Ubuntu 24.04 or a distribution as new. Unpack it and run `1k-words` in the folder.
+
+          **Windows** (x86-64, early): unzip it and run `1k-words.exe`. It isn't signed yet, so SmartScreen may warn you first: choose More info, then Run anyway.
+          NOTES
+          } > "$notes"
           prerelease=()
           [[ "$VERSION" == *-* ]] && prerelease=(--prerelease)
           gh release create "$TAG" dist/* \

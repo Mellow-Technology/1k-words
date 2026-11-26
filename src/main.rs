@@ -1,3 +1,7 @@
+// A window app on Windows, without a console window behind it; debug builds
+// keep the console, for their output.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod acknowledgements;
 mod album_dialogs;
 mod aspect_fit;
@@ -13,7 +17,6 @@ mod devices;
 mod dock_icon;
 mod gallery;
 mod heif;
-#[cfg(target_os = "macos")]
 mod keychain;
 mod library;
 mod library_settings;
@@ -68,10 +71,10 @@ fn main() {
             gallery::bind_keys(cx);
             viewer::bind_keys(cx);
             cx.bind_keys([
-                KeyBinding::new("cmd-shift-i", ImportPhotos, None),
-                KeyBinding::new("cmd-shift-n", NewLibrary, None),
-                KeyBinding::new("cmd-n", NewAlbum, None),
-                KeyBinding::new("cmd-q", Quit, None),
+                KeyBinding::new("secondary-shift-i", ImportPhotos, None),
+                KeyBinding::new("secondary-shift-n", NewLibrary, None),
+                KeyBinding::new("secondary-n", NewAlbum, None),
+                KeyBinding::new("secondary-q", Quit, None),
             ]);
             cx.set_menus(vec![
                 Menu {

@@ -56,11 +56,11 @@ pub fn bind_keys(cx: &mut App) {
     let context = Some(KEY_CONTEXT);
     cx.bind_keys([
         KeyBinding::new("escape", CloseViewer, context),
-        KeyBinding::new("cmd-=", ZoomIn, context),
-        KeyBinding::new("cmd-+", ZoomIn, context),
-        KeyBinding::new("cmd--", ZoomOut, context),
-        KeyBinding::new("cmd-0", ZoomToFit, context),
-        KeyBinding::new("cmd-1", ActualSize, context),
+        KeyBinding::new("secondary-=", ZoomIn, context),
+        KeyBinding::new("secondary-+", ZoomIn, context),
+        KeyBinding::new("secondary--", ZoomOut, context),
+        KeyBinding::new("secondary-0", ZoomToFit, context),
+        KeyBinding::new("secondary-1", ActualSize, context),
         KeyBinding::new("left", PreviousFrame, context),
         KeyBinding::new("right", NextFrame, context),
     ]);

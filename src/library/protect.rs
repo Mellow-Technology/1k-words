@@ -154,8 +154,13 @@ pub(super) mod tests {
         }
         #[cfg(unix)]
         {
-            // A file in a read-only folder can't be deleted.
-            assert!(std::fs::remove_file(day.join("photo.jpg")).is_err());
+            // A file in a read-only folder can't be deleted, except by root
+            // (as in a container), which permissions don't stop.
+            use std::os::unix::fs::MetadataExt as _;
+            let photo = day.join("photo.jpg");
+            if photo.metadata().unwrap().uid() != 0 {
+                assert!(std::fs::remove_file(&photo).is_err());
+            }
         }
 
         unlock_all(&base);
