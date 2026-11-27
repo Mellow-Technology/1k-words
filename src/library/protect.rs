@@ -149,6 +149,8 @@ pub(super) mod tests {
         assert!(is_writable(&base).unwrap());
         unlocked.relock().unwrap();
 
+        // Windows ignores read-only on folders, so they're left writable.
+        #[cfg(unix)]
         for dir in [&base, &base.join("2026"), &base.join("2026/10"), &day] {
             assert!(!is_writable(dir).unwrap(), "{} is writable", dir.display());
         }

@@ -754,8 +754,12 @@ pub(super) mod tests {
         // Read-only like any other original.
         let metadata = std::fs::metadata(&photos[0].path).unwrap();
         assert!(metadata.permissions().readonly());
-        let dir = photos[0].path.parent().unwrap();
-        assert!(std::fs::metadata(dir).unwrap().permissions().readonly());
+        // Folders too, except on Windows, which ignores that (see protect).
+        #[cfg(unix)]
+        {
+            let dir = photos[0].path.parent().unwrap();
+            assert!(std::fs::metadata(dir).unwrap().permissions().readonly());
+        }
         let pool = synced.library.fetched_originals().unwrap();
         assert_eq!(pool.len(), 1);
         assert_eq!(pool[0].path, synced.relative(&photos[0]));
