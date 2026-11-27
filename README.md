@@ -139,7 +139,7 @@ sudo apt install build-essential pkg-config cmake nasm clang libclang-dev \
 scripts/bundle-linux.sh
 ```
 
-[`scripts/bundle-linux.sh`](scripts/bundle-linux.sh) makes `target/bundle/1k-Words-<version>-linux-<arch>`, and a `.tar.gz` of it: the app, with the libraries in its `lib` folder, a desktop entry and icons, and the licences. Run `1k-words` in it. It's built against the system's glibc and libstdc++, so it runs on the distribution that built it and newer ones. The prebuilt ONNX Runtime needs GCC 14's libstdc++, which Ubuntu 22.04 doesn't have.
+[`scripts/bundle-linux.sh`](scripts/bundle-linux.sh) makes `target/bundle/1k-Words-<version>-linux-<arch>`, and a `.tar.gz` of it: the app, with the libraries in its `lib` folder, a desktop entry and icons, and the licences. Run `1k-words` in it. Then [`scripts/package-linux.sh`](scripts/package-linux.sh) packages it as a `.deb` and an `.rpm` with [nFPM](https://nfpm.goreleaser.com), which install it into `/opt/1k-words`, with `1k-words` on the path and in the desktop's launcher. Their dependencies are worked out from what the app links. It's built against the system's glibc and libstdc++, so it runs on the distribution that built it and newer ones. The prebuilt ONNX Runtime needs GCC 14's libstdc++, which Ubuntu 22.04 doesn't have.
 
 ### Windows
 

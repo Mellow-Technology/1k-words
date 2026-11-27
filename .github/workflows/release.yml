@@ -8,10 +8,11 @@
 #      on macOS and Linux, build-vcpkg-windows.sh on Windows.
 #   2. Bundles the app: on macOS (bundle-macos.sh) signed with a Developer ID
 #      and notarized if the secrets below are set, or signed ad hoc if not;
-#      on Linux (bundle-linux.sh) and Windows (bundle-windows.sh), unsigned.
+#      on Linux (bundle-linux.sh, then package-linux.sh for the .deb and
+#      .rpm) and Windows (bundle-windows.sh), unsigned.
 #   3. Publishes them, each with its SHA-256, as a release:
 #        1k-Words-<version>-macos-arm64.zip
-#        1k-Words-<version>-linux-x86_64.tar.gz
+#        1k-Words-<version>-linux-x86_64.tar.gz, .deb and .rpm
 #        1k-Words-<version>-windows-x86_64.zip
 #      A tag with a hyphen (v1.2.3-beta.1) is a prerelease.
 #
@@ -182,7 +183,7 @@ jobs:
             libasound2-dev libfontconfig-dev libfreetype-dev libwayland-dev \
             libxkbcommon-dev libxkbcommon-x11-dev libx11-dev libx11-xcb-dev \
             libxcb1-dev libvulkan-dev libssl-dev libzstd-dev libdbus-1-dev \
-            zlib1g-dev patchelf
+            zlib1g-dev patchelf dpkg-dev
           rustup toolchain install
           rustup show active-toolchain
 
@@ -212,14 +213,17 @@ jobs:
           cargo test --locked --bin 1k-words
 
       - name: Bundle the app
-        run: scripts/bundle-linux.sh
+        run: |
+          scripts/bundle-linux.sh
+          scripts/package-linux.sh
 
       - name: Package it
         run: |
           mkdir -p dist
-          archive="1k-Words-$VERSION-linux-x86_64.tar.gz"
-          mv "target/bundle/$archive" dist/
-          (cd dist && sha256sum "$archive" > "$archive.sha256")
+          for file in "1k-Words-$VERSION-linux-x86_64".{tar.gz,deb,rpm}; do
+            mv "target/bundle/$file" dist/
+            (cd dist && sha256sum "$file" > "$file.sha256")
+          done
           ls -l dist
 
       - uses: actions/upload-artifact@v4
@@ -325,7 +329,7 @@ jobs:
             fi
             cat <<'NOTES'
 
-          **Linux** (x86-64, early): for Ubuntu 24.04 or a distribution as new. Unpack it and run `1k-words` in the folder.
+          **Linux** (x86-64, early): for Ubuntu 24.04, Fedora 40 or distributions as new. Install the `.deb` (`sudo apt install ./1k-Words-*.deb`) or the `.rpm` (`sudo dnf install ./1k-Words-*.rpm`), or unpack the `.tar.gz` and run `1k-words` in the folder.
 
           **Windows** (x86-64, early): unzip it and run `1k-words.exe`. It isn't signed yet, so SmartScreen may warn you first: choose More info, then Run anyway.
           NOTES

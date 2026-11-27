@@ -43,10 +43,13 @@ Both build, pass the tests and run (KW-49), as a folder to unpack, from
 `scripts/bundle-linux.sh` and `scripts/bundle-windows.sh` and the release
 workflow. Still to do:
 
-- **Packaging.** An AppImage or Flatpak for Linux; an MSI or MSIX for
-  Windows. The Linux build only runs on distributions as new as the one
-  that built it (Ubuntu 24.04), for glibc and the prebuilt ONNX Runtime's
-  libstdc++.
+- **Packaging.** Linux has a .tar.gz, .deb and .rpm (`package-linux.sh`);
+  an AppImage or Flatpak would reach more distributions, and an apt or dnf
+  repository would bring updates. Windows needs an MSI or MSIX. The Linux
+  build only runs on distributions as new as the one that built it (Ubuntu
+  24.04), for glibc and the prebuilt ONNX Runtime's libstdc++.
+- **The packages' maintainer** is "Mellow Technology", with no email
+  (`MAINTAINER` in `package-linux.sh`).
 - **Signing** (Authenticode) on Windows, and the app's icon in the .exe.
 - **Still macOS only:** removable devices in the sidebar
   (`src/devices/other.rs`), hardware video decoding (under Video), and
