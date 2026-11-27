@@ -24,8 +24,11 @@
 
 set -euo pipefail
 
-# microsoft/vcpkg's master on 2026-11-26: FFmpeg 9.1, libheif 1.23.7.
-VCPKG_COMMIT=e6d62cc9ce8f8d9687df14521118f2ec3c10ee6a
+# microsoft/vcpkg's master just before FFmpeg 9.1 (2026-11-23), for the
+# same versions build-ffmpeg.sh and build-libheif.sh build: FFmpeg 9.0.2,
+# libheif 1.23.7, libde265 1.1.3. ffmpeg-sys-next 9.0 can't read 9.1's
+# hwcontext_cuda.h, which uses CUDA types it doesn't stub (CUarray).
+VCPKG_COMMIT=93ad765c7b66ab9ce97469ec23a90b15c3a14ee5
 TRIPLET=x64-windows-release
 PORTS=(
   "ffmpeg[core,avcodec,avformat,swresample,swscale,zlib]:$TRIPLET"
