@@ -1,4 +1,5 @@
-//! Secrets in the macOS keychain, as generic passwords.
+//! Secrets in the system's store: the macOS keychain, as generic
+//! passwords; Credential Manager on Windows; the Secret Service on Linux.
 //!
 //! Tests use an in-memory stand-in, so they don't touch the user's keychain.
 
@@ -24,6 +25,7 @@ pub fn delete(service: &str, account: &str) -> Result<()> {
     backend::delete(service, account)
 }
 
+#[cfg(target_os = "macos")]
 mod system {
     use anyhow::{Context as _, Result};
     use security_framework::base::Error;
@@ -50,6 +52,33 @@ mod system {
                 Err::<(), Error>(error).context("removing from the keychain")
             }
             _ => Ok(()),
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+mod system {
+    use anyhow::{Context as _, Result};
+    use keyring::{Entry, Error};
+
+    pub fn get(service: &str, account: &str) -> Result<Option<Vec<u8>>> {
+        match Entry::new(service, account).and_then(|entry| entry.get_secret()) {
+            Ok(secret) => Ok(Some(secret)),
+            Err(Error::NoEntry) => Ok(None),
+            Err(error) => Err(error).context("reading from the system's secret store"),
+        }
+    }
+
+    pub fn set(service: &str, account: &str, secret: &[u8]) -> Result<()> {
+        Entry::new(service, account)
+            .and_then(|entry| entry.set_secret(secret))
+            .context("saving to the system's secret store")
+    }
+
+    pub fn delete(service: &str, account: &str) -> Result<()> {
+        match Entry::new(service, account).and_then(|entry| entry.delete_credential()) {
+            Ok(()) | Err(Error::NoEntry) => Ok(()),
+            Err(error) => Err(error).context("removing from the system's secret store"),
         }
     }
 }
@@ -88,7 +117,7 @@ mod fake {
 mod tests {
     use super::system;
 
-    /// Uses the real keychain, so it's run only on request:
+    /// Uses the real store, so it's run only on request:
     /// `cargo test keychain -- --ignored`.
     #[test]
     #[ignore]

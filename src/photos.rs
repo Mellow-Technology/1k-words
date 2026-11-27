@@ -1077,7 +1077,9 @@ mod tests {
             .flat_map(|stack| &stack.photos)
             .map(|photo| {
                 let relative = photo.path.strip_prefix(volume).unwrap();
-                relative.to_string_lossy().into_owned()
+                // With /, whatever the platform's separator.
+                let parts: Vec<_> = relative.iter().map(|part| part.to_string_lossy()).collect();
+                parts.join("/")
             })
             .collect();
         paths.sort();

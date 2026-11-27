@@ -264,7 +264,7 @@ fn decode(
         macos::enable_hardware_decoding(&mut context);
     }
     #[cfg(not(target_os = "macos"))]
-    let _ = hardware;
+    let _ = (hardware, &mut context);
     let mut decoder = context.decoder().video()?;
 
     let mut output = FrameOutput::new(rotation);

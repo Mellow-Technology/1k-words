@@ -517,7 +517,8 @@ mod tests {
                 .all(|photo| photo.path.starts_with(&default_dir))
         );
 
-        // The originals are read-only, and so are their folders.
+        // The originals are read-only, and so are their folders (except on
+        // Windows, which ignores that; see protect).
         let original = &photos[0].path;
         assert!(
             std::fs::metadata(original)
@@ -525,6 +526,7 @@ mod tests {
                 .permissions()
                 .readonly()
         );
+        #[cfg(unix)]
         assert!(
             std::fs::metadata(original.parent().unwrap())
                 .unwrap()

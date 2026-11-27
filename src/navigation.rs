@@ -60,7 +60,7 @@ pub fn init(cx: &mut App) {
     });
     cx.bind_keys([
         KeyBinding::new("cmd-ctrl-s", ToggleSidebar, None),
-        KeyBinding::new("cmd-,", OpenSettings, None),
+        KeyBinding::new("secondary-,", OpenSettings, None),
     ]);
 }
 

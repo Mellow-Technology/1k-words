@@ -30,6 +30,7 @@ pub struct Device {
 }
 
 /// What the platform reports about the mounted volumes.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 enum Event {
     /// A volume mounted, unmounted or was renamed.
     Changed,
@@ -38,6 +39,7 @@ enum Event {
 }
 
 /// How a volume describes itself, for deciding whether it's a device.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Default)]
 struct VolumeFlags {
     local: bool,
@@ -49,6 +51,7 @@ struct VolumeFlags {
 /// Local volumes that can be removed or ejected count as devices, which
 /// leaves out network shares and the startup disk. Mounted disk images are
 /// ejectable too, but they're files, not devices.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn is_device(flags: VolumeFlags, disk_image: bool) -> bool {
     flags.local && !flags.root && (flags.removable || flags.ejectable) && !disk_image
 }

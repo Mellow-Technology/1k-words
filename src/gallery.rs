@@ -124,8 +124,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-right", ExtendRight, context),
         KeyBinding::new("shift-up", ExtendUp, context),
         KeyBinding::new("shift-down", ExtendDown, context),
-        KeyBinding::new("cmd-a", SelectAll, context),
-        KeyBinding::new("cmd-backspace", RemoveFromAlbum, context),
+        KeyBinding::new("secondary-a", SelectAll, context),
+        KeyBinding::new("secondary-backspace", RemoveFromAlbum, context),
         KeyBinding::new("enter", OpenSelected, context),
         KeyBinding::new("space", ToggleQuickPreview, context),
         KeyBinding::new("escape", Dismiss, context),
@@ -4031,7 +4031,7 @@ mod tests {
             })
         };
         assert_eq!(tiles(cx), None);
-        press(window, "cmd-1", cx);
+        press(window, "secondary-1", cx);
         shown(cx);
         let (full_width, full_height, count) = tiles(cx).unwrap();
         assert_eq!((full_width, full_height), (3000, 2000));
@@ -4039,7 +4039,7 @@ mod tests {
         assert_eq!(shown(cx), Some((width, height, false)));
 
         // Zoomed out again, the tiles are freed.
-        press(window, "cmd-0", cx);
+        press(window, "secondary-0", cx);
         assert_eq!(tiles(cx).map(|(.., count)| count), Some(0));
 
         std::fs::remove_dir_all(folder).ok();
@@ -4269,7 +4269,7 @@ mod tests {
         drop(library);
 
         // Opening Settings counts the library's photos.
-        press(window, "cmd-,", cx);
+        press(window, "secondary-,", cx);
         cx.update_window(window, |_, window, cx| window.render_frame(cx))
             .unwrap();
         gallery.read_with(cx, |gallery, _| assert_eq!(gallery.page, Page::Settings));
@@ -4902,7 +4902,8 @@ mod tests {
         with_gallery(cx, &|gallery, window, cx| {
             gallery.rename_album(trips, window, cx)
         });
-        in_window(cx, &|window, cx| window.press("cmd-a", cx));
+        // Select All: cmd on macOS, ctrl elsewhere.
+        in_window(cx, &|window, cx| window.press("secondary-a", cx));
         in_window(cx, &|window, cx| window.input("Travel", cx));
         in_window(cx, &|window, cx| window.click("confirm", cx));
         assert!(albums(cx).contains(&("Travel".into(), None, 0)));
@@ -5139,7 +5140,7 @@ mod tests {
         click(1, none, 1, cx);
         press(window, "shift-right", cx);
         assert_eq!(selection(cx).0, [1, 2]);
-        press(window, "cmd-a", cx);
+        press(window, "secondary-a", cx);
         assert_eq!(selection(cx).0.len(), 11);
         assert_eq!(
             gallery.read_with(cx, |gallery, _| gallery.selected),
@@ -5560,7 +5561,7 @@ mod tests {
         .unwrap();
         frame(cx);
         click(("tile", 0), cx);
-        press(window, "cmd-backspace", cx);
+        press(window, "secondary-backspace", cx);
         assert_eq!(in_album(trips, cx), 2);
         assert_eq!(notice(cx), "Took the photo out of “Trips”.");
         gallery.read_with(cx, |gallery, _| assert_eq!(gallery.stacks.len(), 2));

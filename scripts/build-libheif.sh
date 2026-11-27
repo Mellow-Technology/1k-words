@@ -18,10 +18,11 @@
 #
 #     PKG_CONFIG_PATH=$PWD/target/libheif/1.23.7/lib/pkgconfig cargo build --release
 #
-# scripts/bundle-macos.sh does this, with FFmpeg's LGPL build. The libraries
-# are named @rpath/lib*.dylib, as FFmpeg's are (build-ffmpeg.sh).
+# The bundle scripts do this, with FFmpeg's LGPL build. On macOS the
+# libraries are named @rpath/lib*.dylib, as FFmpeg's are (build-ffmpeg.sh);
+# on Linux libheif finds libde265 next to it ($ORIGIN).
 #
-# macOS only for now (KW-48); other platforms are KW-49.
+# macOS and Linux. Windows gets libheif from vcpkg (vcpkg.json, KW-49).
 
 set -euo pipefail
 
@@ -33,18 +34,32 @@ LIBDE265_SHA256=554228bd17788c99a7e63b37ab5634722190e6e2bf60c1dcb01cef328e133905
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PREFIX="${1:-$ROOT/target/libheif/$LIBHEIF_VERSION}"
-# The oldest macOS the app supports (MACOSX_DEPLOYMENT_TARGET).
-source "$ROOT/scripts/macos-target.sh"
 WORK="$ROOT/target/libheif/src"
 
-if [[ "$(uname)" != "Darwin" ]]; then
-  echo "This builds libheif for macOS only so far (see KW-49)." >&2
-  exit 1
-fi
+case "$(uname)" in
+  Darwin)
+    # The oldest macOS the app supports (MACOSX_DEPLOYMENT_TARGET).
+    source "$ROOT/scripts/macos-target.sh"
+    PLATFORM=(
+      -DCMAKE_INSTALL_NAME_DIR=@rpath
+      -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET"
+    )
+    BUILT_FOR="macOS $MACOSX_DEPLOYMENT_TARGET and later"
+    ;;
+  Linux)
+    PLATFORM=(-DCMAKE_INSTALL_RPATH='$ORIGIN')
+    BUILT_FOR="Linux ($(uname -m))"
+    ;;
+  *)
+    echo "This builds libheif for macOS and Linux; Windows uses vcpkg (vcpkg.json)." >&2
+    exit 1
+    ;;
+esac
 command -v cmake >/dev/null || {
-  echo "CMake is needed: brew install cmake" >&2
+  echo "CMake is needed: brew install cmake, or your distribution's cmake" >&2
   exit 1
 }
+JOBS="$(getconf _NPROCESSORS_ONLN)"
 
 # Downloads and unpacks a release, checking it against its checksum.
 fetch() {
@@ -64,16 +79,17 @@ fetch() {
   tar -xzf "$tarball" -C "$WORK"
 }
 
-# What both builds share: shared libraries named @rpath/..., for the oldest
-# supported macOS, found only in what's built here.
+# What both builds share: shared libraries in lib (not lib64 or a
+# multiarch folder), found only in what's built here, with the platform's
+# settings above.
 COMMON=(
   -DCMAKE_BUILD_TYPE=Release
   -DCMAKE_INSTALL_PREFIX="$PREFIX"
-  -DCMAKE_INSTALL_NAME_DIR=@rpath
-  -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET"
+  -DCMAKE_INSTALL_LIBDIR=lib
   -DCMAKE_PREFIX_PATH="$PREFIX"
   -DCMAKE_IGNORE_PREFIX_PATH="/opt/homebrew;/usr/local"
   -DBUILD_SHARED_LIBS=ON
+  "${PLATFORM[@]}"
 )
 # libheif finds libde265 through pkg-config: only this one.
 export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
@@ -88,7 +104,7 @@ cmake -S "$WORK/libde265-$LIBDE265_VERSION" -B "$WORK/build-libde265" "${COMMON[
   -DENABLE_DECODER=OFF \
   -DENABLE_ENCODER=OFF \
   -DENABLE_SHERLOCK265=OFF
-cmake --build "$WORK/build-libde265" --parallel "$(sysctl -n hw.ncpu)"
+cmake --build "$WORK/build-libde265" --parallel "$JOBS"
 cmake --install "$WORK/build-libde265"
 
 fetch libheif "$LIBHEIF_VERSION" "$LIBHEIF_SHA256"
@@ -111,13 +127,20 @@ cmake -S "$WORK/libheif-$LIBHEIF_VERSION" -B "$WORK/build-libheif" "${COMMON[@]}
   -DWITH_GDK_PIXBUF=OFF \
   -DBUILD_TESTING=OFF \
   -DBUILD_DOCUMENTATION=OFF
-cmake --build "$WORK/build-libheif" --parallel "$(sysctl -n hw.ncpu)"
+cmake --build "$WORK/build-libheif" --parallel "$JOBS"
 cmake --install "$WORK/build-libheif"
 
 # Nothing but each other and the system: no x265, aom or Homebrew.
-for lib in "$PREFIX"/lib/libheif.dylib "$PREFIX"/lib/libde265.dylib; do
-  stray="$(otool -L "$lib" | tail -n +2 | awk '{print $1}' |
-    grep -v -E '^(@rpath/(libheif|libde265)\.|/usr/lib/|/System/)' || true)"
+for lib in "$PREFIX"/lib/libheif.{dylib,so} "$PREFIX"/lib/libde265.{dylib,so}; do
+  [[ -e "$lib" ]] || continue
+  if [[ "$(uname)" == Darwin ]]; then
+    stray="$(otool -L "$lib" | tail -n +2 | awk '{print $1}' |
+      grep -v -E '^(@rpath/(libheif|libde265)\.|/usr/lib/|/System/)' || true)"
+  else
+    # The C and C++ runtimes are the system's.
+    stray="$(readelf -d "$lib" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' |
+      grep -v -E '^(libheif|libde265|libc|libm|libdl|libpthread|librt|libstdc\+\+|libgcc_s|ld-linux.*)\.so' || true)"
+  fi
   if [[ -n "$stray" ]]; then
     echo "$(basename "$lib") links something it shouldn't:" >&2
     echo "$stray" >&2
@@ -127,4 +150,4 @@ done
 
 echo
 echo "Built libheif $LIBHEIF_VERSION with libde265 $LIBDE265_VERSION (LGPL-3.0, decoding only),"
-echo "for macOS $MACOSX_DEPLOYMENT_TARGET and later, into $PREFIX"
+echo "for $BUILT_FOR, into $PREFIX"

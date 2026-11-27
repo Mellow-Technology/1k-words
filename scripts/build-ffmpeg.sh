@@ -9,8 +9,9 @@
 # app's LGPL-3.0 is compatible with.
 #
 # What the app uses (src/video): Live Photos' QuickTime (.mov) files, with
-# H.264 or HEVC video decoded by VideoToolbox and AAC audio, scaled and
-# resampled by libswscale and libswresample.
+# H.264 or HEVC video (decoded by VideoToolbox on macOS, in software on
+# Linux) and AAC audio, scaled and resampled by libswscale and
+# libswresample.
 #
 #     scripts/build-ffmpeg.sh [prefix]
 #
@@ -19,11 +20,12 @@
 #
 #     FFMPEG_DIR=$PWD/target/ffmpeg/9.0.2 cargo build --release
 #
-# The libraries are named @rpath/libav*.dylib, so the app finds them through
-# its rpath: build.rs adds FFMPEG_DIR/lib for running from target/, and a
-# bundled app looks in its own Frameworks folder.
+# The libraries are found through the app's rpath: build.rs adds
+# FFMPEG_DIR/lib for running from target/, and a bundled app looks in its
+# own folder (Frameworks on macOS, lib on Linux). On macOS they're named
+# @rpath/libav*.dylib; on Linux, by their sonames (libavcodec.so.62).
 #
-# macOS only for now (KW-48); other platforms are KW-49.
+# macOS and Linux. Windows gets FFmpeg from vcpkg (vcpkg.json, KW-49).
 
 set -euo pipefail
 
@@ -35,16 +37,33 @@ SHA256=8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PREFIX="${1:-$ROOT/target/ffmpeg/$VERSION}"
-# The oldest macOS the app supports (MACOSX_DEPLOYMENT_TARGET).
-source "$ROOT/scripts/macos-target.sh"
 WORK="$ROOT/target/ffmpeg/src"
 TARBALL="$WORK/ffmpeg-$VERSION.tar.xz"
 SOURCE="$WORK/ffmpeg-$VERSION"
 
-if [[ "$(uname)" != "Darwin" ]]; then
-  echo "This builds FFmpeg for macOS only so far (see KW-49)." >&2
-  exit 1
-fi
+case "$(uname)" in
+  Darwin)
+    # The oldest macOS the app supports (MACOSX_DEPLOYMENT_TARGET).
+    source "$ROOT/scripts/macos-target.sh"
+    PLATFORM=(
+      --install-name-dir='@rpath'
+      --enable-videotoolbox
+      --enable-hwaccel=h264_videotoolbox,hevc_videotoolbox
+      --extra-cflags="-mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET"
+      --extra-ldflags="-mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET"
+    )
+    BUILT_FOR="macOS $MACOSX_DEPLOYMENT_TARGET and later"
+    ;;
+  Linux)
+    # Software decoding for now; VA-API is in TODO.md.
+    PLATFORM=()
+    BUILT_FOR="Linux ($(uname -m))"
+    ;;
+  *)
+    echo "This builds FFmpeg for macOS and Linux; Windows uses vcpkg (vcpkg.json)." >&2
+    exit 1
+    ;;
+esac
 
 mkdir -p "$WORK"
 if [[ ! -f "$TARBALL" ]]; then
@@ -68,7 +87,6 @@ cd "$SOURCE"
 # needs the prefix: the app's build finds FFmpeg through FFMPEG_DIR.
 ./configure \
   --prefix=/ffmpeg \
-  --install-name-dir='@rpath' \
   --enable-shared \
   --disable-static \
   --disable-programs \
@@ -77,9 +95,8 @@ cd "$SOURCE"
   --disable-network \
   --disable-avdevice \
   --disable-avfilter \
-  `# Nothing found on this Mac is pulled in unless named below.` \
+  `# Nothing found on this machine is pulled in unless named.` \
   --disable-autodetect \
-  --enable-videotoolbox \
   --enable-zlib \
   `# Then only the parts the app uses.` \
   --disable-everything \
@@ -87,9 +104,7 @@ cd "$SOURCE"
   --enable-demuxer=mov \
   --enable-decoder=h264,hevc,aac \
   --enable-parser=h264,hevc,aac \
-  --enable-hwaccel=h264_videotoolbox,hevc_videotoolbox \
-  --extra-cflags="-mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET" \
-  --extra-ldflags="-mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET"
+  ${PLATFORM[@]+"${PLATFORM[@]}"}
 
 # configure records the licence it chose. Stop before installing anything
 # that isn't LGPL.
@@ -100,7 +115,7 @@ for flag in CONFIG_GPL CONFIG_NONFREE; do
   fi
 done
 
-make -j"$(sysctl -n hw.ncpu)"
+make -j"$(getconf _NPROCESSORS_ONLN)"
 rm -rf "$PREFIX" "$WORK/stage"
 make install DESTDIR="$WORK/stage"
 mkdir -p "$(dirname "$PREFIX")"
@@ -110,6 +125,6 @@ rm -rf "$WORK/stage"
 # The licence as the built library reports it, from its configuration.
 LICENSE="$(grep '^#define FFMPEG_LICENSE ' config.h | cut -d'"' -f2)"
 echo
-echo "Built FFmpeg $VERSION ($LICENSE), for macOS $MACOSX_DEPLOYMENT_TARGET and later, into $PREFIX"
+echo "Built FFmpeg $VERSION ($LICENSE), for $BUILT_FOR, into $PREFIX"
 echo "Build the app against it with:"
 echo "  FFMPEG_DIR=$PREFIX cargo build --release"

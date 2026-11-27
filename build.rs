@@ -62,14 +62,18 @@ fn main() {
 }
 
 /// With FFMPEG_DIR set, as to the LGPL build from `scripts/build-ffmpeg.sh`,
-/// ffmpeg-sys links against the libraries there. They're named
-/// `@rpath/libav*.dylib`, so the app looks for them along its rpath: here,
-/// that folder, so it runs from `target/`. A bundled app adds its own
-/// Frameworks folder instead. Without FFMPEG_DIR, FFmpeg comes from
-/// pkg-config (Homebrew's, for development), whose libraries have
-/// absolute names and need no rpath.
+/// ffmpeg-sys links against the libraries there. They're found along the
+/// app's rpath (on macOS they're named `@rpath/libav*.dylib`): here, that
+/// folder, so it runs from `target/`. A bundled app adds its own folder
+/// instead (Frameworks on macOS, lib on Linux). Without FFMPEG_DIR, FFmpeg
+/// comes from pkg-config (Homebrew's or the system's, for development),
+/// whose libraries need no rpath. Windows has no rpath: there FFmpeg comes
+/// from vcpkg, and its DLLs go next to the app.
 fn link_ffmpeg() {
     println!("cargo:rerun-if-env-changed=FFMPEG_DIR");
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        return;
+    }
     if let Ok(dir) = env::var("FFMPEG_DIR") {
         let lib = PathBuf::from(dir).join("lib");
         println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib.display());
@@ -77,12 +81,14 @@ fn link_ffmpeg() {
 }
 
 /// libheif, found through pkg-config, likewise: if it's the build from
-/// `scripts/build-libheif.sh` (put first on PKG_CONFIG_PATH), named
-/// `@rpath/libheif.1.dylib`, its folder goes on the rpath too. Homebrew's
-/// has an absolute name and needs nothing.
+/// `scripts/build-libheif.sh` (put first on PKG_CONFIG_PATH), its folder
+/// goes on the rpath too. On macOS that's when it's named
+/// `@rpath/libheif.1.dylib` (Homebrew's has an absolute name); on Linux,
+/// when it isn't the system's, in /usr.
 fn link_libheif() {
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
+    let os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if os != "macos" && os != "linux" {
         return;
     }
     let Ok(output) = Command::new("pkg-config")
@@ -93,6 +99,12 @@ fn link_libheif() {
     };
     let libdir = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     if libdir.is_empty() {
+        return;
+    }
+    if os == "linux" {
+        if !libdir.starts_with("/usr/") {
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{libdir}");
+        }
         return;
     }
     let id = Command::new("otool")

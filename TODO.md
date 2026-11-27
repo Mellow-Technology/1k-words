@@ -23,18 +23,49 @@
 
 - **LGPL-only FFmpeg build.** `scripts/build-ffmpeg.sh` builds FFmpeg
   without `--enable-gpl`, with only what the app uses, as shared libraries
-  named `@rpath/…`; build with `FFMPEG_DIR` pointing at it. Homebrew's
-  (GPL) FFmpeg is for development only. Still to do: bundle it (below), and
-  build it for Windows and Linux (KW-49).
-- **Bundle the native libraries.** Done for macOS: `scripts/bundle-macos.sh`
-  ships LGPL builds of FFmpeg and of libheif with libde265
-  (`scripts/build-libheif.sh`) in the app's Frameworks folder. Still to do:
-  Windows and Linux (KW-49).
+  named `@rpath/…` on macOS; build with `FFMPEG_DIR` pointing at it.
+  Homebrew's (GPL) FFmpeg is for development only. It builds on Linux too,
+  and Windows gets the same choices from vcpkg
+  (`scripts/build-vcpkg-windows.sh`).
+- **Bundle the native libraries.** `scripts/bundle-macos.sh` ships LGPL
+  builds of FFmpeg and of libheif with libde265 (`scripts/build-libheif.sh`)
+  in the app's Frameworks folder; `bundle-linux.sh` in a `lib` folder next
+  to the app; `bundle-windows.sh` as DLLs next to it.
 - **LGPL compliance.** rawler (LGPL-2.1) is statically linked Rust, so users
   must be able to relink against a modified version. libheif and FFmpeg are
   LGPL too.
 - **Font licence.** Lato is under the SIL OFL (`assets/fonts/OFL.txt`); ship
   the licence with the app.
+
+## Linux and Windows
+
+Both build, pass the tests and run (KW-49), as a folder to unpack, from
+`scripts/bundle-linux.sh` and `scripts/bundle-windows.sh` and the release
+workflow. Still to do:
+
+- **Packaging.** Linux has a .tar.gz, .deb and .rpm (`package-linux.sh`);
+  an AppImage or Flatpak would reach more distributions, and an apt or dnf
+  repository would bring updates. Windows needs an MSI or MSIX. The Linux
+  build only runs on distributions as new as the one that built it (Ubuntu
+  24.04), for glibc and the prebuilt ONNX Runtime's libstdc++.
+- **The packages' maintainer** is "Mellow Technology", with no email
+  (`MAINTAINER` in `package-linux.sh`).
+- **Signing** (Authenticode) on Windows, and the app's icon in the .exe.
+- **Still macOS only:** removable devices in the sidebar
+  (`src/devices/other.rs`), hardware video decoding (under Video), and
+  sync targets' settings in a secure store (under Sync).
+- **Shortcuts.** They're `secondary-` (cmd on macOS, ctrl elsewhere), but
+  the sidebar's is cmd-ctrl-s everywhere. Check each against the platform's
+  conventions (ctrl-q doesn't quit on Windows; Delete, not ctrl-backspace).
+- **The catalog server's token** goes in Credential Manager or the Secret
+  Service. A Linux desktop without a Secret Service (no GNOME Keyring or
+  KWallet) can't keep one.
+- **Object detection** uses ONNX Runtime's CPU provider. Try DirectML on
+  Windows and CUDA on Linux.
+- **The Windows build is untested by hand.** CI builds and tests it; it
+  hasn't been opened on a real machine yet.
+- **Linux on ARM.** Builds (checked in a container), but releases are
+  x86-64 only.
 
 ## Video and Live Photos
 
