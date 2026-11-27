@@ -54,7 +54,12 @@ echo "Building $NAME $VERSION for Windows (x86_64)…"
 REMAP="--remap-path-prefix=$(cygpath -w "$ROOT")=/1k-words"
 REMAP+=" --remap-path-prefix=$(cygpath -w "${CARGO_HOME:-$USERPROFILE/.cargo}")=/cargo"
 REMAP+=" --remap-path-prefix=$(rustc --print sysroot | tr -d '\r')=/rustc"
-export CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS="$REMAP"
+# Windows gives a program's main thread 1 MB of stack, and bindgen, in
+# ffmpeg-sys-next's build script, recurses deeply through FFmpeg's headers.
+# Unoptimised, as release builds' build scripts are, it overflows that, so
+# give the programs built here (build scripts and the app) 8 MB, as on Linux.
+STACK="-C link-arg=/STACK:8388608"
+export CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS="$REMAP $STACK"
 export CARGO_TARGET_WASM32_WASIP2_RUSTFLAGS="$REMAP"
 cargo build --release --locked
 
